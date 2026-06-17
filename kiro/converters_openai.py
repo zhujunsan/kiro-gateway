@@ -134,7 +134,31 @@ def _extract_tool_calls_from_openai(msg: ChatMessage) -> List[Dict[str, Any]]:
                         "arguments": tc.get("function", {}).get("arguments", "{}")
                     }
                 })
-    
+
+    # Fallback: Cursor (and other Anthropic-style clients) put tool calls in
+    # content blocks instead of the tool_calls field. Parse those so the
+    # matching tool_results are not later orphaned and downgraded to text.
+    if not tool_calls and isinstance(msg.content, list):
+        for item in msg.content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "tool_use":
+                continue
+            tool_id = item.get("id")
+            tool_name = item.get("name")
+            if not tool_id or not tool_name:
+                continue
+            # Keep input as-is (dict or str); core extract_tool_uses_from_message
+            # accepts both and json-decodes strings.
+            tool_calls.append({
+                "id": tool_id,
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": item.get("input", {})
+                }
+            })
+
     return tool_calls
 
 

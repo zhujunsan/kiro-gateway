@@ -248,6 +248,23 @@ HIDDEN_MODELS: Dict[str, str] = {
 # Default: {"auto-kiro": "auto"} to avoid Cursor IDE conflict
 MODEL_ALIASES: Dict[str, str] = {
     "auto-kiro": "auto",  # Default alias to avoid Cursor's "auto" model conflict
+    # Claude Opus
+    "kiro-opus-4.8": "claude-opus-4.8",
+    "kiro-opus-4.7": "claude-opus-4.7",
+    "kiro-opus-4.6": "claude-opus-4.6",
+    "kiro-opus-4.5": "claude-opus-4.5",
+    # Claude Sonnet
+    "kiro-sonnet-4.6": "claude-sonnet-4.6",
+    "kiro-sonnet-4.5": "claude-sonnet-4.5",
+    "kiro-sonnet-4": "claude-sonnet-4",
+    # Claude Haiku
+    "kiro-haiku-4.5": "claude-haiku-4.5",
+    # Non-Claude models
+    "kiro-deepseek-3.2": "deepseek-3.2",
+    "kiro-glm-5": "glm-5",
+    "kiro-minimax-m2.1": "minimax-m2.1",
+    "kiro-minimax-m2.5": "minimax-m2.5",
+    "kiro-qwen3-coder-next": "qwen3-coder-next",
 }
 
 # Models to hide from /v1/models endpoint.

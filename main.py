@@ -572,6 +572,148 @@ app.include_router(openai_router)
 app.include_router(anthropic_router)
 
 
+# --- Account usage endpoint ---
+# Upstream never calls Amazon Q's getUsageLimits API, so it can't report account
+# quota. We replicate kiro.rs behavior: hit q.{region}.amazonaws.com/getUsageLimits
+# with the SSO access token and parse subscription tier + usage.
+import urllib.parse
+import uuid
+
+from fastapi import Request, Depends, HTTPException
+from kiro.routes_openai import verify_api_key
+
+_USAGE_KIRO_VERSION = "0.11.107"
+_USAGE_NODE_VERSION = "22.22.0"
+_USAGE_SYSTEM_VERSION = "darwin#24.6.0"
+_USAGE_OVERAGE_RATE_USD = 0.04
+
+
+def _usage_pick_auth():
+    """Return an initialized auth_manager from the account pool, if any."""
+    am = getattr(app.state, "account_manager", None)
+    if am is None:
+        return None, am
+    for _acc in am._accounts.values():
+        if _acc.auth_manager is not None:
+            return _acc.auth_manager, am
+    return None, am
+
+
+def _usage_summary(data: dict) -> dict:
+    """Replicate kiro.rs usage_limits aggregation: base + active trial + active bonuses.
+
+    On paid plans, usage past the monthly limit (overage) is billed at $0.04 per
+    extra credit. We compute per-breakdown overage + cost and a grand total.
+    """
+    sub = (data.get("subscriptionInfo") or {}).get("subscriptionTitle")
+    breakdowns = data.get("usageBreakdownList") or []
+    if not breakdowns:
+        return {
+            "subscription": sub,
+            "nextDateReset": data.get("nextDateReset"),
+            "breakdowns": [],
+            "overageRateUsd": _USAGE_OVERAGE_RATE_USD,
+            "overageCreditsTotal": 0.0,
+            "overageCostUsd": 0.0,
+        }
+
+    out = []
+    total_overage = 0.0
+    for b in breakdowns:
+        used = b.get("currentUsageWithPrecision", b.get("currentUsage", 0)) or 0
+        limit = b.get("usageLimitWithPrecision", b.get("usageLimit", 0)) or 0
+        trial = b.get("freeTrialInfo")
+        if trial and trial.get("freeTrialStatus") == "ACTIVE":
+            used += trial.get("currentUsageWithPrecision", 0) or 0
+            limit += trial.get("usageLimitWithPrecision", 0) or 0
+        for bonus in b.get("bonuses") or []:
+            if bonus.get("status") == "ACTIVE":
+                used += bonus.get("currentUsage", 0) or 0
+                limit += bonus.get("usageLimit", 0) or 0
+        overage = used - limit
+        if overage < 0:
+            overage = 0.0
+        total_overage += overage
+        out.append({
+            "used": round(used, 2),
+            "limit": round(limit, 2),
+            "overage": round(overage, 2),
+            "overageCostUsd": round(overage * _USAGE_OVERAGE_RATE_USD, 2),
+        })
+    return {
+        "subscription": sub,
+        "nextDateReset": data.get("nextDateReset"),
+        "breakdowns": out,
+        "overageRateUsd": _USAGE_OVERAGE_RATE_USD,
+        "overageCreditsTotal": round(total_overage, 2),
+        "overageCostUsd": round(total_overage * _USAGE_OVERAGE_RATE_USD, 2),
+    }
+
+
+@app.get("/usage", dependencies=[Depends(verify_api_key)])
+async def kiro_usage(request: Request, raw: bool = False):
+    """Account quota via Amazon Q getUsageLimits. Auth: Bearer PROXY_API_KEY."""
+    auth, am = _usage_pick_auth()
+    if auth is None:
+        if am is not None:
+            _ids = list(am._accounts.keys())
+            if _ids:
+                try:
+                    await am._initialize_account(_ids[0])
+                except Exception:
+                    pass
+                _acc = am._accounts.get(_ids[0])
+                auth = _acc.auth_manager if _acc else None
+    if auth is None:
+        raise HTTPException(status_code=503, detail="No initialized Kiro account available")
+
+    token = await auth.get_access_token()
+    profile_arn = auth.profile_arn
+
+    region = None
+    if profile_arn:
+        _parts = profile_arn.split(":")
+        if len(_parts) > 3 and _parts[3]:
+            region = _parts[3]
+    region = region or auth.region or "us-east-1"
+
+    host = "q.{}.amazonaws.com".format(region)
+    url = "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST".format(host)
+    if profile_arn:
+        url += "&profileArn=" + urllib.parse.quote(profile_arn, safe="")
+
+    mid = auth.fingerprint
+    user_agent = (
+        "aws-sdk-js/1.0.0 ua/2.1 os/{os} lang/js md/nodejs#{node} "
+        "api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{ver}-{mid}"
+    ).format(os=_USAGE_SYSTEM_VERSION, node=_USAGE_NODE_VERSION, ver=_USAGE_KIRO_VERSION, mid=mid)
+    amz_user_agent = "aws-sdk-js/1.0.0 KiroIDE-{ver}-{mid}".format(ver=_USAGE_KIRO_VERSION, mid=mid)
+
+    headers = {
+        "x-amz-user-agent": amz_user_agent,
+        "user-agent": user_agent,
+        "amz-sdk-invocation-id": str(uuid.uuid4()),
+        "amz-sdk-request": "attempt=1; max=1",
+        "Authorization": "Bearer {}".format(token),
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(url, headers=headers)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail="Upstream request failed: {}".format(e))
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    data = resp.json()
+    if raw:
+        return data
+    result = _usage_summary(data)
+    result["region"] = region
+    return result
+
+
 # --- Uvicorn log config ---
 # Minimal configuration for redirecting uvicorn logs to loguru.
 # Uses InterceptHandler which intercepts logs and passes them to loguru.

@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
 # Valid model IDs accepted by runtime.{region}.kiro.dev
 # Generated from FALLBACK_MODELS to maintain single source of truth
-from kiro.config import FALLBACK_MODELS
+from kiro.config import FALLBACK_MODELS, MODEL_ALIASES
 
 VALID_RUNTIME_MODEL_IDS: set = {model["modelId"] for model in FALLBACK_MODELS}
 
@@ -214,6 +214,7 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
         >>> get_model_id_for_kiro("claude-3-7-sonnet", {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0"})
         'CLAUDE_3_7_SONNET_20250219_V1_0'
     """
+    model_name = MODEL_ALIASES.get(model_name, model_name)
     normalized = normalize_model_name(model_name)
     internal = hidden_models.get(normalized, normalized)
     return to_runtime_model_id(internal)

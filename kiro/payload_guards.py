@@ -142,11 +142,13 @@ def trim_payload_to_limit(payload: Dict[str, Any], max_bytes: int) -> PayloadTri
     # Strip empty toolUses before measuring
     _strip_empty_tool_uses(history)
 
-    # Trim pairs from the beginning until under limit (keep at least 2 entries)
-    while len(history) > 2 and check_payload_size(payload) > max_bytes:
-        # Remove 2 entries (a user/assistant pair)
-        history.pop(0)
-        history.pop(0)
+    # Pin history[0] (carries the folded-in system prompt) and trim the
+    # oldest pair AFTER it. Deleting at index 1 twice keeps parity (always
+    # removes 2) so role alternation and the user-message head are preserved.
+    while len(history) > 3 and check_payload_size(payload) > max_bytes:
+        # Remove the oldest non-head user/assistant pair
+        del history[1]
+        del history[1]
 
     # Align to userInputMessage boundary
     _align_to_user_message(history)
