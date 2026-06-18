@@ -128,6 +128,44 @@ class TestStreamKiroToOpenai:
         print("✓ First chunk has role: assistant")
     
     @pytest.mark.asyncio
+    async def test_empty_content_events_produce_no_content_chunk(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Empty content events do not emit content chunks.
+        Goal: Keep OpenAI output free of empty deltas (consistency with Anthropic fix).
+        """
+        print("Setup: Mock stream interleaving empty and real content...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="")
+            yield KiroEvent(type="content", content="Hello")
+            yield KiroEvent(type="content", content="")
+        
+        print("Action: Streaming to OpenAI format...")
+        chunks = []
+        
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+        
+        # Only one delta carrying actual text content should exist
+        content_delta_chunks = [
+            c for c in chunks
+            if '"delta"' in c and '"content"' in c and '"Hello"' in c
+        ]
+        empty_content_chunks = [
+            c for c in chunks
+            if '"content": ""' in c
+        ]
+        print(f"Content delta chunks: {len(content_delta_chunks)}, empty: {len(empty_content_chunks)}")
+        assert len(content_delta_chunks) == 1
+        assert empty_content_chunks == []
+        print("✓ No empty content chunks emitted")
+    
+    @pytest.mark.asyncio
     async def test_yields_done_at_end(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
         """
         What it does: Yields [DONE] at end of stream.

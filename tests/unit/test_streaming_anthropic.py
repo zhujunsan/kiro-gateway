@@ -527,6 +527,138 @@ class TestStreamKiroToAnthropic:
 
 
 # ==================================================================================================
+# Tests for empty content block prevention ("(empty placeholder)" regression)
+# ==================================================================================================
+
+class TestStreamingAnthropicEmptyBlocks:
+    """
+    Tests ensuring empty text/thinking blocks are never emitted.
+
+    Upstream Kiro frequently sends zero-length content events around tool calls.
+    If the formatter opened a text content block for such events (without a
+    delta), clients like Cursor render it as "(empty placeholder)". These tests
+    pin the fix that defers block creation until real content arrives.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_content_before_tool_does_not_open_text_block(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Empty content before a tool call opens no text block.
+        Goal: Reproduce the Cursor "(empty placeholder)" scenario and verify fix.
+        """
+        print("Setup: Mock stream with empty content then a tool call...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="")  # empty - must be ignored
+            yield KiroEvent(type="tool_use", tool_use={
+                "id": "toolu_1",
+                "function": {"name": "TodoWrite", "arguments": "{}"}
+            })
+
+        print("Action: Streaming to Anthropic format...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
+        # No text content block should ever be started
+        text_block_starts = [
+            e for e in events
+            if "content_block_start" in e and '"type": "text"' in e
+        ]
+        print(f"Text block starts: {len(text_block_starts)}")
+        assert text_block_starts == []
+
+        # The tool_use block must still be present
+        tool_block_starts = [
+            e for e in events
+            if "content_block_start" in e and '"type": "tool_use"' in e
+        ]
+        assert len(tool_block_starts) == 1
+        print("✓ No empty text block; tool_use block preserved")
+
+    @pytest.mark.asyncio
+    async def test_empty_content_among_real_content_yields_single_block(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Empty content events produce neither extra blocks nor deltas.
+        Goal: Verify only real content drives block/delta emission.
+        """
+        print("Setup: Mock stream interleaving empty and real content...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="")
+            yield KiroEvent(type="content", content="Hello")
+            yield KiroEvent(type="content", content="")
+            yield KiroEvent(type="content", content=" World")
+
+        print("Action: Streaming to Anthropic format...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
+        # Exactly one text block opened
+        text_block_starts = [
+            e for e in events
+            if "content_block_start" in e and '"type": "text"' in e
+        ]
+        assert len(text_block_starts) == 1
+
+        # Exactly two deltas (one per real content event)
+        delta_events = [e for e in events if "content_block_delta" in e]
+        print(f"Delta events: {len(delta_events)}")
+        assert len(delta_events) == 2
+        assert "Hello" in delta_events[0]
+        assert "World" in delta_events[1]
+        print("✓ Single text block, deltas only for real content")
+
+    @pytest.mark.asyncio
+    async def test_empty_thinking_does_not_open_thinking_block(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Empty thinking content opens no thinking block.
+        Goal: Verify thinking branch also avoids empty blocks (as_reasoning_content).
+        """
+        print("Setup: Mock stream with empty thinking then real content...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="")  # empty - ignored
+            yield KiroEvent(type="content", content="Answer")
+
+        print("Action: Streaming with as_reasoning_content mode...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_anthropic.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        events.append(event)
+
+        thinking_block_starts = [
+            e for e in events
+            if "content_block_start" in e and '"type": "thinking"' in e
+        ]
+        print(f"Thinking block starts: {len(thinking_block_starts)}")
+        assert thinking_block_starts == []
+        print("✓ No empty thinking block opened")
+
+
+# ==================================================================================================
 # Tests for collect_anthropic_response()
 # ==================================================================================================
 

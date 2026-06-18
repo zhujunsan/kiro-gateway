@@ -272,8 +272,13 @@ async def _process_chunk(
                 if parse_result.regular_content:
                     yield KiroEvent(type="content", content=parse_result.regular_content)
             else:
-                # No thinking parser - pass through as-is
-                yield KiroEvent(type="content", content=content)
+                # No thinking parser - pass through as-is.
+                # Skip zero-length content events: upstream Kiro frequently emits
+                # empty content chunks (especially around tool calls). Forwarding
+                # them would let downstream formatters open empty text blocks,
+                # which clients such as Cursor render as "(empty placeholder)".
+                if content:
+                    yield KiroEvent(type="content", content=content)
         
         elif event["type"] == "usage":
             yield KiroEvent(type="usage", usage=event["data"])

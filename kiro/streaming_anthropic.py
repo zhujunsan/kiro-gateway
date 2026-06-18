@@ -225,6 +225,14 @@ async def stream_kiro_to_anthropic(
                 content = event.content or ""
                 full_content += content
                 
+                # Defense in depth: never open a text content block for empty
+                # content. Opening a block without a delta yields an empty text
+                # block, which clients like Cursor render as "(empty placeholder)".
+                # The core parser already drops empty content, but guarding here
+                # keeps the formatter correct regardless of upstream changes.
+                if not content:
+                    continue
+                
                 # Close thinking block if it was open and we're now getting regular content
                 if thinking_block_started and thinking_block_index is not None:
                     yield format_sse_event("content_block_stop", {
@@ -247,20 +255,24 @@ async def stream_kiro_to_anthropic(
                     })
                     text_block_started = True
                 
-                # Send content delta
-                if content:
-                    yield format_sse_event("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": text_block_index,
-                        "delta": {
-                            "type": "text_delta",
-                            "text": content
-                        }
-                    })
+                # Send content delta (content is guaranteed non-empty above)
+                yield format_sse_event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": text_block_index,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": content
+                    }
+                })
             
             elif event.type == "thinking":
                 thinking_content = event.thinking_content or ""
                 full_thinking_content += thinking_content
+                
+                # Defense in depth: skip empty thinking content so we never emit
+                # an empty thinking/text block (renders as "(empty placeholder)").
+                if not thinking_content:
+                    continue
                 
                 # Handle thinking content based on mode
                 if FAKE_REASONING_HANDLING == "as_reasoning_content":

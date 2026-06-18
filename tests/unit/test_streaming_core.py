@@ -346,6 +346,38 @@ class TestParseKiroStream:
         print("✓ Content events parsed correctly")
     
     @pytest.mark.asyncio
+    async def test_drops_empty_content_events_end_to_end(self, mock_response, mock_parser):
+        """
+        What it does: parse_kiro_stream yields no content events for empty data.
+        Goal: Verify empty upstream content is filtered before reaching formatters.
+        """
+        print("Setup: Mock parser returning empty + real content...")
+        mock_parser.feed.return_value = [
+            {"type": "content", "data": ""},
+            {"type": "content", "data": "Hi"},
+            {"type": "content", "data": ""},
+        ]
+        
+        async def mock_aiter_bytes():
+            yield b'chunk1'
+        
+        mock_response.aiter_bytes = mock_aiter_bytes
+        
+        print("Action: Parsing stream (thinking parser disabled)...")
+        events = []
+        
+        with patch('kiro.streaming_core.AwsEventStreamParser', return_value=mock_parser):
+            with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', False):
+                async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+                    events.append(event)
+        
+        content_events = [e for e in events if e.type == "content"]
+        print(f"Content events: {len(content_events)}")
+        assert len(content_events) == 1
+        assert content_events[0].content == "Hi"
+        print("✓ Empty content events dropped end-to-end")
+    
+    @pytest.mark.asyncio
     async def test_parses_usage_events(self, mock_response, mock_parser):
         """
         What it does: Parses usage events from Kiro stream.
@@ -675,6 +707,68 @@ class TestProcessChunk:
         assert len(thinking_events) == 1
         assert thinking_events[0].thinking_content == "Let me think"
         print("✓ Thinking content yielded correctly")
+    
+    @pytest.mark.asyncio
+    async def test_drops_empty_content_event_without_thinking_parser(self, mock_parser):
+        """
+        What it does: Drops zero-length content events on the pass-through path.
+        Goal: Prevent empty text blocks downstream (Cursor "(empty placeholder)").
+        """
+        print("Setup: Mock parser with an empty content event...")
+        mock_parser.feed.return_value = [{"type": "content", "data": ""}]
+        
+        print("Action: Processing chunk without thinking parser...")
+        events = []
+        async for event in _process_chunk(mock_parser, b'chunk', None):
+            events.append(event)
+        
+        print(f"Received {len(events)} events")
+        assert events == []
+        print("✓ Empty content event dropped")
+    
+    @pytest.mark.asyncio
+    async def test_preserves_whitespace_only_content_event(self, mock_parser):
+        """
+        What it does: Keeps whitespace-only content (legitimate token boundary).
+        Goal: Ensure the fix drops only truly empty content, not meaningful spaces.
+        """
+        print("Setup: Mock parser with whitespace-only content...")
+        mock_parser.feed.return_value = [{"type": "content", "data": " "}]
+        
+        print("Action: Processing chunk without thinking parser...")
+        events = []
+        async for event in _process_chunk(mock_parser, b'chunk', None):
+            events.append(event)
+        
+        print(f"Received {len(events)} events")
+        assert len(events) == 1
+        assert events[0].type == "content"
+        assert events[0].content == " "
+        print("✓ Whitespace content preserved")
+    
+    @pytest.mark.asyncio
+    async def test_drops_only_empty_among_mixed_content(self, mock_parser):
+        """
+        What it does: Drops empty content but keeps real content in the same chunk.
+        Goal: Verify selective filtering does not lose meaningful tokens.
+        """
+        print("Setup: Mock parser with empty + real + empty content events...")
+        mock_parser.feed.return_value = [
+            {"type": "content", "data": ""},
+            {"type": "content", "data": "Hello"},
+            {"type": "content", "data": ""},
+        ]
+        
+        print("Action: Processing chunk without thinking parser...")
+        events = []
+        async for event in _process_chunk(mock_parser, b'chunk', None):
+            events.append(event)
+        
+        print(f"Received {len(events)} events")
+        content_events = [e for e in events if e.type == "content"]
+        assert len(content_events) == 1
+        assert content_events[0].content == "Hello"
+        print("✓ Only empty content dropped, real content preserved")
 
 
 # ==================================================================================================
