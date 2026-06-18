@@ -248,17 +248,18 @@ HIDDEN_MODELS: Dict[str, str] = {
 # Default: {"auto-kiro": "auto"} to avoid Cursor IDE conflict
 MODEL_ALIASES: Dict[str, str] = {
     "auto-kiro": "auto",  # Default alias to avoid Cursor's "auto" model conflict
-    # Claude Opus
-    "kiro-opus-4.8": "claude-opus-4.8",
-    "kiro-opus-4.7": "claude-opus-4.7",
-    "kiro-opus-4.6": "claude-opus-4.6",
-    "kiro-opus-4.5": "claude-opus-4.5",
-    # Claude Sonnet
-    "kiro-sonnet-4.6": "claude-sonnet-4.6",
-    "kiro-sonnet-4.5": "claude-sonnet-4.5",
-    "kiro-sonnet-4": "claude-sonnet-4",
-    # Claude Haiku
-    "kiro-haiku-4.5": "claude-haiku-4.5",
+    # Claude Opus (use -o- code so the alias does not contain "opus", which
+    # IDEs like Cursor sniff out and treat as a native Anthropic model)
+    "kiro-o-4.8": "claude-opus-4.8",
+    "kiro-o-4.7": "claude-opus-4.7",
+    "kiro-o-4.6": "claude-opus-4.6",
+    "kiro-o-4.5": "claude-opus-4.5",
+    # Claude Sonnet (use -s- code, see note above)
+    "kiro-s-4.6": "claude-sonnet-4.6",
+    "kiro-s-4.5": "claude-sonnet-4.5",
+    "kiro-s-4": "claude-sonnet-4",
+    # Claude Haiku (use -h- code, see note above)
+    "kiro-h-4.5": "claude-haiku-4.5",
     # Non-Claude models
     "kiro-deepseek-3.2": "deepseek-3.2",
     "kiro-glm-5": "glm-5",
