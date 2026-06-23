@@ -9,7 +9,12 @@ import pytest
 
 from kiro.kiro_errors import (
     KiroErrorInfo,
-    enhance_kiro_error
+    enhance_kiro_error,
+    is_context_length_error,
+    build_openai_error_response,
+    build_anthropic_error_response,
+    OPENAI_CONTEXT_LENGTH_CODE,
+    CONTEXT_LENGTH_REASON,
 )
 
 
@@ -625,3 +630,95 @@ class TestEnhanceImproperlyFormedRequest:
 
         # Should fall through to generic handler, not the size-limit message
         assert "payload size exceeded" not in error_info.user_message
+
+
+class TestIsContextLengthError:
+    """Tests for the is_context_length_error helper."""
+
+    def test_true_for_context_length_reason(self):
+        info = enhance_kiro_error(
+            {"message": "Input is too long.", "reason": CONTEXT_LENGTH_REASON}
+        )
+        assert is_context_length_error(info) is True
+
+    def test_false_for_other_reason(self):
+        info = enhance_kiro_error(
+            {"message": "Bad model.", "reason": "INVALID_MODEL_ID"}
+        )
+        assert is_context_length_error(info) is False
+
+    def test_false_for_unknown(self):
+        info = enhance_kiro_error({"message": "boom"})
+        assert is_context_length_error(info) is False
+
+
+class TestBuildOpenAIErrorResponse:
+    """Tests for OpenAI-format error normalization."""
+
+    def test_context_length_normalized_to_400_canonical_shape(self):
+        info = enhance_kiro_error(
+            {"message": "Input is too long.", "reason": CONTEXT_LENGTH_REASON}
+        )
+        # Upstream may report a different status; we force 400.
+        status, body = build_openai_error_response(info, status_code=400)
+        assert status == 400
+        err = body["error"]
+        assert err["type"] == "invalid_request_error"
+        assert err["code"] == OPENAI_CONTEXT_LENGTH_CODE
+        assert err["param"] == "messages"
+        assert err["message"] == info.user_message
+
+    def test_context_length_forces_400_even_if_upstream_differs(self):
+        info = enhance_kiro_error(
+            {"message": "Input is too long.", "reason": CONTEXT_LENGTH_REASON}
+        )
+        status, body = build_openai_error_response(info, status_code=413)
+        assert status == 400
+        assert body["error"]["code"] == OPENAI_CONTEXT_LENGTH_CODE
+
+    def test_non_context_error_keeps_generic_shape(self):
+        info = enhance_kiro_error(
+            {"message": "Bad model.", "reason": "INVALID_MODEL_ID"}
+        )
+        status, body = build_openai_error_response(info, status_code=400)
+        assert status == 400
+        err = body["error"]
+        assert err["type"] == "kiro_api_error"
+        assert err["code"] == 400
+        assert "param" not in err
+
+    def test_non_context_error_preserves_status(self):
+        info = enhance_kiro_error({"message": "server boom"})
+        status, body = build_openai_error_response(info, status_code=500)
+        assert status == 500
+        assert body["error"]["code"] == 500
+        assert body["error"]["type"] == "kiro_api_error"
+
+
+class TestBuildAnthropicErrorResponse:
+    """Tests for Anthropic-format error normalization."""
+
+    def test_context_length_normalized_to_400_invalid_request(self):
+        info = enhance_kiro_error(
+            {"message": "Input is too long.", "reason": CONTEXT_LENGTH_REASON}
+        )
+        status, body = build_anthropic_error_response(info, status_code=400)
+        assert status == 400
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["message"] == info.user_message
+
+    def test_context_length_forces_400(self):
+        info = enhance_kiro_error(
+            {"message": "Input is too long.", "reason": CONTEXT_LENGTH_REASON}
+        )
+        status, _ = build_anthropic_error_response(info, status_code=502)
+        assert status == 400
+
+    def test_non_context_error_keeps_api_error_shape(self):
+        info = enhance_kiro_error({"message": "server boom"})
+        status, body = build_anthropic_error_response(info, status_code=500)
+        assert status == 500
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "api_error"
+        assert body["error"]["message"] == info.user_message

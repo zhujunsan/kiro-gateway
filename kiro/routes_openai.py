@@ -452,6 +452,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     
                     # Extract error reason and save for final return
                     error_reason = None
+                    error_info = None
                     try:
                         error_json = json.loads(error_text)
                         from kiro.kiro_errors import enhance_kiro_error
@@ -479,16 +480,22 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         if debug_logger:
                             debug_logger.flush_on_error(response.status_code, last_error_message)
                         
-                        return JSONResponse(
-                            status_code=response.status_code,
-                            content={
+                        # Normalize context-length errors to OpenAI's canonical
+                        # shape so clients can trigger their own context handling.
+                        if error_info is not None:
+                            from kiro.kiro_errors import build_openai_error_response
+                            resp_status, resp_body = build_openai_error_response(
+                                error_info, response.status_code
+                            )
+                        else:
+                            resp_status, resp_body = response.status_code, {
                                 "error": {
                                     "message": last_error_message,
                                     "type": "kiro_api_error",
-                                    "code": response.status_code
+                                    "code": response.status_code,
                                 }
                             }
-                        )
+                        return JSONResponse(status_code=resp_status, content=resp_body)
                     
                     else:  # ErrorType.RECOVERABLE
                         # RECOVERABLE - try next account
@@ -627,6 +634,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             
             # Try to parse JSON response from Kiro to extract error message
             error_message = error_text
+            error_info = None
             try:
                 error_json = json.loads(error_text)
                 # Enhance Kiro API errors with user-friendly messages
@@ -647,17 +655,22 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             if debug_logger:
                 debug_logger.flush_on_error(response.status_code, error_message)
             
-            # Return error in OpenAI API format
-            return JSONResponse(
-                status_code=response.status_code,
-                content={
+            # Return error in OpenAI API format. Context-length errors are
+            # normalized to OpenAI's canonical context_length_exceeded shape.
+            if error_info is not None:
+                from kiro.kiro_errors import build_openai_error_response
+                resp_status, resp_body = build_openai_error_response(
+                    error_info, response.status_code
+                )
+            else:
+                resp_status, resp_body = response.status_code, {
                     "error": {
                         "message": error_message,
                         "type": "kiro_api_error",
-                        "code": response.status_code
+                        "code": response.status_code,
                     }
                 }
-            )
+            return JSONResponse(status_code=resp_status, content=resp_body)
         
         # Prepare data for fallback token counting
         # Convert Pydantic models to dicts for tokenizer

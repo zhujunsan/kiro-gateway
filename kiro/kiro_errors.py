@@ -37,9 +37,18 @@ Example:
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 from loguru import logger
+
+
+# Kiro's reason code for "conversation exceeds the model context window".
+CONTEXT_LENGTH_REASON = "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+
+# OpenAI-standard error code for context overflow. Clients (and some IDEs)
+# match on this string to trigger their own context-compaction / summarization
+# retry, so we surface Kiro's context error in this canonical shape.
+OPENAI_CONTEXT_LENGTH_CODE = "context_length_exceeded"
 
 
 @dataclass
@@ -139,3 +148,96 @@ def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
         user_message=user_message,
         original_message=original_message
     )
+
+
+def is_context_length_error(error_info: KiroErrorInfo) -> bool:
+    """
+    Check whether an enhanced error represents a context-window overflow.
+
+    Args:
+        error_info: The enhanced error info from enhance_kiro_error().
+
+    Returns:
+        True if the error is Kiro's context-length-exceeded error.
+    """
+    return error_info.reason == CONTEXT_LENGTH_REASON
+
+
+def build_openai_error_response(
+    error_info: KiroErrorInfo,
+    status_code: int,
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    Build an OpenAI-format error body (and status) for a Kiro API error.
+
+    Context-length errors are normalized to OpenAI's canonical shape so that
+    OpenAI-compatible clients can recognize them and trigger their own context
+    handling:
+
+        HTTP 400
+        {"error": {"message": ..., "type": "invalid_request_error",
+                   "param": "messages", "code": "context_length_exceeded"}}
+
+    All other errors keep the gateway's existing generic shape and their
+    original upstream status code, preserving backward compatibility.
+
+    Args:
+        error_info: Enhanced error info from enhance_kiro_error().
+        status_code: Original upstream HTTP status code.
+
+    Returns:
+        (status_code, error_body) tuple ready for JSONResponse.
+    """
+    if is_context_length_error(error_info):
+        return 400, {
+            "error": {
+                "message": error_info.user_message,
+                "type": "invalid_request_error",
+                "param": "messages",
+                "code": OPENAI_CONTEXT_LENGTH_CODE,
+            }
+        }
+
+    return status_code, {
+        "error": {
+            "message": error_info.user_message,
+            "type": "kiro_api_error",
+            "code": status_code,
+        }
+    }
+
+
+def build_anthropic_error_response(
+    error_info: KiroErrorInfo,
+    status_code: int,
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    Build an Anthropic-format error body (and status) for a Kiro API error.
+
+    Context-length errors are normalized to Anthropic's invalid_request_error
+    shape (HTTP 400) so Anthropic-compatible clients can recognize the overflow;
+    all other errors keep the gateway's existing generic shape and status code.
+
+    Args:
+        error_info: Enhanced error info from enhance_kiro_error().
+        status_code: Original upstream HTTP status code.
+
+    Returns:
+        (status_code, error_body) tuple ready for JSONResponse.
+    """
+    if is_context_length_error(error_info):
+        return 400, {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": error_info.user_message,
+            },
+        }
+
+    return status_code, {
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": error_info.user_message,
+        },
+    }
