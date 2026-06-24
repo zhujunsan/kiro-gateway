@@ -47,6 +47,15 @@ from kiro.config import (
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 
 
+# Filler used when a message has no text content but Kiro API requires a
+# non-empty string. MUST NOT be a human-readable phrase: earlier versions used
+# "(empty placeholder)", which the model would echo back as literal output
+# (Cursor then rendered it verbatim and fed it back into history, creating a
+# self-reinforcing contamination loop). A zero-width space satisfies the
+# non-empty requirement while staying invisible if it ever leaks into output.
+EMPTY_CONTENT_PLACEHOLDER = "\u200b"
+
+
 # ==================================================================================================
 # Data Classes for Unified Message Format
 # ==================================================================================================
@@ -1111,7 +1120,7 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
                     content_parts.append(result_text)
             
             # Join all parts with double newline
-            content = "\n\n".join(content_parts) if content_parts else "(empty placeholder)"
+            content = "\n\n".join(content_parts) if content_parts else EMPTY_CONTENT_PLACEHOLDER
             
             # Create a copy of the message without tool content but with text representation
             # IMPORTANT: Preserve images from the original message (e.g., screenshots from MCP tools)
@@ -1336,10 +1345,10 @@ def ensure_first_message_is_user(messages: List[UnifiedMessage]) -> List[Unified
             f"(Kiro API requires conversations to start with user)"
         )
         # Create minimal synthetic user message (matches LiteLLM behavior)
-        # Using "(empty placeholder)" as minimal valid content to avoid disrupting conversation context
+        # Using a zero-width placeholder as minimal valid content to avoid disrupting conversation context
         synthetic_user = UnifiedMessage(
             role="user",
-            content="(empty placeholder)"
+            content=EMPTY_CONTENT_PLACEHOLDER
         )
         
         return [synthetic_user] + messages
@@ -1446,7 +1455,7 @@ def ensure_alternating_roles(messages: List[UnifiedMessage]) -> List[UnifiedMess
         if msg.role == "user" and prev_role == "user":
             synthetic_assistant = UnifiedMessage(
                 role="assistant",
-                content="(empty placeholder)"  # Consistent with build_kiro_history() placeholder
+                content=EMPTY_CONTENT_PLACEHOLDER  # Consistent with build_kiro_history() placeholder
             )
             result.append(synthetic_assistant)
             synthetic_count += 1
@@ -1488,7 +1497,7 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
             
             # Fallback for empty content - Kiro API requires non-empty content
             if not content:
-                content = "(empty placeholder)"
+                content = EMPTY_CONTENT_PLACEHOLDER
             
             user_input = {
                 "content": content,
@@ -1530,7 +1539,7 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
             
             # Fallback for empty content - Kiro API requires non-empty content
             if not content:
-                content = "(empty placeholder)"
+                content = EMPTY_CONTENT_PLACEHOLDER
             
             assistant_response = {"content": content}
             
@@ -1663,11 +1672,11 @@ def build_kiro_payload(
                 "content": current_content
             }
         })
-        current_content = "(empty placeholder)"
+        current_content = EMPTY_CONTENT_PLACEHOLDER
     
     # If content is empty - use placeholder
     if not current_content:
-        current_content = "(empty placeholder)"
+        current_content = EMPTY_CONTENT_PLACEHOLDER
     
     # Process images in current message - extract from message or content
     # IMPORTANT: images go directly into userInputMessage, NOT into userInputMessageContext

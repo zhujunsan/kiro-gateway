@@ -12,6 +12,7 @@ Tests for OpenAI-specific conversion logic:
 import pytest
 from unittest.mock import patch
 
+from kiro.converters_core import EMPTY_CONTENT_PLACEHOLDER
 from kiro.converters_openai import (
     build_kiro_payload,
     convert_openai_messages_to_unified,
@@ -807,7 +808,7 @@ class TestBuildKiroPayload:
         
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert current_content == "(empty placeholder)"
+        assert current_content == EMPTY_CONTENT_PLACEHOLDER
     
     def test_raises_for_empty_messages(self):
         """
@@ -845,7 +846,7 @@ class TestBuildKiroPayload:
 
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert current_content == "(empty placeholder)"
+        assert current_content == EMPTY_CONTENT_PLACEHOLDER
     
     def test_normalizes_model_id_correctly(self):
         """
