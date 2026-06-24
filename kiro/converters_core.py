@@ -707,6 +707,29 @@ def convert_images_to_kiro_format(images: Optional[List[Dict[str, Any]]]) -> Lis
 # Tool Results and Tool Uses Extraction
 # ==================================================================================================
 
+def sanitize_tool_use_id(tool_id: Any) -> str:
+    """
+    Normalize a tool-use identifier for the Kiro API.
+
+    Cursor sometimes emits compound IDs with embedded newlines, e.g.
+    ``call_<uuid>\\nfc_<hash>``. Kiro rejects those with HTTP 400
+    "Invalid tool use format (REQUEST_BODY_INVALID)". Strip all whitespace
+    so matching tool_use / tool_result pairs stay aligned.
+    """
+    if tool_id is None:
+        return ""
+    text = str(tool_id)
+    cleaned = "".join(text.split())
+    if cleaned != text and cleaned:
+        preview = 80
+        logger.debug(
+            "Sanitized tool_use_id (removed whitespace): {!r} -> {!r}",
+            text[:preview] + ("..." if len(text) > preview else ""),
+            cleaned[:preview] + ("..." if len(cleaned) > preview else ""),
+        )
+    return cleaned
+
+
 def convert_tool_results_to_kiro_format(tool_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Converts unified tool results to Kiro API format.
@@ -735,7 +758,7 @@ def convert_tool_results_to_kiro_format(tool_results: List[Dict[str, Any]]) -> L
         kiro_results.append({
             "content": [{"text": content_text}],
             "status": "success",
-            "toolUseId": tr.get("tool_use_id", "")
+            "toolUseId": sanitize_tool_use_id(tr.get("tool_use_id", "")),
         })
     
     return kiro_results
@@ -762,7 +785,7 @@ def extract_tool_results_from_content(content: Any) -> List[Dict[str, Any]]:
                 tool_results.append({
                     "content": [{"text": extract_text_content(item.get("content", "")) or "(empty result)"}],
                     "status": "success",
-                    "toolUseId": item.get("tool_use_id", "")
+                    "toolUseId": sanitize_tool_use_id(item.get("tool_use_id", "")),
                 })
     
     return tool_results
@@ -802,7 +825,7 @@ def extract_tool_uses_from_message(
                 tool_uses.append({
                     "name": func.get("name", ""),
                     "input": input_data,
-                    "toolUseId": tc.get("id", "")
+                    "toolUseId": sanitize_tool_use_id(tc.get("id", "")),
                 })
     
     # From content blocks (Anthropic format)
@@ -812,7 +835,7 @@ def extract_tool_uses_from_message(
                 tool_uses.append({
                     "name": item.get("name", ""),
                     "input": item.get("input", {}),
-                    "toolUseId": item.get("id", "")
+                    "toolUseId": sanitize_tool_use_id(item.get("id", "")),
                 })
     
     return tool_uses

@@ -45,6 +45,7 @@ from kiro.converters_core import (
     UnifiedTool,
     ThinkingConfig,
     build_kiro_payload as core_build_kiro_payload,
+    sanitize_tool_use_id,
 )
 
 
@@ -69,7 +70,7 @@ def _extract_tool_results_from_openai(content: Any) -> List[Dict[str, Any]]:
             if isinstance(item, dict) and item.get("type") == "tool_result":
                 tool_results.append({
                     "type": "tool_result",
-                    "tool_use_id": item.get("tool_use_id", ""),
+                    "tool_use_id": sanitize_tool_use_id(item.get("tool_use_id", "")),
                     "content": extract_text_content(item.get("content", "")) or "(empty result)"
                 })
     
@@ -127,7 +128,7 @@ def _extract_tool_calls_from_openai(msg: ChatMessage) -> List[Dict[str, Any]]:
         for tc in msg.tool_calls:
             if isinstance(tc, dict):
                 tool_calls.append({
-                    "id": tc.get("id", ""),
+                    "id": sanitize_tool_use_id(tc.get("id", "")),
                     "type": "function",
                     "function": {
                         "name": tc.get("function", {}).get("name", ""),
@@ -151,7 +152,7 @@ def _extract_tool_calls_from_openai(msg: ChatMessage) -> List[Dict[str, Any]]:
             # Keep input as-is (dict or str); core extract_tool_uses_from_message
             # accepts both and json-decodes strings.
             tool_calls.append({
-                "id": tool_id,
+                "id": sanitize_tool_use_id(tool_id),
                 "type": "function",
                 "function": {
                     "name": tool_name,
@@ -202,7 +203,7 @@ def convert_openai_messages_to_unified(messages: List[ChatMessage]) -> Tuple[str
             # Collect tool results
             tool_result = {
                 "type": "tool_result",
-                "tool_use_id": msg.tool_call_id or "",
+                "tool_use_id": sanitize_tool_use_id(msg.tool_call_id or ""),
                 "content": extract_text_content(msg.content) or "(empty result)"
             }
             pending_tool_results.append(tool_result)

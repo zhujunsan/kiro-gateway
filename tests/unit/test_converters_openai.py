@@ -137,6 +137,60 @@ class TestConvertOpenAIMessagesToUnified:
         assert unified[0].tool_calls is not None
         assert len(unified[0].tool_calls) == 1
         assert unified[0].tool_calls[0]["id"] == "call_123"
+
+    def test_sanitizes_tool_ids_with_embedded_newlines(self):
+        """
+        Cursor sometimes emits compound tool IDs with embedded newlines.
+        They must be normalized so tool_use/tool_result pairs stay aligned.
+        """
+        raw_id = "call_ba9Q96rddtkJMtrrtZQXHWDr\nfc_08a8627642d75eb1016a182009cd9481a2bdbf6c0ae2e7d"
+        clean_id = "call_ba9Q96rddtkJMtrrtZQXHWDrfc_08a8627642d75eb1016a182009cd9481a2bdbf6c0ae2e7d"
+        messages = [
+            ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{
+                    "id": raw_id,
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": "{}"},
+                }],
+            ),
+            ChatMessage(role="tool", content="file contents", tool_call_id=raw_id),
+            ChatMessage(role="user", content="continue"),
+        ]
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4-5",
+            messages=messages,
+            tools=[Tool(
+                type="function",
+                function=ToolFunction(name="Read", description="Read a file", parameters={}),
+            )],
+        )
+
+        _, unified = convert_openai_messages_to_unified(messages)
+        assert unified[0].tool_calls[0]["id"] == clean_id
+        assert unified[1].tool_results[0]["tool_use_id"] == clean_id
+
+        payload = build_kiro_payload(request, "conv-123", "arn:aws:test")
+        history = payload["conversationState"]["history"]
+        tool_use_ids = [
+            tu["toolUseId"]
+            for turn in history
+            for tu in (turn.get("assistantResponseMessage") or {}).get("toolUses") or []
+        ]
+        tool_result_ids = [
+            tr["toolUseId"]
+            for turn in history
+            for tr in ((turn.get("userInputMessage") or {}).get("userInputMessageContext") or {}).get("toolResults") or []
+        ]
+        current_ctx = (
+            payload["conversationState"]["currentMessage"]["userInputMessage"]
+            .get("userInputMessageContext") or {}
+        )
+        tool_result_ids.extend(tr["toolUseId"] for tr in current_ctx.get("toolResults") or [])
+        assert clean_id in tool_use_ids
+        assert clean_id in tool_result_ids
+        assert "\n" not in clean_id
     
     def test_handles_empty_tool_call_id(self):
         """

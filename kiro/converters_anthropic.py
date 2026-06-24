@@ -43,6 +43,7 @@ from kiro.converters_core import (
     build_kiro_payload,
     extract_text_content,
     extract_images_from_content,
+    sanitize_tool_use_id,
 )
 
 
@@ -194,7 +195,7 @@ def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, 
             tool_results.append(
                 {
                     "type": "tool_result",
-                    "tool_use_id": tool_use_id,
+                    "tool_use_id": sanitize_tool_use_id(tool_use_id),
                     "content": result_content or "(empty result)",
                 }
             )
@@ -281,7 +282,7 @@ def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any
         if block_type == "tool_use" and tool_id and tool_name:
             tool_calls.append(
                 {
-                    "id": tool_id,
+                    "id": sanitize_tool_use_id(tool_id),
                     "type": "function",
                     "function": {
                         "name": tool_name,

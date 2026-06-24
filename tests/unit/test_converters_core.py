@@ -33,6 +33,7 @@ from kiro.converters_core import (
     extract_tool_results_from_content,
     extract_tool_uses_from_message,
     sanitize_json_schema,
+    sanitize_tool_use_id,
     convert_tools_to_kiro_format,
     convert_tool_results_to_kiro_format,
     tool_calls_to_text,
@@ -2776,6 +2777,44 @@ class TestSanitizeJsonSchema:
         assert "additionalProperties" not in result
         assert result["required"] == ["question", "options"]  # Non-empty required is preserved
         assert result["properties"]["question"]["type"] == "string"
+
+
+# ==================================================================================================
+# Tests for sanitize_tool_use_id
+# ==================================================================================================
+
+class TestSanitizeToolUseId:
+    """Tests for sanitize_tool_use_id function."""
+
+    def test_passes_through_clean_ids(self):
+        assert sanitize_tool_use_id("tooluse_abc123") == "tooluse_abc123"
+        assert sanitize_tool_use_id("call_abc") == "call_abc"
+
+    def test_strips_embedded_newlines(self):
+        raw = "call_ba9Q96rddtkJMtrrtZQXHWDr\nfc_08a8627642d75eb1016a182009cd9481a2bdbf6c0ae2e7d"
+        expected = "call_ba9Q96rddtkJMtrrtZQXHWDrfc_08a8627642d75eb1016a182009cd9481a2bdbf6c0ae2e7d"
+        assert sanitize_tool_use_id(raw) == expected
+
+    def test_handles_none_and_empty(self):
+        assert sanitize_tool_use_id(None) == ""
+        assert sanitize_tool_use_id("") == ""
+
+    def test_extract_tool_uses_sanitizes_ids(self):
+        tool_calls = [{
+            "id": "call_x\nfc_y",
+            "type": "function",
+            "function": {"name": "Read", "arguments": "{}"},
+        }]
+        result = extract_tool_uses_from_message(None, tool_calls)
+        assert result[0]["toolUseId"] == "call_xfc_y"
+
+    def test_convert_tool_results_sanitizes_ids(self):
+        result = convert_tool_results_to_kiro_format([{
+            "type": "tool_result",
+            "tool_use_id": "call_x\nfc_y",
+            "content": "ok",
+        }])
+        assert result[0]["toolUseId"] == "call_xfc_y"
 
 
 # ==================================================================================================
