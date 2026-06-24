@@ -51,9 +51,9 @@ from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 # non-empty string. MUST NOT be a human-readable phrase: earlier versions used
 # "(empty placeholder)", which the model would echo back as literal output
 # (Cursor then rendered it verbatim and fed it back into history, creating a
-# self-reinforcing contamination loop). A zero-width space satisfies the
-# non-empty requirement while staying invisible if it ever leaks into output.
-EMPTY_CONTENT_PLACEHOLDER = "\u200b"
+# self-reinforcing contamination loop). A single space satisfies the non-empty
+# requirement while being invisible and avoids zero-width character issues.
+EMPTY_CONTENT_PLACEHOLDER = " "
 
 
 # ==================================================================================================

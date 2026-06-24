@@ -36,6 +36,7 @@ import httpx
 from fastapi import HTTPException
 from loguru import logger
 
+from kiro.converters_core import EMPTY_CONTENT_PLACEHOLDER
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.utils import generate_completion_id
 from kiro.config import (
@@ -331,7 +332,7 @@ async def stream_kiro_to_openai_internal(
             logger.debug(f"Processing {len(all_tool_calls)} tool calls for streaming response")
             
             # If no content was sent yet, Cursor might render "(empty placeholder)".
-            # Inject a tiny invisible zero-width space as content to prevent this UI bug.
+            # Inject a minimal placeholder as content to prevent this UI bug.
             if first_chunk:
                 empty_preventer_chunk = {
                     "id": completion_id,
@@ -340,13 +341,13 @@ async def stream_kiro_to_openai_internal(
                     "model": model,
                     "choices": [{
                         "index": 0,
-                        "delta": {"role": "assistant", "content": "\u200b"},
+                        "delta": {"role": "assistant", "content": EMPTY_CONTENT_PLACEHOLDER},
                         "finish_reason": None
                     }]
                 }
                 yield f"data: {json.dumps(empty_preventer_chunk, ensure_ascii=False)}\n\n"
                 first_chunk = False
-                full_content = "\u200b"
+                full_content = EMPTY_CONTENT_PLACEHOLDER
             
             # Add required index field to each tool_call
             # according to OpenAI API specification for streaming
