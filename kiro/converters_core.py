@@ -904,6 +904,130 @@ def tool_results_to_text(tool_results: List[Dict[str, Any]]) -> str:
 
 
 # ==================================================================================================
+# Unknown Tool Filtering
+# ==================================================================================================
+
+def _tool_call_name(tc: Dict[str, Any]) -> str:
+    """Extract the tool name from a unified tool_call dict."""
+    return (tc.get("function") or {}).get("name", "") or ""
+
+
+def strip_unknown_tool_calls(
+    messages: List[UnifiedMessage],
+    allowed_tool_names: set,
+) -> Tuple[List[UnifiedMessage], bool]:
+    """
+    Converts tool_calls/tool_results that reference tools not present in the
+    current request's tool definitions into text, preserving conversation
+    context.
+
+    Kiro validates that every ``toolUses[].name`` in history refers to a tool
+    declared in the current request. Long-lived clients (Cursor, Cline, …)
+    rebuild their tool set across versions/modes, so an old history can contain
+    tool names (e.g. ``ReadFile``/``ApplyPatch``/``rg``) that the current
+    request no longer declares (it now sends ``Read``/``StrReplace``/``Grep``).
+    Sending those structured tool uses triggers HTTP 400 "Invalid tool use
+    format (REQUEST_BODY_INVALID)".
+
+    To stay robust we keep valid (declared) tool calls structured and downgrade
+    only the unknown ones to text. tool_results are matched to their originating
+    tool_use by id, so a result is downgraded iff its tool_use was.
+
+    Args:
+        messages: List of messages in unified format
+        allowed_tool_names: Set of tool names declared in the current request
+
+    Returns:
+        Tuple of:
+        - List of messages with unknown tool content converted to text
+        - Boolean indicating whether anything was downgraded
+    """
+    if not messages or not allowed_tool_names:
+        return messages, False
+
+    # Pass 1: find tool_use ids whose tool name is not declared this request.
+    unknown_ids: set = set()
+    unknown_names: set = set()
+    for msg in messages:
+        if msg.role != "assistant" or not msg.tool_calls:
+            continue
+        for tc in msg.tool_calls:
+            name = _tool_call_name(tc)
+            if name and name not in allowed_tool_names:
+                tid = tc.get("id", "")
+                if tid:
+                    unknown_ids.add(tid)
+                unknown_names.add(name)
+
+    if not unknown_names:
+        return messages, False
+
+    # Pass 2: rebuild messages, downgrading unknown tool_calls and the
+    # tool_results that correspond to them (matched by tool_use id).
+    result: List[UnifiedMessage] = []
+    downgraded_calls = 0
+    downgraded_results = 0
+    for msg in messages:
+        new_content = extract_text_content(msg.content)
+        appended_parts: List[str] = []
+
+        kept_calls = None
+        if msg.tool_calls:
+            kept_calls = []
+            unknown_calls = []
+            for tc in msg.tool_calls:
+                if _tool_call_name(tc) in allowed_tool_names:
+                    kept_calls.append(tc)
+                else:
+                    unknown_calls.append(tc)
+            if unknown_calls:
+                downgraded_calls += len(unknown_calls)
+                text = tool_calls_to_text(unknown_calls)
+                if text:
+                    appended_parts.append(text)
+            kept_calls = kept_calls or None
+
+        kept_results = None
+        if msg.tool_results:
+            kept_results = []
+            unknown_results = []
+            for tr in msg.tool_results:
+                if tr.get("tool_use_id", "") in unknown_ids:
+                    unknown_results.append(tr)
+                else:
+                    kept_results.append(tr)
+            if unknown_results:
+                downgraded_results += len(unknown_results)
+                text = tool_results_to_text(unknown_results)
+                if text:
+                    appended_parts.append(text)
+            kept_results = kept_results or None
+
+        if appended_parts:
+            new_content = (
+                f"{new_content}\n\n" + "\n\n".join(appended_parts)
+                if new_content
+                else "\n\n".join(appended_parts)
+            )
+
+        result.append(UnifiedMessage(
+            role=msg.role,
+            content=new_content,
+            tool_calls=kept_calls if msg.tool_calls else None,
+            tool_results=kept_results if msg.tool_results else None,
+            images=msg.images,
+        ))
+
+    logger.debug(
+        f"Downgraded tool content referencing undeclared tools "
+        f"{sorted(unknown_names)} to text: "
+        f"{downgraded_calls} tool_calls, {downgraded_results} tool_results"
+    )
+
+    return result, True
+
+
+# ==================================================================================================
 # Message Merging
 # ==================================================================================================
 
@@ -1459,6 +1583,13 @@ def build_kiro_payload(
         messages_with_assistants = messages_without_tools
         converted_tool_results = had_tool_content
     else:
+        # Downgrade history tool calls/results that reference tools not declared
+        # in THIS request (clients like Cursor rebuild their tool set across
+        # versions, leaving stale names like ReadFile/ApplyPatch/rg in history).
+        # Kiro rejects undeclared tool names with 400 "Invalid tool use format".
+        allowed_tool_names = {t.name for t in tools if t.name}
+        messages, _ = strip_unknown_tool_calls(messages, allowed_tool_names)
+
         # Ensure assistant messages exist before tool_results (Kiro API requirement)
         # Also returns flag if any tool_results were converted (to skip thinking tag injection)
         messages_with_assistants, converted_tool_results = ensure_assistant_before_tool_results(messages)

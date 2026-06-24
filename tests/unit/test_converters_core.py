@@ -25,6 +25,7 @@ from kiro.converters_core import (
     ensure_alternating_roles,
     ensure_assistant_before_tool_results,
     strip_all_tool_content,
+    strip_unknown_tool_calls,
     build_kiro_history,
     build_kiro_payload,
     process_tools_with_long_descriptions,
@@ -4209,6 +4210,119 @@ class TestBuildKiroHistory:
 # ==================================================================================================
 # Tests for strip_all_tool_content
 # ==================================================================================================
+
+class TestStripUnknownToolCalls:
+    """
+    Tests for strip_unknown_tool_calls function.
+
+    This function downgrades tool_calls/tool_results that reference tools NOT
+    declared in the current request to text, while keeping declared ones
+    structured. It fixes Kiro 400 "Invalid tool use format" when long-lived
+    clients (Cursor/Cline) send history with stale tool names.
+    """
+
+    def _assistant(self, name, tool_id, args="{}"):
+        return UnifiedMessage(
+            role="assistant",
+            content="",
+            tool_calls=[{
+                "id": tool_id,
+                "type": "function",
+                "function": {"name": name, "arguments": args},
+            }],
+        )
+
+    def _user_result(self, tool_id, content="ok"):
+        return UnifiedMessage(
+            role="user",
+            content="",
+            tool_results=[{
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": content,
+            }],
+        )
+
+    def test_no_tools_declared_is_noop(self):
+        msgs = [self._assistant("ReadFile", "t1"), self._user_result("t1")]
+        result, changed = strip_unknown_tool_calls(msgs, set())
+        assert changed is False
+        assert result is msgs
+
+    def test_all_known_is_noop(self):
+        msgs = [self._assistant("Read", "t1"), self._user_result("t1")]
+        result, changed = strip_unknown_tool_calls(msgs, {"Read"})
+        assert changed is False
+        assert result[0].tool_calls is not None
+        assert result[1].tool_results is not None
+
+    def test_unknown_tool_call_downgraded_to_text(self):
+        msgs = [self._assistant("ReadFile", "t1", '{"path": "a.py"}'),
+                self._user_result("t1", "file contents")]
+        result, changed = strip_unknown_tool_calls(msgs, {"Read"})
+        assert changed is True
+        # tool_calls/tool_results removed, content preserved as text
+        assert result[0].tool_calls is None
+        assert "ReadFile" in result[0].content
+        assert result[1].tool_results is None
+        assert "file contents" in result[1].content
+
+    def test_mixed_known_and_unknown_in_same_message(self):
+        msg = UnifiedMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {"id": "t1", "type": "function",
+                 "function": {"name": "Read", "arguments": "{}"}},
+                {"id": "t2", "type": "function",
+                 "function": {"name": "ReadFile", "arguments": "{}"}},
+            ],
+        )
+        results_msg = UnifiedMessage(
+            role="user", content="",
+            tool_results=[
+                {"type": "tool_result", "tool_use_id": "t1", "content": "r1"},
+                {"type": "tool_result", "tool_use_id": "t2", "content": "r2"},
+            ],
+        )
+        result, changed = strip_unknown_tool_calls([msg, results_msg], {"Read"})
+        assert changed is True
+        # Known call kept structured, unknown downgraded
+        assert result[0].tool_calls is not None
+        assert len(result[0].tool_calls) == 1
+        assert result[0].tool_calls[0]["function"]["name"] == "Read"
+        assert "ReadFile" in result[0].content
+        # Matching result: t1 kept, t2 downgraded
+        assert result[1].tool_results is not None
+        assert len(result[1].tool_results) == 1
+        assert result[1].tool_results[0]["tool_use_id"] == "t1"
+        assert "r2" in result[1].content
+
+    def test_existing_text_content_preserved(self):
+        msg = UnifiedMessage(
+            role="assistant",
+            content="some thoughts",
+            tool_calls=[{"id": "t1", "type": "function",
+                         "function": {"name": "rg", "arguments": "{}"}}],
+        )
+        result, changed = strip_unknown_tool_calls([msg], {"Grep"})
+        assert changed is True
+        assert result[0].content.startswith("some thoughts")
+        assert "rg" in result[0].content
+
+    def test_images_preserved(self):
+        msg = UnifiedMessage(
+            role="assistant",
+            content="",
+            tool_calls=[{"id": "t1", "type": "function",
+                         "function": {"name": "ApplyPatch", "arguments": "{}"}}],
+            images=[{"media_type": "image/jpeg", "data": TEST_IMAGE_BASE64}],
+        )
+        result, changed = strip_unknown_tool_calls([msg], {"Write"})
+        assert changed is True
+        assert result[0].images is not None
+        assert len(result[0].images) == 1
+
 
 class TestStripAllToolContent:
     """
