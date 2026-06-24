@@ -11,6 +11,7 @@ from kiro.parsers import (
     AwsEventStreamParser,
     find_matching_brace,
     parse_bracket_tool_calls,
+    parse_xml_tool_calls,
     deduplicate_tool_calls
 )
 
@@ -231,6 +232,259 @@ class TestParseBracketToolCalls:
         print(f"IDs: {[r['id'] for r in result]}")
         assert len(result) == 2
         assert result[0]["id"] != result[1]["id"]
+
+
+class TestParseXmlToolCalls:
+    """Tests for parse_xml_tool_calls function."""
+
+    def test_parses_single_string_param(self):
+        """
+        What it does: Tests parsing of a single <invoke> with one string parameter.
+        Goal: Ensure basic XML tool call is extracted correctly.
+        """
+        print("Setup: Simple invoke with one string param...")
+        text = '<invoke name="Shell"><parameter name="command">ls -la</parameter></invoke>'
+
+        print("Action: Parsing XML tool calls...")
+        result = parse_xml_tool_calls(text)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "Shell"
+        import json
+        args = json.loads(result[0]["function"]["arguments"])
+        assert args["command"] == "ls -la"
+
+    def test_parses_multiple_string_params(self):
+        """
+        What it does: Tests parsing of invoke with multiple string parameters.
+        Goal: Ensure all parameters are extracted.
+        """
+        print("Setup: Invoke with multiple params...")
+        text = (
+            '<invoke name="Shell">'
+            '<parameter name="command">git push origin v0.1.19</parameter>'
+            '<parameter name="description">push tag</parameter>'
+            '<parameter name="working_directory">/home/user/project</parameter>'
+            '</invoke>'
+        )
+
+        print("Action: Parsing XML tool calls...")
+        result = parse_xml_tool_calls(text)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        import json
+        args = json.loads(result[0]["function"]["arguments"])
+        assert args["command"] == "git push origin v0.1.19"
+        assert args["description"] == "push tag"
+        assert args["working_directory"] == "/home/user/project"
+
+    def test_decodes_json_array_param(self):
+        """
+        What it does: Tests that a parameter containing a JSON array is decoded.
+        Goal: Ensure AskQuestion-style questions list is parsed as a list, not a string.
+        """
+        print("Setup: AskQuestion invoke with JSON array param...")
+        text = (
+            '<invoke name="AskQuestion">'
+            '<parameter name="questions">[{"id": "fix", "options": [{"id": "a", "label": "A"}], "prompt": "Choose"}]</parameter>'
+            '</invoke>'
+        )
+
+        print("Action: Parsing XML tool calls...")
+        result = parse_xml_tool_calls(text)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "AskQuestion"
+        import json
+        args = json.loads(result[0]["function"]["arguments"])
+        assert isinstance(args["questions"], list)
+        assert args["questions"][0]["id"] == "fix"
+
+    def test_decodes_json_object_param(self):
+        """
+        What it does: Tests that a parameter containing a JSON object is decoded.
+        Goal: Ensure object-valued params are not kept as raw strings.
+        """
+        print("Setup: Invoke with JSON object param...")
+        text = (
+            '<invoke name="StrReplace">'
+            '<parameter name="path">/app/file.py</parameter>'
+            '<parameter name="old_string">old value</parameter>'
+            '<parameter name="new_string">new value</parameter>'
+            '</invoke>'
+        )
+
+        print("Action: Parsing XML tool calls...")
+        result = parse_xml_tool_calls(text)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        import json
+        args = json.loads(result[0]["function"]["arguments"])
+        assert args["path"] == "/app/file.py"
+        assert args["old_string"] == "old value"
+        assert args["new_string"] == "new value"
+
+    def test_parses_multiline_invoke(self):
+        """
+        What it does: Tests parsing of multi-line invoke block.
+        Goal: Ensure newlines inside the block are handled.
+        """
+        print("Setup: Multi-line invoke block...")
+        text = (
+            '<invoke name="Shell">\n'
+            '<parameter name="command">echo hello</parameter>\n'
+            '</invoke>'
+        )
+
+        print("Action: Parsing XML tool calls...")
+        result = parse_xml_tool_calls(text)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        import json
+        args = json.loads(result[0]["function"]["arguments"])
+        assert args["command"] == "echo hello"
+
+    def test_parses_multiple_invokes(self):
+        """
+        What it does: Tests parsing of multiple <invoke> blocks in one response.
+        Goal: Ensure all tool calls are extracted.
+        """
+        print("Setup: Two invoke blocks...")
+        text = (
+            'First call: <invoke name="Read"><parameter name="path">/app/a.py</parameter></invoke>'
+            ' then: <invoke name="Shell"><parameter name="command">pytest</parameter></invoke>'
+        )
+
+        print("Action: Parsing XML tool calls...")
+        result = parse_xml_tool_calls(text)
+
+        print(f"Result: {result}")
+        assert len(result) == 2
+        assert result[0]["function"]["name"] == "Read"
+        assert result[1]["function"]["name"] == "Shell"
+
+    def test_ignores_call_prefix(self):
+        """
+        What it does: Tests that the 'call\\n' prefix some generations emit is ignored.
+        Goal: Ensure the prefix doesn't prevent parsing.
+        """
+        print("Setup: Invoke with 'call' prefix as seen in real transcripts...")
+        text = (
+            'call\n'
+            '<invoke name="AskQuestion">'
+            '<parameter name="questions">[]</parameter>'
+            '</invoke>'
+        )
+
+        print("Action: Parsing XML tool calls...")
+        result = parse_xml_tool_calls(text)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "AskQuestion"
+
+    def test_returns_empty_for_no_invoke(self):
+        """
+        What it does: Tests returning empty list when no <invoke> present.
+        Goal: Ensure regular text is not parsed as tool call.
+        """
+        print("Setup: Regular text without invoke...")
+        text = "This is just regular text without any tool calls."
+
+        print("Action: Parsing XML tool calls...")
+        result = parse_xml_tool_calls(text)
+
+        print(f"Comparing result: Expected [], Got {result}")
+        assert result == []
+
+    def test_returns_empty_for_empty_string(self):
+        """
+        What it does: Tests handling of empty string.
+        Goal: Ensure empty string doesn't cause errors.
+        """
+        result = parse_xml_tool_calls("")
+        assert result == []
+
+    def test_returns_empty_for_none(self):
+        """
+        What it does: Tests handling of None.
+        Goal: Ensure None doesn't cause errors.
+        """
+        result = parse_xml_tool_calls(None)
+        assert result == []
+
+    def test_generates_unique_ids(self):
+        """
+        What it does: Tests generation of unique IDs for XML tool calls.
+        Goal: Ensure each tool call gets a unique ID.
+        """
+        print("Setup: Two identical invoke blocks...")
+        block = '<invoke name="Shell"><parameter name="command">ls</parameter></invoke>'
+        text = block + block
+
+        print("Action: Parsing XML tool calls...")
+        result = parse_xml_tool_calls(text)
+
+        print(f"IDs: {[r['id'] for r in result]}")
+        assert len(result) == 2
+        assert result[0]["id"] != result[1]["id"]
+
+    def test_fallback_to_string_for_invalid_json_param(self):
+        """
+        What it does: Tests that params starting with { but containing invalid JSON
+        are kept as raw strings rather than raising an error.
+        Goal: Ensure robustness when parameter value looks like JSON but is malformed.
+        """
+        print("Setup: Param that starts with { but is not valid JSON...")
+        text = (
+            '<invoke name="Shell">'
+            '<parameter name="command">{not valid json</parameter>'
+            '</invoke>'
+        )
+
+        print("Action: Parsing XML tool calls...")
+        result = parse_xml_tool_calls(text)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        import json
+        args = json.loads(result[0]["function"]["arguments"])
+        assert args["command"] == "{not valid json"
+
+    def test_real_world_askquestion_from_transcript(self):
+        """
+        What it does: Tests parsing of an exact AskQuestion block from a real transcript.
+        Goal: Reproduce the actual failure case that caused conversations to appear cut off.
+        """
+        print("Setup: Real-world AskQuestion block from transcript...")
+        # Exact format seen in a0ca95ba session line 76
+        text = (
+            'call\n'
+            '<invoke name="AskQuestion">\n'
+            '<parameter name="questions">[{"id": "fix", "options": ['
+            '{"id": "revert_exec", "label": "回退到裸可执行"}, '
+            '{"id": "keep", "label": "保持现状"}], '
+            '"prompt": "macOS 开机自启登录项显示怎么修？"}]</parameter>\n'
+            '</invoke>'
+        )
+
+        print("Action: Parsing XML tool calls...")
+        result = parse_xml_tool_calls(text)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "AskQuestion"
+        import json
+        args = json.loads(result[0]["function"]["arguments"])
+        questions = args["questions"]
+        assert isinstance(questions, list)
+        assert questions[0]["prompt"] == "macOS 开机自启登录项显示怎么修？"
+        assert len(questions[0]["options"]) == 2
 
 
 class TestDeduplicateToolCalls:

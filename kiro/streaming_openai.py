@@ -330,6 +330,24 @@ async def stream_kiro_to_openai_internal(
         if all_tool_calls:
             logger.debug(f"Processing {len(all_tool_calls)} tool calls for streaming response")
             
+            # If no content was sent yet, Cursor might render "(empty placeholder)".
+            # Inject a tiny invisible zero-width space as content to prevent this UI bug.
+            if first_chunk:
+                empty_preventer_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": "\u200b"},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(empty_preventer_chunk, ensure_ascii=False)}\n\n"
+                first_chunk = False
+                full_content = "\u200b"
+            
             # Add required index field to each tool_call
             # according to OpenAI API specification for streaming
             indexed_tool_calls = []

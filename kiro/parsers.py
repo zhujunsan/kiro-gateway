@@ -148,6 +148,89 @@ def parse_bracket_tool_calls(response_text: str) -> List[Dict[str, Any]]:
     return tool_calls
 
 
+def parse_xml_tool_calls(response_text: str) -> List[Dict[str, Any]]:
+    """
+    Parses tool calls in XML <invoke> format embedded in response text.
+
+    Claude occasionally falls back to the legacy XML tool-call format
+    (trained on older Anthropic data) instead of emitting a structured
+    tool_use event.  This function detects and extracts those calls so
+    they are not silently dropped.
+
+    Expected format::
+
+        <invoke name="ToolName">
+        <parameter name="param1">value1</parameter>
+        <parameter name="param2">{"key": "val"}</parameter>
+        </invoke>
+
+    The ``call`` prefix that some generations emit before the tag is
+    ignored.  Parameter values that look like JSON (start with ``{`` or
+    ``[``) are decoded; all other values are kept as plain strings.
+
+    Args:
+        response_text: Full model response text
+
+    Returns:
+        List of tool calls in OpenAI format
+
+    Example:
+        >>> text = '<invoke name="Shell"><parameter name="command">ls</parameter></invoke>'
+        >>> calls = parse_xml_tool_calls(text)
+        >>> calls[0]["function"]["name"]
+        'Shell'
+        >>> import json; json.loads(calls[0]["function"]["arguments"])
+        {'command': 'ls'}
+    """
+    if not response_text or "<invoke" not in response_text:
+        return []
+
+    tool_calls = []
+
+    # Match each <invoke name="...">...</invoke> block (DOTALL for multi-line values)
+    invoke_pattern = re.compile(
+        r'<invoke\s+name="([^"]+)">(.*?)</invoke>',
+        re.DOTALL | re.IGNORECASE,
+    )
+    param_pattern = re.compile(
+        r'<parameter\s+name="([^"]+)">(.*?)</parameter>',
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    for invoke_match in invoke_pattern.finditer(response_text):
+        tool_name = invoke_match.group(1).strip()
+        body = invoke_match.group(2)
+
+        params: Dict[str, Any] = {}
+        for param_match in param_pattern.finditer(body):
+            key = param_match.group(1).strip()
+            raw_value = param_match.group(2).strip()
+
+            # Try to decode JSON values (objects / arrays)
+            if raw_value and raw_value[0] in ('{', '['):
+                try:
+                    params[key] = json.loads(raw_value)
+                except json.JSONDecodeError:
+                    params[key] = raw_value
+            else:
+                params[key] = raw_value
+
+        tool_call_id = generate_tool_call_id()
+        tool_calls.append({
+            "id": tool_call_id,
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "arguments": json.dumps(params, ensure_ascii=False),
+            },
+        })
+        logger.debug(
+            f"parse_xml_tool_calls: extracted '{tool_name}' with params {list(params.keys())}"
+        )
+
+    return tool_calls
+
+
 def deduplicate_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Removes duplicate tool calls.

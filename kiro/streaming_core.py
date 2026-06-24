@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Awaitable, Dict
 import httpx
 from loguru import logger
 
-from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, parse_xml_tool_calls, deduplicate_tool_calls
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
@@ -327,10 +327,20 @@ async def collect_stream_to_result(
         elif event.type == "context_usage" and event.context_usage_percentage is not None:
             result.context_usage_percentage = event.context_usage_percentage
     
-    # Check for bracket-style tool calls in full content
+    # Fallback 1: bracket-style tool calls  [Called func with args: {...}]
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
     if bracket_tool_calls:
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
+
+    # Fallback 2: XML-style tool calls  <invoke name="..."><parameter ...>
+    # Claude occasionally emits legacy XML format instead of structured tool_use events.
+    xml_tool_calls = parse_xml_tool_calls(full_content_for_bracket_tools)
+    if xml_tool_calls:
+        logger.warning(
+            f"XML tool call fallback triggered: extracted {len(xml_tool_calls)} call(s) "
+            f"from text — model emitted legacy <invoke> format"
+        )
+        result.tool_calls = deduplicate_tool_calls(result.tool_calls + xml_tool_calls)
     
     return result
 
