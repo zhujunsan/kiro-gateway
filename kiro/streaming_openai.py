@@ -69,6 +69,13 @@ except ImportError:
 # Re-export FirstTokenTimeoutError for backward compatibility
 __all__ = ['FirstTokenTimeoutError', 'stream_kiro_to_openai', 'stream_with_first_token_retry', 'collect_stream_response']
 
+# Maximum size (in characters) of a single tool_call `arguments` slice sent per
+# SSE chunk. Tool arguments are streamed incrementally (OpenAI spec) instead of
+# in one giant chunk so that no single `data:` line becomes oversized — large
+# lines can be buffered/truncated by intermediaries (e.g. cloudflared) and make
+# clients such as Cursor hang. ~1KB keeps lines small while limiting overhead.
+TOOL_CALL_ARG_CHUNK_SIZE = 1024
+
 
 async def stream_kiro_to_openai_internal(
     client: httpx.AsyncClient,
@@ -345,13 +352,40 @@ async def stream_kiro_to_openai_internal(
                         "finish_reason": None
                     }]
                 }
-                yield f"data: {json.dumps(empty_preventer_chunk, ensure_ascii=False)}\n\n"
+                empty_preventer_text = f"data: {json.dumps(empty_preventer_chunk, ensure_ascii=False)}\n\n"
+                if debug_logger:
+                    debug_logger.log_modified_chunk(empty_preventer_text.encode('utf-8'))
+                yield empty_preventer_text
                 first_chunk = False
                 full_content = EMPTY_CONTENT_PLACEHOLDER
             
-            # Add required index field to each tool_call
-            # according to OpenAI API specification for streaming
-            indexed_tool_calls = []
+            from kiro.converters_core import get_original_tool_name
+            
+            def _emit_tool_call_chunk(delta_tool_call: dict) -> str:
+                """Wrap a single tool_call delta in an OpenAI chunk and log it."""
+                chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"tool_calls": [delta_tool_call]},
+                        "finish_reason": None
+                    }]
+                }
+                text = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                if debug_logger:
+                    debug_logger.log_modified_chunk(text.encode('utf-8'))
+                return text
+            
+            # Stream each tool call as incremental deltas per OpenAI spec:
+            # 1) An opening delta carrying index/id/type/name and empty arguments.
+            # 2) One or more deltas carrying successive slices of the arguments JSON.
+            # Splitting the (potentially very large) arguments string avoids a single
+            # oversized SSE line, which can be buffered/truncated by intermediaries
+            # (e.g. cloudflared) and makes clients like Cursor hang waiting for the
+            # stream to "finish" instead of seeing progressive tool_call deltas.
             for idx, tc in enumerate(all_tool_calls):
                 # Extract function with None protection
                 func = tc.get("function") or {}
@@ -360,34 +394,31 @@ async def stream_kiro_to_openai_internal(
                 tool_args = func.get("arguments") or "{}"
                 
                 # Reverse-map truncated tool names back to originals
-                from kiro.converters_core import get_original_tool_name
                 tool_name = get_original_tool_name(tool_name)
                 
                 logger.debug(f"Tool call [{idx}] '{tool_name}': id={tc.get('id')}, args_length={len(tool_args)}")
                 
-                indexed_tc = {
+                # Opening delta: identity + empty arguments
+                yield _emit_tool_call_chunk({
                     "index": idx,
                     "id": tc.get("id"),
                     "type": tc.get("type", "function"),
                     "function": {
                         "name": tool_name,
-                        "arguments": tool_args
+                        "arguments": ""
                     }
-                }
-                indexed_tool_calls.append(indexed_tc)
-            
-            tool_calls_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"tool_calls": indexed_tool_calls},
-                    "finish_reason": None
-                }]
-            }
-            yield f"data: {json.dumps(tool_calls_chunk, ensure_ascii=False)}\n\n"
+                })
+                
+                # Argument deltas: slice the JSON string into bounded pieces.
+                # Empty arguments still need at least one delta so clients that
+                # only look at argument deltas see a complete "{}" (or "").
+                if tool_args:
+                    for start in range(0, len(tool_args), TOOL_CALL_ARG_CHUNK_SIZE):
+                        arg_slice = tool_args[start:start + TOOL_CALL_ARG_CHUNK_SIZE]
+                        yield _emit_tool_call_chunk({
+                            "index": idx,
+                            "function": {"arguments": arg_slice}
+                        })
         
         # Save truncation info for recovery (tracked by stable identifiers)
         from kiro.truncation_recovery import should_inject_recovery
@@ -440,8 +471,13 @@ async def stream_kiro_to_openai_internal(
             f"total_tokens={total_tokens} ({total_source})"
         )
         
-        yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
+        final_chunk_text = f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+        done_text = "data: [DONE]\n\n"
+        if debug_logger:
+            debug_logger.log_modified_chunk(final_chunk_text.encode('utf-8'))
+            debug_logger.log_modified_chunk(done_text.encode('utf-8'))
+        yield final_chunk_text
+        yield done_text
         
     except FirstTokenTimeoutError:
         # Propagate timeout up for retry
@@ -630,7 +666,11 @@ async def collect_stream_response(
     full_content = ""
     full_reasoning_content = ""
     final_usage = None
-    tool_calls = []
+    # Incremental tool_calls are merged by their delta `index` into this dict,
+    # preserving first-seen order. Streaming now sends an opening delta (id/name)
+    # followed by argument slices, so we accumulate arguments per index.
+    tool_calls_by_index = {}
+    tool_call_order = []
     finish_reason = "stop"  # Default fallback
     completion_id = generate_completion_id()
     
@@ -660,7 +700,32 @@ async def collect_stream_response(
             if "reasoning_content" in delta:
                 full_reasoning_content += delta["reasoning_content"]
             if "tool_calls" in delta:
-                tool_calls.extend(delta["tool_calls"])
+                for tc_delta in delta["tool_calls"]:
+                    # Merge by index (incremental streaming format). Fallback to
+                    # positional index if a producer omits it.
+                    tc_index = tc_delta.get("index")
+                    if tc_index is None:
+                        tc_index = len(tool_call_order)
+                    
+                    if tc_index not in tool_calls_by_index:
+                        tool_calls_by_index[tc_index] = {
+                            "id": None,
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                        tool_call_order.append(tc_index)
+                    
+                    acc = tool_calls_by_index[tc_index]
+                    if tc_delta.get("id"):
+                        acc["id"] = tc_delta["id"]
+                    if tc_delta.get("type"):
+                        acc["type"] = tc_delta["type"]
+                    
+                    func_delta = tc_delta.get("function") or {}
+                    if func_delta.get("name"):
+                        acc["function"]["name"] = func_delta["name"]
+                    if "arguments" in func_delta and func_delta["arguments"]:
+                        acc["function"]["arguments"] += func_delta["arguments"]
             
             # Extract finish_reason from chunk (streaming already calculated it correctly)
             finish_reason_from_chunk = chunk_data.get("choices", [{}])[0].get("finish_reason")
@@ -673,6 +738,8 @@ async def collect_stream_response(
                 
         except (json.JSONDecodeError, IndexError):
             continue
+    
+    tool_calls = [tool_calls_by_index[i] for i in tool_call_order]
     
     # Form final response
     message = {"role": "assistant", "content": full_content}
@@ -690,7 +757,7 @@ async def collect_stream_response(
                 "type": tc.get("type", "function"),
                 "function": {
                     "name": func.get("name", ""),
-                    "arguments": func.get("arguments", "{}")
+                    "arguments": func.get("arguments") or "{}"
                 }
             }
             cleaned_tool_calls.append(cleaned_tc)

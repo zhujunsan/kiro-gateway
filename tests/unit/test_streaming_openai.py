@@ -535,7 +535,10 @@ class TestStreamingOpenaiNoneProtection:
         tool_chunks = [c for c in chunks if '"tool_calls"' in c]
         assert len(tool_chunks) >= 1
         
-        # Parse and verify name is empty string
+        # Tool calls are streamed incrementally: the opening delta carries the
+        # name (None -> "") and subsequent deltas carry only argument slices.
+        # Collect the name from whichever delta provides it.
+        names = []
         for chunk in tool_chunks:
             if chunk.startswith("data: "):
                 json_str = chunk[6:].strip()
@@ -545,7 +548,12 @@ class TestStreamingOpenaiNoneProtection:
                         delta = data["choices"][0].get("delta", {})
                         if "tool_calls" in delta:
                             for tc in delta["tool_calls"]:
-                                assert tc["function"]["name"] == ""
+                                func = tc.get("function") or {}
+                                if "name" in func:
+                                    names.append(func["name"])
+        
+        # None name must be normalized to empty string in the opening delta.
+        assert names and all(n == "" for n in names)
         
         print("✓ None function name handled")
     
@@ -580,7 +588,10 @@ class TestStreamingOpenaiNoneProtection:
         tool_chunks = [c for c in chunks if '"tool_calls"' in c]
         assert len(tool_chunks) >= 1
         
-        # Parse and verify arguments is "{}"
+        # Tool calls stream incrementally: reassemble argument slices across
+        # deltas (the opening delta has empty arguments, then slices follow).
+        # None arguments must be normalized to "{}".
+        reassembled = ""
         for chunk in tool_chunks:
             if chunk.startswith("data: "):
                 json_str = chunk[6:].strip()
@@ -590,7 +601,11 @@ class TestStreamingOpenaiNoneProtection:
                         delta = data["choices"][0].get("delta", {})
                         if "tool_calls" in delta:
                             for tc in delta["tool_calls"]:
-                                assert tc["function"]["arguments"] == "{}"
+                                func = tc.get("function") or {}
+                                if "arguments" in func and func["arguments"]:
+                                    reassembled += func["arguments"]
+        
+        assert reassembled == "{}"
         
         print("✓ None function arguments handled")
     
