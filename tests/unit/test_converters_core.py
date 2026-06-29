@@ -12,6 +12,7 @@ Tests for shared conversion logic used by both OpenAI and Anthropic adapters:
 """
 
 import os
+import re
 import pytest
 from unittest.mock import patch
 
@@ -34,6 +35,7 @@ from kiro.converters_core import (
     extract_tool_uses_from_message,
     sanitize_json_schema,
     sanitize_tool_use_id,
+    TOOL_USE_ID_MAX_LENGTH,
     convert_tools_to_kiro_format,
     convert_tool_results_to_kiro_format,
     tool_calls_to_text,
@@ -2791,14 +2793,38 @@ class TestSanitizeToolUseId:
         assert sanitize_tool_use_id("tooluse_abc123") == "tooluse_abc123"
         assert sanitize_tool_use_id("call_abc") == "call_abc"
 
-    def test_strips_embedded_newlines(self):
-        raw = "call_ba9Q96rddtkJMtrrtZQXHWDr\nfc_08a8627642d75eb1016a182009cd9481a2bdbf6c0ae2e7d"
-        expected = "call_ba9Q96rddtkJMtrrtZQXHWDrfc_08a8627642d75eb1016a182009cd9481a2bdbf6c0ae2e7d"
+    def test_strips_embedded_newlines_when_within_limit(self):
+        raw = "call_short\nfc_abc123"
+        expected = "call_shortfc_abc123"
         assert sanitize_tool_use_id(raw) == expected
+        assert len(expected) <= TOOL_USE_ID_MAX_LENGTH
 
     def test_handles_none_and_empty(self):
         assert sanitize_tool_use_id(None) == ""
         assert sanitize_tool_use_id("") == ""
+
+    def test_truncates_ids_over_64_chars(self):
+        # Cursor compound IDs (call_<24>\nfc_<50hex>) join to ~82 chars, which
+        # Kiro rejects. The result must fit the 64-char/charset limit.
+        raw = "call_XIEn2Zmm4S8apT60EsM6eEpu\nfc_025171eceade8063016a412bdf1000819fa9ed2aef76be6340"
+        out = sanitize_tool_use_id(raw)
+        assert len(out) == TOOL_USE_ID_MAX_LENGTH
+        assert re.fullmatch(r"[a-zA-Z0-9_-]+", out)
+
+    def test_is_deterministic_so_pairs_stay_aligned(self):
+        # tool_use and tool_result are sanitized independently; the same input
+        # must always map to the same output or pairing breaks.
+        raw = "call_XIEn2Zmm4S8apT60EsM6eEpu\nfc_025171eceade8063016a412bdf1000819fa9ed2aef76be6340"
+        assert sanitize_tool_use_id(raw) == sanitize_tool_use_id(raw)
+
+    def test_long_ids_sharing_prefix_do_not_collide(self):
+        base = "call_AAAAAAAAAAAAAAAAAAAAAAAA\nfc_" + "0" * 47
+        a = sanitize_tool_use_id(base + "1")
+        b = sanitize_tool_use_id(base + "2")
+        assert a != b
+
+    def test_replaces_disallowed_characters(self):
+        assert re.fullmatch(r"[a-zA-Z0-9_-]+", sanitize_tool_use_id("call/abc.def:ghi"))
 
     def test_extract_tool_uses_sanitizes_ids(self):
         tool_calls = [{

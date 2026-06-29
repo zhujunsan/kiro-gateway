@@ -12,7 +12,11 @@ Tests for OpenAI-specific conversion logic:
 import pytest
 from unittest.mock import patch
 
-from kiro.converters_core import EMPTY_CONTENT_PLACEHOLDER
+from kiro.converters_core import (
+    EMPTY_CONTENT_PLACEHOLDER,
+    sanitize_tool_use_id,
+    TOOL_USE_ID_MAX_LENGTH,
+)
 from kiro.converters_openai import (
     build_kiro_payload,
     convert_openai_messages_to_unified,
@@ -145,7 +149,11 @@ class TestConvertOpenAIMessagesToUnified:
         They must be normalized so tool_use/tool_result pairs stay aligned.
         """
         raw_id = "call_ba9Q96rddtkJMtrrtZQXHWDr\nfc_08a8627642d75eb1016a182009cd9481a2bdbf6c0ae2e7d"
-        clean_id = "call_ba9Q96rddtkJMtrrtZQXHWDrfc_08a8627642d75eb1016a182009cd9481a2bdbf6c0ae2e7d"
+        # Joined this id is 79 chars; Kiro caps toolUseId at 64, so the
+        # sanitizer truncates with a hash suffix. Use the live transform so the
+        # test tracks the real behavior on both tool_use / tool_result sides.
+        clean_id = sanitize_tool_use_id(raw_id)
+        assert len(clean_id) <= TOOL_USE_ID_MAX_LENGTH
         messages = [
             ChatMessage(
                 role="assistant",

@@ -30,7 +30,9 @@ The core layer provides a unified interface that API-specific adapters use
 to convert their formats to Kiro API format.
 """
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -716,23 +718,46 @@ def convert_images_to_kiro_format(images: Optional[List[Dict[str, Any]]]) -> Lis
 # Tool Results and Tool Uses Extraction
 # ==================================================================================================
 
+# Kiro (CodeWhisperer / Bedrock Converse) constrains toolUseId to
+# 1..64 chars matching ``[a-zA-Z0-9_-]+``. Anything longer or with stray
+# characters is rejected with HTTP 400 "Invalid tool use format
+# (REQUEST_BODY_INVALID)". See AWS Bedrock ToolUseBlock / ToolResultBlock docs.
+TOOL_USE_ID_MAX_LENGTH = 64
+_TOOL_USE_ID_INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
+
+
 def sanitize_tool_use_id(tool_id: Any) -> str:
     """
     Normalize a tool-use identifier for the Kiro API.
 
     Cursor sometimes emits compound IDs with embedded newlines, e.g.
-    ``call_<uuid>\\nfc_<hash>``. Kiro rejects those with HTTP 400
-    "Invalid tool use format (REQUEST_BODY_INVALID)". Strip all whitespace
-    so matching tool_use / tool_result pairs stay aligned.
+    ``call_<uuid>\\nfc_<hash>``. After stripping the newline the joined ID can
+    exceed Kiro's 64-char limit (``call_<24>fc_<50hex>`` is 82 chars), which
+    still trips "Invalid tool use format (REQUEST_BODY_INVALID)". So we also
+    replace disallowed characters and truncate over-long IDs with a
+    deterministic hash suffix.
+
+    The transform is a pure function of the input, so the same original ID
+    always maps to the same sanitized ID — matching tool_use / tool_result
+    pairs stay aligned on both sides.
     """
     if tool_id is None:
         return ""
     text = str(tool_id)
+    # Remove all whitespace (Cursor compound IDs contain embedded newlines).
     cleaned = "".join(text.split())
+    # Enforce the Kiro/Bedrock charset: replace anything outside [a-zA-Z0-9_-].
+    cleaned = _TOOL_USE_ID_INVALID_CHARS.sub("_", cleaned)
+    # Cap at 64 chars; keep a readable prefix plus a hash of the *cleaned* value
+    # so distinct IDs that share a long prefix never collide.
+    if len(cleaned) > TOOL_USE_ID_MAX_LENGTH:
+        hash_suffix = hashlib.md5(cleaned.encode("utf-8")).hexdigest()[:8]
+        prefix = cleaned[: TOOL_USE_ID_MAX_LENGTH - 1 - len(hash_suffix)]
+        cleaned = f"{prefix}_{hash_suffix}"
     if cleaned != text and cleaned:
         preview = 80
         logger.debug(
-            "Sanitized tool_use_id (removed whitespace): {!r} -> {!r}",
+            "Sanitized tool_use_id: {!r} -> {!r}",
             text[:preview] + ("..." if len(text) > preview else ""),
             cleaned[:preview] + ("..." if len(cleaned) > preview else ""),
         )
