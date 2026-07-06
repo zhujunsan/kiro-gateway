@@ -57,6 +57,16 @@ from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 # requirement while being invisible and avoids zero-width character issues.
 EMPTY_CONTENT_PLACEHOLDER = " "
 
+# Content for the synthetic currentMessage we must fabricate when the last
+# message in the conversation is an assistant turn (the client replays the
+# whole transcript with no new user input). Unlike history entries — where a
+# blank " " placeholder is accepted — Kiro rejects a currentMessage whose
+# userInputMessage.content is blank/whitespace with HTTP 400
+# "Improperly formed request. (reason: REQUEST_BODY_INVALID)". So the synthetic
+# turn needs a minimal, non-blank instruction. "Continue." mirrors what native
+# clients send to resume an assistant turn and is unambiguous to the model.
+SYNTHETIC_CURRENT_MESSAGE = "Continue."
+
 
 # ==================================================================================================
 # Data Classes for Unified Message Format
@@ -1689,15 +1699,17 @@ def build_kiro_payload(
     if full_system_prompt and not history:
         current_content = f"{full_system_prompt}\n\n{current_content}"
     
-    # If current message is assistant, need to add it to history
-    # and create user message placeholder
+    # If current message is assistant, move it into history and fabricate a
+    # user currentMessage. This must carry real, non-blank content: Kiro rejects
+    # a currentMessage with blank/whitespace content (HTTP 400
+    # REQUEST_BODY_INVALID), even though blank placeholders are fine in history.
     if current_message.role == "assistant":
         history.append({
             "assistantResponseMessage": {
                 "content": current_content
             }
         })
-        current_content = EMPTY_CONTENT_PLACEHOLDER
+        current_content = SYNTHETIC_CURRENT_MESSAGE
     
     # If content is empty - use placeholder
     if not current_content:

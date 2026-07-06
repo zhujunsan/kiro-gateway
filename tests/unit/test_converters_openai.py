@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from kiro.converters_core import (
     EMPTY_CONTENT_PLACEHOLDER,
+    SYNTHETIC_CURRENT_MESSAGE,
     sanitize_tool_use_id,
     TOOL_USE_ID_MAX_LENGTH,
 )
@@ -800,7 +801,10 @@ class TestBuildKiroPayload:
     def test_handles_assistant_as_last_message(self):
         """
         What it does: Verifies handling of assistant as last message.
-        Purpose: Ensure "(empty placeholder)" message is created.
+        Purpose: When the transcript ends on an assistant turn, that turn moves
+        into history and the fabricated currentMessage must carry real,
+        non-blank content (Kiro rejects a blank currentMessage with HTTP 400
+        REQUEST_BODY_INVALID).
         """
         print("Setup: Request with assistant at the end...")
         request = ChatCompletionRequest(
@@ -816,7 +820,12 @@ class TestBuildKiroPayload:
         
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert current_content == EMPTY_CONTENT_PLACEHOLDER
+        # Must be the synthetic (non-blank) content, NOT the blank placeholder.
+        assert current_content == SYNTHETIC_CURRENT_MESSAGE
+        assert current_content.strip(), "synthetic currentMessage must not be blank"
+        # The assistant turn should have been moved into history.
+        history = result["conversationState"]["history"]
+        assert history[-1]["assistantResponseMessage"]["content"] == "Hi there"
     
     def test_raises_for_empty_messages(self):
         """

@@ -44,6 +44,7 @@ from kiro.converters_core import (
     UnifiedTool,
     ThinkingConfig,
     EMPTY_CONTENT_PLACEHOLDER,
+    SYNTHETIC_CURRENT_MESSAGE,
 )
 
 # Test data for images - 1x1 pixel JPEG
@@ -5722,6 +5723,43 @@ class TestBuildKiroPayloadIssue20:
                     break
         assert found_tool_uses, "toolUses should be preserved when tools are defined"
     
+    def test_assistant_last_message_synthesizes_nonblank_current_message(self):
+        """
+        What it does: When the transcript ends on an assistant turn, that turn is
+        moved into history and a synthetic user currentMessage is fabricated.
+        Purpose: Kiro rejects a currentMessage whose content is blank/whitespace
+        with HTTP 400 (REQUEST_BODY_INVALID). The synthetic turn must therefore
+        carry real, non-blank content — this is the regression guard for that 400.
+        """
+        print("Setup: Conversation ending on an assistant turn...")
+        messages = [
+            UnifiedMessage(role="user", content="Draft the outline"),
+            UnifiedMessage(role="assistant", content="Here is the outline you asked for."),
+        ]
+
+        print("Action: Building Kiro payload...")
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4",
+            tools=None,
+            conversation_id="test-conv",
+            profile_arn="arn:test",
+            thinking_config=ThinkingConfig(enabled=False),
+        )
+
+        current_content = result.payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        print(f"currentMessage content: '{current_content}'")
+        assert current_content == SYNTHETIC_CURRENT_MESSAGE
+        # The core regression assertion: must not be blank/whitespace.
+        assert current_content.strip(), "synthetic currentMessage must not be blank"
+        assert current_content != EMPTY_CONTENT_PLACEHOLDER
+
+        print("Checking the assistant turn was moved into history...")
+        history = result.payload["conversationState"].get("history", [])
+        assert history, "assistant turn should have been moved into history"
+        assert history[-1]["assistantResponseMessage"]["content"] == "Here is the outline you asked for."
+
     def test_empty_tools_list_triggers_stripping(self):
         """
         What it does: Verifies that empty tools list (tools=[]) triggers tool content stripping.
