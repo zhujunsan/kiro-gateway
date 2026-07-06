@@ -1,7 +1,10 @@
 # Prod dependencies
 fastapi
 uvicorn[standard]
-httpx
+# [socks] pulls in socksio so a socks:// proxy (HTTP(S)_PROXY / ALL_PROXY,
+# common for users behind a SOCKS proxy) works instead of crashing httpx at
+# client construction with "Unknown scheme for proxy URL".
+httpx[socks]
 loguru
 python-dotenv
 tiktoken

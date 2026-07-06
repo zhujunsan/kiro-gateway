@@ -84,6 +84,7 @@ from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.account_manager import AccountManager
+from kiro.proxy import resolve_proxy
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
@@ -348,10 +349,13 @@ async def lifespan(app: FastAPI):
         write=30.0,
         pool=30.0
     )
+    # resolve_proxy() honours HTTP(S)_PROXY / ALL_PROXY and normalizes socks://
+    # to socks5h:// so a user proxy doesn't crash client construction.
     app.state.http_client = httpx.AsyncClient(
         limits=limits,
         timeout=timeout,
-        follow_redirects=True
+        follow_redirects=True,
+        proxy=resolve_proxy(),
     )
     logger.info("Shared HTTP client created with connection pooling")
     
@@ -698,7 +702,7 @@ async def kiro_usage(request: Request, raw: bool = False):
     }
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60, proxy=resolve_proxy()) as client:
             resp = await client.get(url, headers=headers)
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail="Upstream request failed: {}".format(e))

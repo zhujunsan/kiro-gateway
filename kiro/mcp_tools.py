@@ -41,6 +41,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.proxy import resolve_proxy
 
 # Import debug_logger
 try:
@@ -157,7 +158,7 @@ async def call_kiro_mcp_api(
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=60.0, proxy=resolve_proxy()) as client:
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
