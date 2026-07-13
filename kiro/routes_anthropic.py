@@ -482,7 +482,14 @@ async def messages(
                                 
                                 if debug_logger:
                                     if streaming_error:
-                                        debug_logger.flush_on_error(500, str(streaming_error))
+                                        from kiro.debug_logger import classify_streaming_exception
+                                        src, code, phase, st = classify_streaming_exception(streaming_error)
+                                        debug_logger.flush_on_error(
+                                            st, str(streaming_error),
+                                            source=src, code=code, phase=phase,
+                                        )
+                                    elif client_disconnected:
+                                        debug_logger.flush_on_disconnect()
                                     else:
                                         debug_logger.discard_buffers()
                         
@@ -553,7 +560,13 @@ async def messages(
                         logger.warning(f"HTTP {response.status_code} - POST /v1/messages - {last_error_message[:100]}")
                         
                         if debug_logger:
-                            debug_logger.flush_on_error(response.status_code, last_error_message)
+                            debug_logger.flush_on_error(
+                            response.status_code, last_error_message,
+                            source="kiro_upstream",
+                            code=(error_reason or f"http_{response.status_code}"),
+                            phase="response_parse",
+                            upstream_status=response.status_code,
+                        )
                         
                         # Normalize context-length errors to the canonical
                         # invalid_request_error shape so clients can react.
@@ -612,14 +625,24 @@ async def messages(
                 # These come from build_kiro_payload() or other places → re-raise immediately
                 logger.error(f"HTTP {e.status_code} - POST /v1/messages - {e.detail}")
                 if debug_logger:
-                    debug_logger.flush_on_error(e.status_code, str(e.detail))
+                    debug_logger.flush_on_error(
+                    e.status_code, str(e.detail),
+                    source=("network" if e.status_code in (502, 504) else "client_request"),
+                    code=("timeout" if e.status_code == 504 else ("bad_gateway" if e.status_code == 502 else f"http_{e.status_code}")),
+                    phase=("connect" if e.status_code in (502, 504) else "validation"),
+                )
                 raise
             except Exception as e:
                 await http_client.close()
                 logger.error(f"Internal error: {e}", exc_info=True)
                 logger.error(f"HTTP 500 - POST /v1/messages - {str(e)[:100]}")
                 if debug_logger:
-                    debug_logger.flush_on_error(500, str(e))
+                    debug_logger.flush_on_error(
+                    500, str(e),
+                    source="gateway",
+                    code=type(e).__name__,
+                    phase="unknown",
+                )
                 
                 return JSONResponse(
                     status_code=500,
@@ -787,7 +810,13 @@ async def messages(
             
             # Flush debug logs on error
             if debug_logger:
-                debug_logger.flush_on_error(response.status_code, error_message)
+                debug_logger.flush_on_error(
+                response.status_code, error_message,
+                source="kiro_upstream",
+                code=f"http_{response.status_code}",
+                phase="response_parse",
+                upstream_status=response.status_code,
+            )
             
             # Return error in Anthropic format. Context-length errors are
             # normalized to invalid_request_error so clients can react.
@@ -854,7 +883,14 @@ async def messages(
                     
                     if debug_logger:
                         if streaming_error:
-                            debug_logger.flush_on_error(500, str(streaming_error))
+                            from kiro.debug_logger import classify_streaming_exception
+                            src, code, phase, st = classify_streaming_exception(streaming_error)
+                            debug_logger.flush_on_error(
+                                st, str(streaming_error),
+                                source=src, code=code, phase=phase,
+                            )
+                        elif client_disconnected:
+                            debug_logger.flush_on_disconnect()
                         else:
                             debug_logger.discard_buffers()
             
@@ -898,14 +934,24 @@ async def messages(
         
         logger.error(f"HTTP {e.status_code} - POST /v1/messages - {e.detail}")
         if debug_logger:
-            debug_logger.flush_on_error(e.status_code, str(e.detail))
+            debug_logger.flush_on_error(
+                    e.status_code, str(e.detail),
+                    source=("network" if e.status_code in (502, 504) else "client_request"),
+                    code=("timeout" if e.status_code == 504 else ("bad_gateway" if e.status_code == 502 else f"http_{e.status_code}")),
+                    phase=("connect" if e.status_code in (502, 504) else "validation"),
+                )
         raise
     except Exception as e:
         await http_client.close()
         logger.error(f"Internal error: {e}", exc_info=True)
         logger.error(f"HTTP 500 - POST /v1/messages - {str(e)[:100]}")
         if debug_logger:
-            debug_logger.flush_on_error(500, str(e))
+            debug_logger.flush_on_error(
+                    500, str(e),
+                    source="gateway",
+                    code=type(e).__name__,
+                    phase="unknown",
+                )
         
         return JSONResponse(
             status_code=500,

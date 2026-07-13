@@ -414,7 +414,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                     logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
                                 if debug_logger:
                                     if streaming_error:
-                                        debug_logger.flush_on_error(500, str(streaming_error))
+                                        from kiro.debug_logger import classify_streaming_exception
+                                        src, code, phase, st = classify_streaming_exception(streaming_error)
+                                        debug_logger.flush_on_error(
+                                            st, str(streaming_error),
+                                            source=src, code=code, phase=phase,
+                                        )
+                                    elif client_disconnected:
+                                        debug_logger.flush_on_disconnect()
                                     else:
                                         debug_logger.discard_buffers()
                         
@@ -478,7 +485,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         logger.warning(f"HTTP {response.status_code} - POST /v1/chat/completions - {last_error_message[:100]}")
                         
                         if debug_logger:
-                            debug_logger.flush_on_error(response.status_code, last_error_message)
+                            debug_logger.flush_on_error(
+                            response.status_code, last_error_message,
+                            source="kiro_upstream",
+                            code=(error_reason or f"http_{response.status_code}"),
+                            phase="response_parse",
+                            upstream_status=response.status_code,
+                        )
                         
                         # Normalize context-length errors to OpenAI's canonical
                         # shape so clients can trigger their own context handling.
@@ -537,14 +550,24 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 # These come from build_kiro_payload() or other places → re-raise immediately
                 logger.error(f"HTTP {e.status_code} - POST /v1/chat/completions - {e.detail}")
                 if debug_logger:
-                    debug_logger.flush_on_error(e.status_code, str(e.detail))
+                    debug_logger.flush_on_error(
+                    e.status_code, str(e.detail),
+                    source=("network" if e.status_code in (502, 504) else "client_request"),
+                    code=("timeout" if e.status_code == 504 else ("bad_gateway" if e.status_code == 502 else f"http_{e.status_code}")),
+                    phase=("connect" if e.status_code in (502, 504) else "validation"),
+                )
                 raise
             except Exception as e:
                 await http_client.close()
                 logger.error(f"Internal error: {e}", exc_info=True)
                 logger.error(f"HTTP 500 - POST /v1/chat/completions - {str(e)[:100]}")
                 if debug_logger:
-                    debug_logger.flush_on_error(500, str(e))
+                    debug_logger.flush_on_error(
+                    500, str(e),
+                    source="gateway",
+                    code=type(e).__name__,
+                    phase="unknown",
+                )
                 raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
         
         # All attempts exhausted
@@ -653,7 +676,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             
             # Flush debug logs on error ("errors" mode)
             if debug_logger:
-                debug_logger.flush_on_error(response.status_code, error_message)
+                debug_logger.flush_on_error(
+                response.status_code, error_message,
+                source="kiro_upstream",
+                code=f"http_{response.status_code}",
+                phase="response_parse",
+                upstream_status=response.status_code,
+            )
             
             # Return error in OpenAI API format. Context-length errors are
             # normalized to OpenAI's canonical context_length_exceeded shape.
@@ -728,7 +757,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     # Write debug logs AFTER streaming completes
                     if debug_logger:
                         if streaming_error:
-                            debug_logger.flush_on_error(500, str(streaming_error))
+                            from kiro.debug_logger import classify_streaming_exception
+                            src, code, phase, st = classify_streaming_exception(streaming_error)
+                            debug_logger.flush_on_error(
+                                st, str(streaming_error),
+                                source=src, code=code, phase=phase,
+                            )
+                        elif client_disconnected:
+                            debug_logger.flush_on_disconnect()
                         else:
                             debug_logger.discard_buffers()
             
@@ -770,7 +806,12 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         logger.error(f"HTTP {e.status_code} - POST /v1/chat/completions - {e.detail}")
         # Flush debug logs on HTTP error ("errors" mode)
         if debug_logger:
-            debug_logger.flush_on_error(e.status_code, str(e.detail))
+            debug_logger.flush_on_error(
+                    e.status_code, str(e.detail),
+                    source=("network" if e.status_code in (502, 504) else "client_request"),
+                    code=("timeout" if e.status_code == 504 else ("bad_gateway" if e.status_code == 502 else f"http_{e.status_code}")),
+                    phase=("connect" if e.status_code in (502, 504) else "validation"),
+                )
         raise
     except Exception as e:
         await http_client.close()
@@ -779,5 +820,10 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         logger.error(f"HTTP 500 - POST /v1/chat/completions - {str(e)[:100]}")
         # Flush debug logs on internal error ("errors" mode)
         if debug_logger:
-            debug_logger.flush_on_error(500, str(e))
+            debug_logger.flush_on_error(
+                    500, str(e),
+                    source="gateway",
+                    code=type(e).__name__,
+                    phase="unknown",
+                )
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")

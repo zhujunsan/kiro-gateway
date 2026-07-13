@@ -96,7 +96,13 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         from kiro.debug_logger import debug_logger
         if debug_logger:
             error_message = f"Validation error: {sanitized_errors}"
-            debug_logger.flush_on_error(422, error_message)
+            debug_logger.flush_on_error(
+                422,
+                error_message,
+                source="client_request",
+                code="validation_error",
+                phase="validation",
+            )
     except ImportError:
         pass  # debug_logger not available
     

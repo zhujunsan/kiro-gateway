@@ -688,3 +688,138 @@ class TestDebugLoggerAppLogsCapture:
             print(f"Проверяем, что app_logs.txt НЕ создан...")
             app_logs_file = debug_dir / "app_logs.txt"
             assert not app_logs_file.exists()
+
+class TestDebugSessionIsolation:
+    """Request-scoped sessions and error snapshots."""
+
+    def test_concurrent_sessions_do_not_share_buffers(self, tmp_path):
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            from kiro.debug_logger import DebugLogger, _current_session
+            import contextvars
+
+            dbg = DebugLogger.__new__(DebugLogger)
+            dbg._initialized = False
+            dbg.__init__()
+            dbg.debug_dir = tmp_path / "debug_logs"
+
+            ctx1 = contextvars.copy_context()
+            ctx2 = contextvars.copy_context()
+
+            def run_a():
+                dbg.prepare_new_request(path="/v1/chat/completions", model="a")
+                dbg.log_request_body(b'{"model":"a"}')
+                return _current_session.get().incident_id, bytes(dbg._request_body_buffer)
+
+            def run_b():
+                dbg.prepare_new_request(path="/v1/messages", model="b")
+                dbg.log_request_body(b'{"model":"b"}')
+                return _current_session.get().incident_id, bytes(dbg._request_body_buffer)
+
+            id_a, body_a = ctx1.run(run_a)
+            id_b, body_b = ctx2.run(run_b)
+
+            assert id_a != id_b
+            assert body_a == b'{"model":"a"}'
+            assert body_b == b'{"model":"b"}'
+
+            # Context A still sees its own body
+            assert ctx1.run(lambda: bytes(dbg._request_body_buffer)) == b'{"model":"a"}'
+
+    def test_flush_emits_full_snapshot_via_callback(self, tmp_path):
+        snapshots = []
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            from kiro.debug_logger import DebugLogger, set_error_snapshot_callback
+            set_error_snapshot_callback(snapshots.append)
+            try:
+                dbg = DebugLogger.__new__(DebugLogger)
+                dbg._initialized = False
+                dbg.__init__()
+                dbg.debug_dir = tmp_path / "debug_logs"
+
+                incident = dbg.prepare_new_request(
+                    path="/v1/chat/completions", model="claude-sonnet-4", stream=True
+                )
+                dbg.log_request_body(b'{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}')
+                dbg.log_kiro_request_body(b'{"conversationState":{}}')
+                dbg.log_raw_chunk(b"raw-sse")
+                dbg.log_modified_chunk(b"mod-sse")
+                dbg._app_logs_buffer.write("line1\n")
+
+                dbg.flush_on_error(
+                    400, "bad model",
+                    source="kiro_upstream",
+                    code="INVALID_MODEL_ID",
+                    phase="response_parse",
+                    upstream_status=400,
+                )
+
+                assert len(snapshots) == 1
+                snap = snapshots[0]
+                assert snap["incident_id"] == incident
+                assert snap["source"] == "kiro_upstream"
+                assert snap["code"] == "INVALID_MODEL_ID"
+                assert snap["model"] == "claude-sonnet-4"
+                assert snap["path"] == "/v1/chat/completions"
+                assert snap["stream"] is True
+                assert "request_body.json" in snap["artifacts"]
+                assert "kiro_request_body.json" in snap["artifacts"]
+                assert "response_stream_raw.txt" in snap["artifacts"]
+                assert "response_stream_modified.txt" in snap["artifacts"]
+                assert "app_logs.txt" in snap["artifacts"]
+                assert "error_info.json" in snap["artifacts"]
+                assert snap["artifacts"]["response_stream_raw.txt"] == b"raw-sse"
+            finally:
+                set_error_snapshot_callback(None)
+
+    def test_disconnect_classified_as_cancelled(self, tmp_path):
+        snapshots = []
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            from kiro.debug_logger import DebugLogger, set_error_snapshot_callback
+            set_error_snapshot_callback(snapshots.append)
+            try:
+                dbg = DebugLogger.__new__(DebugLogger)
+                dbg._initialized = False
+                dbg.__init__()
+                dbg.debug_dir = tmp_path / "debug_logs"
+                dbg.prepare_new_request(path="/v1/chat/completions", stream=True)
+                dbg.log_request_body(b'{"model":"m"}')
+                dbg.log_modified_chunk(b"partial")
+                dbg.flush_on_disconnect()
+                assert snapshots[0]["source"] == "cancelled"
+                assert snapshots[0]["code"] == "client_disconnect"
+                assert snapshots[0]["client_disconnected"] is True
+            finally:
+                set_error_snapshot_callback(None)
+
+    def test_classify_streaming_exception(self):
+        from kiro.debug_logger import classify_streaming_exception
+
+        class FirstTokenTimeoutError(Exception):
+            pass
+
+        src, code, phase, st = classify_streaming_exception(FirstTokenTimeoutError("x"))
+        assert (src, code, phase, st) == ("network", "first_token_timeout", "first_token", 504)
+
+        src, code, phase, st = classify_streaming_exception(TimeoutError("read timeout"))
+        assert src == "network" and st == 504
+
+        src, code, phase, st = classify_streaming_exception(RuntimeError("boom"))
+        assert src == "gateway" and code == "streaming_error"
+
+    def test_callback_failure_does_not_raise(self, tmp_path):
+        def bad_cb(_snap):
+            raise RuntimeError("uploader down")
+
+        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+            from kiro.debug_logger import DebugLogger, set_error_snapshot_callback
+            set_error_snapshot_callback(bad_cb)
+            try:
+                dbg = DebugLogger.__new__(DebugLogger)
+                dbg._initialized = False
+                dbg.__init__()
+                dbg.debug_dir = tmp_path / "debug_logs"
+                dbg.prepare_new_request()
+                dbg.log_request_body(b'{"x":1}')
+                dbg.flush_on_error(500, "err", source="gateway", code="boom", phase="unknown")
+            finally:
+                set_error_snapshot_callback(None)
