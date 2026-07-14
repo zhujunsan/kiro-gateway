@@ -410,14 +410,18 @@ class TestKiroHttpClientRequestWithRetry:
     @pytest.mark.asyncio
     async def test_other_status_codes_returned_as_is(self, mock_auth_manager_for_http):
         """
-        What it does: Verifies other status codes are returned without retry.
-        Purpose: Ensure 400, 404, etc. are returned immediately.
+        What it does: Verifies generic 400 (non-INVALID_MODEL_ID) is returned without retry.
+        Purpose: Ensure malformed/other 400s are returned immediately.
         """
         print("Setup: Creating KiroHttpClient...")
         http_client = KiroHttpClient(mock_auth_manager_for_http)
         
         mock_response = AsyncMock()
         mock_response.status_code = 400
+        mock_response.aread = AsyncMock(
+            return_value=b'{"message":"Improperly formed request.","reason":null}'
+        )
+        mock_response.aclose = AsyncMock()
         
         mock_client = AsyncMock()
         mock_client.is_closed = False
@@ -436,6 +440,204 @@ class TestKiroHttpClientRequestWithRetry:
         assert response.status_code == 400
         mock_client.request.assert_called_once()
     
+    @pytest.mark.asyncio
+    async def test_invalid_model_id_retries_then_succeeds(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies 400 INVALID_MODEL_ID triggers short same-account retry.
+        Purpose: Intermittent upstream INVALID_MODEL_ID should recover without failover.
+        """
+        print("Setup: Creating KiroHttpClient...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        
+        mock_response_400 = AsyncMock()
+        mock_response_400.status_code = 400
+        mock_response_400.aread = AsyncMock(
+            return_value=(
+                b'{"message":"Invalid model ID. Please select a different model '
+                b'to continue.","reason":"INVALID_MODEL_ID"}'
+            )
+        )
+        mock_response_400.aclose = AsyncMock()
+        
+        mock_response_200 = AsyncMock()
+        mock_response_200.status_code = 200
+        
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(side_effect=[mock_response_400, mock_response_200])
+        
+        print("Action: Executing request...")
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+                    with patch('kiro.http_client.INVALID_MODEL_ID_RETRY_DELAY', 0.5):
+                        with patch('kiro.http_client.INVALID_MODEL_ID_MAX_RETRIES', 2):
+                            response = await http_client.request_with_retry(
+                                "POST",
+                                "https://api.example.com/test",
+                                {"data": "value"}
+                            )
+        
+        print("Verification: retried once with 0.5s delay, then succeeded...")
+        assert response.status_code == 200
+        assert mock_client.request.call_count == 2
+        mock_sleep.assert_called_once_with(0.5)
+    
+    @pytest.mark.asyncio
+    async def test_invalid_model_id_retries_exhausted_returns_400(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies exhausted INVALID_MODEL_ID retries return the last 400.
+        Purpose: True unavailable models still fail after bounded same-account retries.
+        """
+        print("Setup: Creating KiroHttpClient...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        
+        def make_400():
+            mock_response = AsyncMock()
+            mock_response.status_code = 400
+            mock_response.aread = AsyncMock(
+                return_value=b'{"message":"Invalid model ID.","reason":"INVALID_MODEL_ID"}'
+            )
+            mock_response.aclose = AsyncMock()
+            return mock_response
+        
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        # MAX_RETRIES default 3 → 1 initial + up to 2 INVALID retries
+        mock_client.request = AsyncMock(side_effect=[make_400(), make_400(), make_400()])
+        
+        print("Action: Executing request...")
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+                    with patch('kiro.http_client.INVALID_MODEL_ID_RETRY_DELAY', 0.5):
+                        with patch('kiro.http_client.INVALID_MODEL_ID_MAX_RETRIES', 2):
+                            with patch('kiro.http_client.MAX_RETRIES', 3):
+                                response = await http_client.request_with_retry(
+                                    "POST",
+                                    "https://api.example.com/test",
+                                    {"data": "value"}
+                                )
+        
+        print("Verification: 3 attempts, delays 0.5 then 1.0, final 400...")
+        assert response.status_code == 400
+        assert mock_client.request.call_count == 3
+        assert mock_sleep.call_args_list == [((0.5,),), ((1.0,),)]
+    
+    @pytest.mark.asyncio
+    async def test_content_length_exceeded_does_not_retry(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies 400 CONTENT_LENGTH_EXCEEDS_THRESHOLD is not retried.
+        Purpose: Context overflow is FATAL and must return immediately.
+        """
+        print("Setup: Creating KiroHttpClient...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        
+        mock_response = AsyncMock()
+        mock_response.status_code = 400
+        mock_response.aread = AsyncMock(
+            return_value=(
+                b'{"message":"Input is too long.",'
+                b'"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}'
+            )
+        )
+        mock_response.aclose = AsyncMock()
+        
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(return_value=mock_response)
+        
+        print("Action: Executing request...")
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+                    response = await http_client.request_with_retry(
+                        "POST",
+                        "https://api.example.com/test",
+                        {"data": "value"}
+                    )
+        
+        print("Verification: no retry for context overflow...")
+        assert response.status_code == 400
+        mock_client.request.assert_called_once()
+        mock_sleep.assert_not_called()
+    
+    @pytest.mark.asyncio
+    async def test_400_without_reason_does_not_retry(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies 400 with non-JSON / missing reason is not retried.
+        Purpose: Conservative — only exact INVALID_MODEL_ID is retryable.
+        """
+        print("Setup: Creating KiroHttpClient...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        
+        mock_response = AsyncMock()
+        mock_response.status_code = 400
+        mock_response.aread = AsyncMock(return_value=b"not-json")
+        mock_response.aclose = AsyncMock()
+        
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(return_value=mock_response)
+        
+        print("Action: Executing request...")
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+                    response = await http_client.request_with_retry(
+                        "POST",
+                        "https://api.example.com/test",
+                        {"data": "value"}
+                    )
+        
+        print("Verification: non-JSON 400 returned without retry...")
+        assert response.status_code == 400
+        mock_client.request.assert_called_once()
+        mock_sleep.assert_not_called()
+    
+    @pytest.mark.asyncio
+    async def test_streaming_invalid_model_id_retries_and_closes(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies stream=True INVALID_MODEL_ID retries via send() and aclose().
+        Purpose: Avoid connection leak when draining streamed 400 before retry.
+        """
+        print("Setup: Creating KiroHttpClient...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        
+        mock_response_400 = AsyncMock()
+        mock_response_400.status_code = 400
+        mock_response_400.aread = AsyncMock(
+            return_value=b'{"message":"Invalid model ID.","reason":"INVALID_MODEL_ID"}'
+        )
+        mock_response_400.aclose = AsyncMock()
+        
+        mock_response_200 = AsyncMock()
+        mock_response_200.status_code = 200
+        
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.build_request = MagicMock(return_value=MagicMock())
+        mock_client.send = AsyncMock(side_effect=[mock_response_400, mock_response_200])
+        
+        print("Action: Executing streaming request...")
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+                    with patch('kiro.http_client.INVALID_MODEL_ID_RETRY_DELAY', 0.5):
+                        with patch('kiro.http_client.INVALID_MODEL_ID_MAX_RETRIES', 2):
+                            response = await http_client.request_with_retry(
+                                "POST",
+                                "https://api.example.com/test",
+                                {"data": "value"},
+                                stream=True,
+                            )
+        
+        print("Verification: streamed 400 drained/closed, then succeeded...")
+        assert response.status_code == 200
+        assert mock_client.send.call_count == 2
+        mock_response_400.aread.assert_awaited()
+        mock_response_400.aclose.assert_awaited()
+        mock_sleep.assert_called_once_with(0.5)
     @pytest.mark.asyncio
     async def test_streaming_request_uses_send(self, mock_auth_manager_for_http):
         """

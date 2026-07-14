@@ -24,6 +24,7 @@ Handles:
 - 403: automatic token refresh and retry
 - 429: exponential backoff
 - 5xx: exponential backoff
+- 400 + INVALID_MODEL_ID: short same-account backoff (intermittent upstream)
 - Timeouts: exponential backoff
 
 Supports both per-request clients and shared application-level client
@@ -32,17 +33,67 @@ with connection pooling for better resource management.
 
 import asyncio
 import json
-from typing import Optional
+from typing import Optional, Tuple
 
 import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import (
+    MAX_RETRIES,
+    BASE_RETRY_DELAY,
+    FIRST_TOKEN_MAX_RETRIES,
+    STREAMING_READ_TIMEOUT,
+    INVALID_MODEL_ID_MAX_RETRIES,
+    INVALID_MODEL_ID_RETRY_DELAY,
+)
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
 from kiro.proxy import resolve_proxy
+
+
+async def _read_response_body(response: httpx.Response) -> bytes:
+    """Read response body once; safe for stream and non-stream responses."""
+    try:
+        return await response.aread()
+    except Exception:
+        try:
+            return response.content or b""
+        except Exception:
+            return b""
+
+
+def _peek_kiro_reason(body: bytes) -> Optional[str]:
+    """Extract Kiro error ``reason`` from a response body, if present."""
+    if not body:
+        return None
+    try:
+        data = json.loads(body.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, UnicodeError, TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    reason = data.get("reason")
+    return reason if isinstance(reason, str) and reason else None
+
+
+async def _drain_error_response(
+    response: httpx.Response,
+    stream: bool,
+) -> Tuple[httpx.Response, bytes, Optional[str]]:
+    """
+    Drain an error response body and optionally close a streamed connection.
+
+    Returns the same response (body cached via aread), raw bytes, and Kiro reason.
+    """
+    body = await _read_response_body(response)
+    if stream:
+        try:
+            await response.aclose()
+        except Exception as e:
+            logger.debug(f"Error closing streamed error response: {e}")
+    return response, body, _peek_kiro_reason(body)
 
 
 class KiroHttpClient:
@@ -53,6 +104,7 @@ class KiroHttpClient:
     - 403: refreshes token and retries
     - 429: waits with exponential backoff
     - 5xx: waits with exponential backoff
+    - 400 + INVALID_MODEL_ID: short same-account backoff (bounded)
     - Timeouts: waits with exponential backoff
     
     Supports two modes of operation:
@@ -185,6 +237,7 @@ class KiroHttpClient:
         - 403: refreshes token via auth_manager.force_refresh() and retries
         - 429: waits with exponential backoff (1s, 2s, 4s)
         - 5xx: waits with exponential backoff
+        - 400 + INVALID_MODEL_ID: short same-account backoff (0.5s, 1s by default)
         - Timeouts: waits with exponential backoff
         
         For streaming, STREAMING_READ_TIMEOUT is used for waiting between chunks.
@@ -211,6 +264,7 @@ class KiroHttpClient:
         last_error = None
         last_error_info: Optional[NetworkErrorInfo] = None
         last_response: Optional[httpx.Response] = None  # Для сохранения последнего 429/5xx
+        invalid_model_retries_done = 0
         
         for attempt in range(max_retries):
             try:
@@ -239,6 +293,11 @@ class KiroHttpClient:
                 
                 # Check status
                 if response.status_code == 200:
+                    if invalid_model_retries_done > 0:
+                        logger.debug(
+                            f"INVALID_MODEL_ID recovered after "
+                            f"{invalid_model_retries_done} same-account retry(ies)"
+                        )
                     return response
                 
                 # 403 - token expired, refresh and retry
@@ -262,6 +321,27 @@ class KiroHttpClient:
                     logger.warning(f"Received {response.status_code}, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                     continue
+                
+                # 400 - only INVALID_MODEL_ID is eligible for same-account retry
+                if response.status_code == 400:
+                    response, _body, reason = await _drain_error_response(response, stream)
+                    if (
+                        reason == "INVALID_MODEL_ID"
+                        and invalid_model_retries_done < INVALID_MODEL_ID_MAX_RETRIES
+                        and attempt < max_retries - 1
+                    ):
+                        invalid_model_retries_done += 1
+                        delay = INVALID_MODEL_ID_RETRY_DELAY * (
+                            2 ** (invalid_model_retries_done - 1)
+                        )
+                        logger.warning(
+                            f"Received 400 INVALID_MODEL_ID, waiting {delay}s "
+                            f"(attempt {invalid_model_retries_done}/"
+                            f"{INVALID_MODEL_ID_MAX_RETRIES})"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    return response
                 
                 # Other errors - return as is
                 return response
