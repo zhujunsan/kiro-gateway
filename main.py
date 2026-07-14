@@ -87,6 +87,7 @@ from kiro.account_manager import AccountManager
 from kiro.proxy import resolve_proxy
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
+from kiro.routes_responses import router as responses_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
 
@@ -574,6 +575,9 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# OpenAI Responses API (Codex wire_api=responses): /v1/responses
+app.include_router(responses_router)
 
 
 # --- Account usage endpoint ---

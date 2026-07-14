@@ -24,7 +24,7 @@ This middleware initializes debug logging BEFORE Pydantic validation,
 which allows capturing validation errors (422) in debug logs.
 
 The middleware:
-1. Intercepts requests to API endpoints (/v1/chat/completions, /v1/messages)
+1. Intercepts requests to API endpoints (/v1/chat/completions, /v1/messages, /v1/responses)
 2. Calls prepare_new_request() to initialize buffers and loguru sink
 3. Reads and logs the raw request body
 4. Passes the request to the next handler
@@ -49,6 +49,7 @@ from kiro.config import DEBUG_MODE
 LOGGED_ENDPOINTS = frozenset({
     "/v1/chat/completions",  # OpenAI-compatible endpoint
     "/v1/messages",          # Anthropic-compatible endpoint
+    "/v1/responses",         # OpenAI Responses API (Codex)
 })
 
 
