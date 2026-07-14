@@ -596,11 +596,13 @@ class TestFallbackModelsConfig:
             "claude-opus-4.5",
             "claude-sonnet-4",
             "claude-sonnet-4.5",
+            "minimax-m2.1",
         }
         retired_aliases = {
             "kiro-o-4.5",
             "kiro-s-4",
             "kiro-s-4.5",
+            "kiro-minimax-m2.1",
         }
 
         fallback_ids = {m["modelId"] for m in FALLBACK_MODELS}

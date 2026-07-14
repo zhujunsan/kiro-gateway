@@ -260,7 +260,6 @@ MODEL_ALIASES: Dict[str, str] = {
     # Non-Claude models
     "kiro-deepseek-3.2": "deepseek-3.2",
     "kiro-glm-5": "glm-5",
-    "kiro-minimax-m2.1": "minimax-m2.1",
     "kiro-minimax-m2.5": "minimax-m2.5",
     "kiro-qwen3-coder-next": "qwen3-coder-next",
 }
@@ -275,13 +274,14 @@ MODEL_ALIASES: Dict[str, str] = {
 #   HIDDEN_FROM_LIST = ["auto", "claude-old-model"]
 #
 # Default: ["auto"] to show only "auto-kiro" alias
-# Also hide retired Claude IDs that Kiro ListAvailableModels may still return
+# Also hide retired model IDs that Kiro ListAvailableModels may still return
 # but no longer accept (timeout / INVALID_MODEL_ID).
 HIDDEN_FROM_LIST: List[str] = [
     "auto",
     "claude-opus-4.5",
     "claude-sonnet-4",
     "claude-sonnet-4.5",
+    "minimax-m2.1",
 ]
 
 # ==================================================================================================
@@ -304,7 +304,6 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "claude-opus-4.8"},
     {"modelId": "deepseek-3.2"},
     {"modelId": "glm-5"},
-    {"modelId": "minimax-m2.1"},
     {"modelId": "minimax-m2.5"},
     {"modelId": "qwen3-coder-next"},
 ]
