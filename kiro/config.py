@@ -253,11 +253,8 @@ MODEL_ALIASES: Dict[str, str] = {
     "kiro-o-4.8": "claude-opus-4.8",
     "kiro-o-4.7": "claude-opus-4.7",
     "kiro-o-4.6": "claude-opus-4.6",
-    "kiro-o-4.5": "claude-opus-4.5",
     # Claude Sonnet (use -s- code, see note above)
     "kiro-s-4.6": "claude-sonnet-4.6",
-    "kiro-s-4.5": "claude-sonnet-4.5",
-    "kiro-s-4": "claude-sonnet-4",
     # Claude Haiku (use -h- code, see note above)
     "kiro-h-4.5": "claude-haiku-4.5",
     # Non-Claude models
@@ -278,7 +275,14 @@ MODEL_ALIASES: Dict[str, str] = {
 #   HIDDEN_FROM_LIST = ["auto", "claude-old-model"]
 #
 # Default: ["auto"] to show only "auto-kiro" alias
-HIDDEN_FROM_LIST: List[str] = ["auto"]
+# Also hide retired Claude IDs that Kiro ListAvailableModels may still return
+# but no longer accept (timeout / INVALID_MODEL_ID).
+HIDDEN_FROM_LIST: List[str] = [
+    "auto",
+    "claude-opus-4.5",
+    "claude-sonnet-4",
+    "claude-sonnet-4.5",
+]
 
 # ==================================================================================================
 # Fallback Models Configuration (DNS Failure Recovery)
@@ -293,11 +297,8 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # - Update gateway regularly to get the latest model list
 FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
-    {"modelId": "claude-sonnet-4"},
-    {"modelId": "claude-sonnet-4.5"},
     {"modelId": "claude-sonnet-4.6"},
     {"modelId": "claude-haiku-4.5"},
-    {"modelId": "claude-opus-4.5"},
     {"modelId": "claude-opus-4.6"},
     {"modelId": "claude-opus-4.7"},
     {"modelId": "claude-opus-4.8"},

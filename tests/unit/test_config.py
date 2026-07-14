@@ -583,6 +583,31 @@ class TestFallbackModelsConfig:
         print("Verification: Contains at least one Claude model...")
         has_claude = any("claude" in mid.lower() for mid in model_ids)
         assert has_claude, "No Claude models in fallback list"
+
+    def test_retired_claude_models_removed_from_lists(self):
+        """
+        What it does: Verifies retired Claude IDs are dropped from fallback/aliases
+                      and hidden from /v1/models even if the live API still returns them.
+        Purpose: Keep clients from picking models that Kiro currently rejects/timeouts.
+        """
+        from kiro.config import FALLBACK_MODELS, HIDDEN_FROM_LIST, MODEL_ALIASES
+
+        retired = {
+            "claude-opus-4.5",
+            "claude-sonnet-4",
+            "claude-sonnet-4.5",
+        }
+        retired_aliases = {
+            "kiro-o-4.5",
+            "kiro-s-4",
+            "kiro-s-4.5",
+        }
+
+        fallback_ids = {m["modelId"] for m in FALLBACK_MODELS}
+        assert retired.isdisjoint(fallback_ids)
+        assert retired_aliases.isdisjoint(MODEL_ALIASES.keys())
+        assert retired.issubset(set(HIDDEN_FROM_LIST))
+        assert not any(target in retired for target in MODEL_ALIASES.values())
     
     def test_fallback_models_use_dot_format(self):
         """
@@ -613,7 +638,7 @@ class TestFallbackModelsIntegration:
     async def test_fallback_models_work_with_model_resolver(self):
         """
         What it does: Verifies that fallback models work with ModelResolver normalization.
-        Purpose: Ensure that model name normalization (claude-opus-4-5 → claude-opus-4.5)
+        Purpose: Ensure that model name normalization (claude-opus-4-6 → claude-opus-4.6)
                  works correctly with fallback models, just like with API models.
         """
         print("Setup: Importing FALLBACK_MODELS and creating cache...")
@@ -632,10 +657,10 @@ class TestFallbackModelsIntegration:
         resolver = ModelResolver(cache=cache, hidden_models={})
         
         print("\nAction: Testing normalization with dash format...")
-        # Test that dash format (claude-opus-4-5) is normalized and found
+        # Test that dash format is normalized and found in current FALLBACK_MODELS
         test_cases = [
-            ("claude-opus-4-5", "claude-opus-4.5"),  # Dash → Dot
-            ("claude-sonnet-4-5", "claude-sonnet-4.5"),  # Dash → Dot
+            ("claude-opus-4-6", "claude-opus-4.6"),  # Dash → Dot
+            ("claude-sonnet-4-6", "claude-sonnet-4.6"),  # Dash → Dot
             ("claude-haiku-4-5", "claude-haiku-4.5"),  # Dash → Dot
         ]
         
