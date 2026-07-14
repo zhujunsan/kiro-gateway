@@ -454,6 +454,117 @@ class TestConvertResponsesToolsToUnified:
         ])
         assert [t.name for t in tools] == ["f"]
 
+    def test_dedupe_same_local_name_across_namespaces(self):
+        """Codex MCP apps often reuse local names like `_get_profile` per app."""
+        tools = convert_responses_tools_to_unified([
+            ResponsesFunctionTool.model_validate({
+                "type": "namespace",
+                "name": "mcp__codex_apps__github",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "_get_profile",
+                        "description": "github profile",
+                        "parameters": {"type": "object"},
+                    },
+                    {
+                        "type": "function",
+                        "name": "_search",
+                        "parameters": {"type": "object"},
+                    },
+                ],
+            }),
+            ResponsesFunctionTool.model_validate({
+                "type": "namespace",
+                "name": "mcp__codex_apps__gmail",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "_get_profile",
+                        "description": "gmail profile (duplicate local name)",
+                        "parameters": {"type": "object", "properties": {"x": {}}},
+                    },
+                    {
+                        "type": "function",
+                        "name": "_fetch",
+                        "parameters": {"type": "object"},
+                    },
+                ],
+            }),
+            ResponsesFunctionTool.model_validate({
+                "type": "namespace",
+                "name": "mcp__codex_apps__google_drive",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "_get_profile",
+                        "description": "drive profile",
+                        "parameters": {"type": "object"},
+                    },
+                ],
+            }),
+        ])
+        assert tools is not None
+        names = [t.name for t in tools]
+        assert names == ["_get_profile", "_search", "_fetch"]
+        assert names.count("_get_profile") == 1
+        # First occurrence wins (github description).
+        assert tools[0].description == "github profile"
+
+    def test_dedupe_namespace_vs_flat_function(self):
+        """Flat function and namespace-expanded local name must not both ship."""
+        tools = convert_responses_tools_to_unified([
+            ResponsesFunctionTool(
+                type="function",
+                name="_get_profile",
+                description="flat first",
+                parameters={"type": "object"},
+            ),
+            ResponsesFunctionTool.model_validate({
+                "type": "namespace",
+                "name": "mcp__codex_apps__github",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "_get_profile",
+                        "description": "ns duplicate",
+                        "parameters": {"type": "object"},
+                    },
+                    {
+                        "type": "function",
+                        "name": "_list_repos",
+                        "parameters": {"type": "object"},
+                    },
+                ],
+            }),
+        ])
+        assert [t.name for t in tools] == ["_get_profile", "_list_repos"]
+        assert tools[0].description == "flat first"
+
+    def test_dedupe_flat_after_namespace_keeps_namespace_first(self):
+        tools = convert_responses_tools_to_unified([
+            ResponsesFunctionTool.model_validate({
+                "type": "namespace",
+                "name": "ns_a",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "shared",
+                        "description": "from namespace",
+                        "parameters": {"type": "object"},
+                    },
+                ],
+            }),
+            ResponsesFunctionTool(
+                type="function",
+                name="shared",
+                description="flat later",
+                parameters={"type": "object"},
+            ),
+        ])
+        assert [t.name for t in tools] == ["shared"]
+        assert tools[0].description == "from namespace"
+
 
 # ==================================================================================================
 # Thinking config

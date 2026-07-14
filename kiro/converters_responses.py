@@ -290,6 +290,10 @@ def convert_responses_tools_to_unified(
        with their local names (not namespace-prefixed)
     4. Built-in / unknown wrapper types (``web_search``, etc.) — skipped with log
 
+    Duplicate tool names (same local name across namespaces, or namespace vs
+    top-level ``function``) are collapsed: the first occurrence is kept and
+    later ones are skipped with a log. Bedrock/Kiro reject TOOL_DUPLICATE.
+
     Raises:
         ValueError: Malformed function / namespace entries.
     """
@@ -306,6 +310,20 @@ def convert_responses_tools_to_unified(
         return None
 
     unified_tools: List[UnifiedTool] = []
+    seen_names: set[str] = set()
+
+    def _append_unique(unified: UnifiedTool, source: str) -> bool:
+        """Keep first tool per name; skip later duplicates (Bedrock TOOL_DUPLICATE)."""
+        if unified.name in seen_names:
+            logger.info(
+                f"Skipping duplicate tool name {unified.name!r} from {source} "
+                f"(keeping first occurrence)"
+            )
+            return False
+        seen_names.add(unified.name)
+        unified_tools.append(unified)
+        return True
+
     for i, tool in enumerate(tools):
         tool_dict = _tool_as_dict(tool)
         tool_type = tool_dict.get("type") or "function"
@@ -336,8 +354,8 @@ def convert_responses_tools_to_unified(
                         f"no name found"
                     )
                     continue
-                unified_tools.append(unified)
-                expanded += 1
+                if _append_unique(unified, f"namespace '{ns_name}'"):
+                    expanded += 1
             logger.debug(
                 f"Expanded namespace tool '{ns_name}' → {expanded} function tool(s)"
             )
@@ -348,7 +366,7 @@ def convert_responses_tools_to_unified(
             if unified is None:
                 logger.warning("Skipping invalid Responses tool: no name found")
                 continue
-            unified_tools.append(unified)
+            _append_unique(unified, f"tools[{i}] function")
             continue
 
         # Built-ins and other Codex-only wrappers: strip, do not fail the request.
