@@ -38,6 +38,8 @@ SUPPORTED_INPUT_ITEM_TYPES = frozenset({
 })
 
 # Built-in / hosted tools that are not client function tools.
+# These are ignored (stripped) during conversion rather than rejecting the
+# whole request — Codex and other clients often send them alongside functions.
 UNSUPPORTED_BUILTIN_TOOL_TYPES = frozenset({
     "web_search",
     "web_search_preview",
@@ -54,6 +56,30 @@ UNSUPPORTED_BUILTIN_TOOL_TYPES = frozenset({
     "mcp",
     "custom",
 })
+
+# Codex / Responses wrapper that groups nested function tools.
+# Nested ``tools`` are expanded into flat function tools for Kiro.
+NAMESPACE_TOOL_TYPE = "namespace"
+
+
+def _tool_as_dict(tool: Any) -> Dict[str, Any]:
+    """Normalize a tool model or dict to a plain dict."""
+    if hasattr(tool, "model_dump"):
+        return tool.model_dump()
+    if isinstance(tool, dict):
+        return tool
+    raise TypeError(f"expected tool object or dict, got {type(tool).__name__}")
+
+
+def _function_tool_name(tool_dict: Dict[str, Any]) -> Optional[str]:
+    """Resolve function tool name from flat or Chat Completions nested shape."""
+    name = tool_dict.get("name")
+    if name:
+        return str(name)
+    function = tool_dict.get("function")
+    if isinstance(function, dict) and function.get("name"):
+        return str(function["name"])
+    return None
 
 
 class ResponsesReasoning(BaseModel):
@@ -95,7 +121,8 @@ class ResponsesRequest(BaseModel):
 
     ``input`` is intentionally loose (string or list of dicts). Call
     :func:`validate_responses_request` (or the converter entry point) to
-    reject unsupported items / built-in tools with a 400-ready ValueError.
+    reject unsupported input items with a 400-ready ValueError. Built-in
+    tools are stripped during conversion; ``namespace`` tools are expanded.
     """
     model: str
     input: Union[str, List[Any]]
@@ -192,47 +219,72 @@ def validate_responses_input(input_data: Union[str, List[Any], None]) -> None:
         validate_responses_input_item(item, index=i)
 
 
+def _validate_function_tool_dict(tool_dict: Dict[str, Any], loc: str) -> None:
+    """Ensure a function tool has a usable name (flat or nested shape)."""
+    if not _function_tool_name(tool_dict):
+        raise ValueError(
+            f"{loc}: function tool requires 'name' "
+            f"(or function.name in Chat Completions shape)"
+        )
+
+
 def validate_responses_tools(tools: Optional[List[Any]]) -> None:
     """
-    Validate Responses ``tools`` — only ``type: function`` is supported.
+    Validate Responses ``tools`` for conversion readiness.
+
+    Accepted:
+    - ``type: function`` (must have a name)
+    - ``type: namespace`` (Codex wrapper; nested function tools are validated)
+
+    Built-in tools (``web_search``, ``local_shell``, …) and other unknown
+    wrapper types are **not** rejected here — converters strip them so Codex
+    requests still succeed as long as function tools remain.
 
     Raises:
-        ValueError: If a built-in / non-function tool is present (400-ready).
+        ValueError: Malformed function / namespace entries (400-ready).
     """
     if not tools:
         return
 
     for i, tool in enumerate(tools):
-        if hasattr(tool, "model_dump"):
-            tool_dict = tool.model_dump()
-        elif isinstance(tool, dict):
-            tool_dict = tool
-        else:
+        try:
+            tool_dict = _tool_as_dict(tool)
+        except TypeError:
             raise ValueError(
                 f"tools[{i}]: expected object, got {type(tool).__name__}"
-            )
+            ) from None
 
         tool_type = tool_dict.get("type") or "function"
 
         if tool_type == "function":
-            # Flat Responses shape or nested Chat Completions shape
-            name = tool_dict.get("name")
-            function = tool_dict.get("function")
-            if not name and isinstance(function, dict):
-                name = function.get("name")
-            if not name:
-                raise ValueError(
-                    f"tools[{i}]: function tool requires 'name' "
-                    f"(or function.name in Chat Completions shape)"
-                )
+            _validate_function_tool_dict(tool_dict, f"tools[{i}]")
             continue
 
-        if tool_type in UNSUPPORTED_BUILTIN_TOOL_TYPES or tool_type != "function":
-            raise ValueError(
-                f"Unsupported tool type '{tool_type}' at tools[{i}]. "
-                f"Only function tools are supported "
-                f"(built-in tools such as web_search, local_shell are not available)."
-            )
+        if tool_type == NAMESPACE_TOOL_TYPE:
+            nested = tool_dict.get("tools")
+            if nested is None:
+                continue
+            if not isinstance(nested, list):
+                raise ValueError(
+                    f"tools[{i}]: namespace tool 'tools' must be an array"
+                )
+            for j, nested_tool in enumerate(nested):
+                try:
+                    nested_dict = _tool_as_dict(nested_tool)
+                except TypeError:
+                    raise ValueError(
+                        f"tools[{i}].tools[{j}]: expected object, "
+                        f"got {type(nested_tool).__name__}"
+                    ) from None
+                nested_type = nested_dict.get("type") or "function"
+                if nested_type == "function":
+                    _validate_function_tool_dict(
+                        nested_dict, f"tools[{i}].tools[{j}]"
+                    )
+            continue
+
+        # Built-ins / unknown wrappers: tolerate (stripped during conversion).
+        continue
 
 
 def validate_responses_request(request: ResponsesRequest) -> None:
@@ -240,7 +292,7 @@ def validate_responses_request(request: ResponsesRequest) -> None:
     Run all Responses request checks that should map to HTTP 400.
 
     Raises:
-        ValueError: On unsupported input items or non-function tools.
+        ValueError: On unsupported input items or malformed function tools.
     """
     validate_responses_input(request.input)
     validate_responses_tools(request.tools)

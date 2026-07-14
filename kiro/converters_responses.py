@@ -254,6 +254,29 @@ def convert_responses_input_to_unified(
 # Tools → UnifiedTool
 # ==================================================================================================
 
+def _unified_tool_from_function_dict(tool_dict: Dict[str, Any]) -> Optional[UnifiedTool]:
+    """Build UnifiedTool from a flat or Chat Completions nested function dict."""
+    from kiro.models_responses import _function_tool_name
+
+    function = tool_dict.get("function")
+    if isinstance(function, dict) and function.get("name"):
+        return UnifiedTool(
+            name=function["name"],
+            description=function.get("description"),
+            input_schema=function.get("parameters"),
+        )
+
+    name = _function_tool_name(tool_dict)
+    if not name:
+        return None
+
+    return UnifiedTool(
+        name=name,
+        description=tool_dict.get("description"),
+        input_schema=tool_dict.get("parameters"),
+    )
+
+
 def convert_responses_tools_to_unified(
     tools: Optional[List[ResponsesFunctionTool]],
 ) -> Optional[List[UnifiedTool]]:
@@ -263,11 +286,19 @@ def convert_responses_tools_to_unified(
     Supports:
     1. Responses flat: ``{"type": "function", "name": "...", "parameters": {...}}``
     2. Chat Completions nested: ``{"type": "function", "function": {"name": ...}}``
+    3. Codex ``type: namespace`` wrappers — nested function tools are expanded
+       with their local names (not namespace-prefixed)
+    4. Built-in / unknown wrapper types (``web_search``, etc.) — skipped with log
 
     Raises:
-        ValueError: If a non-function / built-in tool is present.
+        ValueError: Malformed function / namespace entries.
     """
-    from kiro.models_responses import validate_responses_tools
+    from kiro.models_responses import (
+        NAMESPACE_TOOL_TYPE,
+        UNSUPPORTED_BUILTIN_TOOL_TYPES,
+        _tool_as_dict,
+        validate_responses_tools,
+    )
 
     validate_responses_tools(tools)
 
@@ -275,23 +306,61 @@ def convert_responses_tools_to_unified(
         return None
 
     unified_tools: List[UnifiedTool] = []
-    for tool in tools:
-        # Nested Chat Completions shape takes priority when present with name
-        if tool.function and isinstance(tool.function, dict) and tool.function.get("name"):
-            unified_tools.append(UnifiedTool(
-                name=tool.function["name"],
-                description=tool.function.get("description"),
-                input_schema=tool.function.get("parameters"),
-            ))
-        elif tool.name:
-            unified_tools.append(UnifiedTool(
-                name=tool.name,
-                description=tool.description,
-                input_schema=tool.parameters,
-            ))
-        else:
-            logger.warning("Skipping invalid Responses tool: no name found")
+    for i, tool in enumerate(tools):
+        tool_dict = _tool_as_dict(tool)
+        tool_type = tool_dict.get("type") or "function"
+
+        if tool_type == NAMESPACE_TOOL_TYPE:
+            ns_name = tool_dict.get("name") or f"tools[{i}]"
+            nested = tool_dict.get("tools") or []
+            if not isinstance(nested, list):
+                continue
+            expanded = 0
+            for nested_tool in nested:
+                if not isinstance(nested_tool, dict):
+                    if hasattr(nested_tool, "model_dump"):
+                        nested_tool = nested_tool.model_dump()
+                    else:
+                        continue
+                nested_type = nested_tool.get("type") or "function"
+                if nested_type != "function":
+                    logger.debug(
+                        f"Skipping non-function tool inside namespace "
+                        f"'{ns_name}': type={nested_type!r}"
+                    )
+                    continue
+                unified = _unified_tool_from_function_dict(nested_tool)
+                if unified is None:
+                    logger.warning(
+                        f"Skipping invalid function inside namespace '{ns_name}': "
+                        f"no name found"
+                    )
+                    continue
+                unified_tools.append(unified)
+                expanded += 1
+            logger.debug(
+                f"Expanded namespace tool '{ns_name}' → {expanded} function tool(s)"
+            )
             continue
+
+        if tool_type == "function":
+            unified = _unified_tool_from_function_dict(tool_dict)
+            if unified is None:
+                logger.warning("Skipping invalid Responses tool: no name found")
+                continue
+            unified_tools.append(unified)
+            continue
+
+        # Built-ins and other Codex-only wrappers: strip, do not fail the request.
+        reason = (
+            "built-in"
+            if tool_type in UNSUPPORTED_BUILTIN_TOOL_TYPES
+            else "unknown wrapper"
+        )
+        logger.info(
+            f"Ignoring Responses {reason} tool type={tool_type!r} at tools[{i}] "
+            f"(name={tool_dict.get('name')!r}); only function tools are forwarded"
+        )
 
     return unified_tools if unified_tools else None
 
@@ -340,8 +409,9 @@ def build_kiro_payload_from_responses(
     """
     Build complete Kiro API payload from a Responses API request.
 
-    Validates unsupported input items / built-in tools (ValueError → HTTP 400),
-    converts to unified messages/tools, then calls converters_core.build_kiro_payload.
+    Validates unsupported input items (ValueError → HTTP 400), expands
+    ``namespace`` tools / strips built-ins, converts to unified messages/tools,
+    then calls converters_core.build_kiro_payload.
 
     Args:
         request_data: Parsed ResponsesRequest

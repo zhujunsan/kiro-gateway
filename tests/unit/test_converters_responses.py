@@ -111,22 +111,44 @@ class TestValidateResponsesInput:
 
 
 class TestValidateResponsesTools:
-    """Only function tools allowed."""
+    """Function + namespace accepted; built-ins ignored (not 400)."""
 
     def test_function_tool_ok(self):
         validate_responses_tools([
             ResponsesFunctionTool(type="function", name="Read", parameters={}),
         ])
 
-    def test_web_search_raises(self):
-        with pytest.raises(ValueError, match="Only function tools are supported"):
-            validate_responses_tools([
-                {"type": "web_search"},
-            ])
+    def test_web_search_ignored(self):
+        validate_responses_tools([{"type": "web_search"}])
 
-    def test_local_shell_raises(self):
-        with pytest.raises(ValueError, match="local_shell"):
-            validate_responses_tools([{"type": "local_shell"}])
+    def test_local_shell_ignored(self):
+        validate_responses_tools([{"type": "local_shell"}])
+
+    def test_namespace_with_nested_functions_ok(self):
+        validate_responses_tools([
+            {
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "sub-agents",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "parameters": {"type": "object"},
+                    },
+                ],
+            }
+        ])
+
+    def test_namespace_nested_function_without_name_raises(self):
+        with pytest.raises(ValueError, match=r"tools\[0\]\.tools\[0\].*requires 'name'"):
+            validate_responses_tools([
+                {
+                    "type": "namespace",
+                    "name": "ns",
+                    "tools": [{"type": "function"}],
+                }
+            ])
 
     def test_function_without_name_raises(self):
         with pytest.raises(ValueError, match="requires 'name'"):
@@ -372,11 +394,65 @@ class TestConvertResponsesToolsToUnified:
     def test_none_returns_none(self):
         assert convert_responses_tools_to_unified(None) is None
 
-    def test_builtin_tool_raises(self):
-        with pytest.raises(ValueError, match="Only function tools"):
-            convert_responses_tools_to_unified([
-                ResponsesFunctionTool(type="web_search", name="web_search"),
-            ])
+    def test_builtin_tool_stripped(self):
+        tools = convert_responses_tools_to_unified([
+            ResponsesFunctionTool(type="function", name="Read", parameters={}),
+            ResponsesFunctionTool(type="web_search", name="web_search"),
+        ])
+        assert tools is not None
+        assert len(tools) == 1
+        assert tools[0].name == "Read"
+
+    def test_builtin_only_returns_none(self):
+        assert convert_responses_tools_to_unified([
+            ResponsesFunctionTool(type="file_search", name="file_search"),
+        ]) is None
+
+    def test_namespace_expands_nested_functions(self):
+        tools = convert_responses_tools_to_unified([
+            ResponsesFunctionTool(
+                type="function",
+                name="exec_command",
+                parameters={"type": "object"},
+            ),
+            ResponsesFunctionTool.model_validate({
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Tools for spawning and managing sub-agents.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "description": "Spawn a sub-agent",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"prompt": {"type": "string"}},
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "name": "close_agent",
+                        "parameters": {"type": "object"},
+                    },
+                ],
+            }),
+            ResponsesFunctionTool(type="web_search"),
+        ])
+        assert tools is not None
+        names = [t.name for t in tools]
+        assert names == ["exec_command", "spawn_agent", "close_agent"]
+        assert tools[1].description == "Spawn a sub-agent"
+        assert tools[1].input_schema["properties"]["prompt"]["type"] == "string"
+
+    def test_unknown_wrapper_type_stripped(self):
+        tools = convert_responses_tools_to_unified([
+            ResponsesFunctionTool(type="function", name="f", parameters={}),
+            ResponsesFunctionTool.model_validate({
+                "type": "codex_mystery_wrapper",
+                "name": "x",
+            }),
+        ])
+        assert [t.name for t in tools] == ["f"]
 
 
 # ==================================================================================================
@@ -491,14 +567,39 @@ class TestBuildKiroPayloadFromResponses:
         with pytest.raises(ValueError, match="Unsupported"):
             build_kiro_payload_from_responses(req, "c", "arn:aws:test")
 
-    def test_rejects_builtin_tool(self):
+    def test_strips_builtin_and_expands_namespace_tools(self):
         req = ResponsesRequest(
             model="m",
             input="hi",
-            tools=[ResponsesFunctionTool(type="file_search", name="file_search")],
+            tools=[
+                ResponsesFunctionTool(type="function", name="Read", parameters={}),
+                ResponsesFunctionTool.model_validate({
+                    "type": "namespace",
+                    "name": "mcp__node_repl",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "js",
+                            "parameters": {"type": "object"},
+                        },
+                    ],
+                }),
+                ResponsesFunctionTool(type="file_search", name="file_search"),
+            ],
         )
-        with pytest.raises(ValueError, match="Only function tools"):
-            build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        payload = build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        ctx = (
+            payload["conversationState"]["currentMessage"]["userInputMessage"]
+            .get("userInputMessageContext") or {}
+        )
+        names = [
+            t.get("toolSpecification", {}).get("name")
+            for t in (ctx.get("tools") or [])
+        ]
+        assert "Read" in names
+        assert "js" in names
+        assert "file_search" not in names
+        assert "mcp__node_repl" not in names
 
     def test_validate_responses_request_wires_both_checks(self):
         req = ResponsesRequest(

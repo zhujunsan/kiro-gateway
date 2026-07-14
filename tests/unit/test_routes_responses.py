@@ -74,6 +74,54 @@ class TestResponsesValidation:
         detail = response.json().get("detail", "")
         assert "Unsupported" in detail or "web_search_call" in detail
 
+    def test_namespace_and_web_search_tools_do_not_400(
+        self, test_client, valid_proxy_api_key
+    ):
+        """Codex sends namespace wrappers + web_search; must not reject the request."""
+        with patch(
+            "kiro.routes_responses.KiroHttpClient"
+        ) as mock_cls:
+            mock_instance = AsyncMock()
+            mock_instance.request_with_retry = AsyncMock(
+                side_effect=Exception("Network blocked")
+            )
+            mock_instance.close = AsyncMock()
+            mock_cls.return_value = mock_instance
+
+            response = test_client.post(
+                "/v1/responses",
+                headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "input": "Hello",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "exec_command",
+                            "parameters": {"type": "object"},
+                        },
+                        {
+                            "type": "namespace",
+                            "name": "multi_agent_v1",
+                            "description": "sub-agents",
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "name": "spawn_agent",
+                                    "parameters": {"type": "object"},
+                                }
+                            ],
+                        },
+                        {"type": "web_search", "external_web_access": False},
+                    ],
+                },
+            )
+
+        # Must not be the old Unsupported tool type 400
+        assert response.status_code != 400
+        detail = str(response.json().get("detail", ""))
+        assert "Unsupported tool type" not in detail
+
 
 class TestResponsesCompact:
     """POST /v1/responses/compact is intentionally unimplemented."""
