@@ -207,10 +207,10 @@ BASE_RETRY_DELAY: float = 1.0
 # Kiro sometimes returns INVALID_MODEL_ID for a model that succeeds seconds later
 # on the same account; a short bounded retry recovers without failover.
 # Total attempts for a pure INVALID_MODEL_ID sequence = 1 + this value.
-INVALID_MODEL_ID_MAX_RETRIES: int = int(os.getenv("INVALID_MODEL_ID_MAX_RETRIES", "2"))
+INVALID_MODEL_ID_MAX_RETRIES: int = int(os.getenv("INVALID_MODEL_ID_MAX_RETRIES", "5"))
 
-# Base delay (seconds) for INVALID_MODEL_ID retries: delay * (2 ** (retry_index - 1))
-# Defaults shorter than BASE_RETRY_DELAY because the observed failures are brief blips.
+# Base delay (seconds) for INVALID_MODEL_ID retries: delay * retry_index
+# → 0.5s, 1.0s, 1.5s, 2.0s, 2.5s with defaults (linear, not exponential).
 INVALID_MODEL_ID_RETRY_DELAY: float = float(os.getenv("INVALID_MODEL_ID_RETRY_DELAY", "0.5"))
 
 # ==================================================================================================

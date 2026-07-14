@@ -104,7 +104,7 @@ class KiroHttpClient:
     - 403: refreshes token and retries
     - 429: waits with exponential backoff
     - 5xx: waits with exponential backoff
-    - 400 + INVALID_MODEL_ID: short same-account backoff (bounded)
+    - 400 + INVALID_MODEL_ID: linear same-account backoff (bounded)
     - Timeouts: waits with exponential backoff
     
     Supports two modes of operation:
@@ -237,7 +237,7 @@ class KiroHttpClient:
         - 403: refreshes token via auth_manager.force_refresh() and retries
         - 429: waits with exponential backoff (1s, 2s, 4s)
         - 5xx: waits with exponential backoff
-        - 400 + INVALID_MODEL_ID: short same-account backoff (0.5s, 1s by default)
+        - 400 + INVALID_MODEL_ID: linear same-account backoff (0.5s..2.5s by default)
         - Timeouts: waits with exponential backoff
         
         For streaming, STREAMING_READ_TIMEOUT is used for waiting between chunks.
@@ -259,6 +259,8 @@ class KiroHttpClient:
         # Determine the number of retry attempts
         # FIRST_TOKEN_TIMEOUT is used in streaming_openai.py, not here
         max_retries = FIRST_TOKEN_MAX_RETRIES if stream else MAX_RETRIES
+        # INVALID_MODEL_ID has its own budget; ensure the loop can cover it.
+        loop_limit = max(max_retries, 1 + INVALID_MODEL_ID_MAX_RETRIES)
         
         client = await self._get_client(stream=stream)
         last_error = None
@@ -266,7 +268,7 @@ class KiroHttpClient:
         last_response: Optional[httpx.Response] = None  # Для сохранения последнего 429/5xx
         invalid_model_retries_done = 0
         
-        for attempt in range(max_retries):
+        for attempt in range(loop_limit):
             try:
                 # Get current token
                 token = await self.auth_manager.get_access_token()
@@ -302,6 +304,8 @@ class KiroHttpClient:
                 
                 # 403 - token expired, refresh and retry
                 if response.status_code == 403:
+                    if attempt >= max_retries - 1:
+                        return response
                     logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
                     await self.auth_manager.force_refresh()
                     continue
@@ -309,6 +313,8 @@ class KiroHttpClient:
                 # 429 - rate limit, wait and retry
                 if response.status_code == 429:
                     last_response = response  # Сохраняем для возврата после exhaustion
+                    if attempt >= max_retries - 1:
+                        break
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
@@ -317,6 +323,8 @@ class KiroHttpClient:
                 # 5xx - server error, wait and retry
                 if 500 <= response.status_code < 600:
                     last_response = response  # Сохраняем для возврата после exhaustion
+                    if attempt >= max_retries - 1:
+                        break
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"Received {response.status_code}, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
@@ -328,12 +336,9 @@ class KiroHttpClient:
                     if (
                         reason == "INVALID_MODEL_ID"
                         and invalid_model_retries_done < INVALID_MODEL_ID_MAX_RETRIES
-                        and attempt < max_retries - 1
                     ):
                         invalid_model_retries_done += 1
-                        delay = INVALID_MODEL_ID_RETRY_DELAY * (
-                            2 ** (invalid_model_retries_done - 1)
-                        )
+                        delay = INVALID_MODEL_ID_RETRY_DELAY * invalid_model_retries_done
                         logger.warning(
                             f"Received 400 INVALID_MODEL_ID, waiting {delay}s "
                             f"(attempt {invalid_model_retries_done}/"
@@ -362,8 +367,7 @@ class KiroHttpClient:
                     await asyncio.sleep(delay)
                 else:
                     logger.error(f"{short_msg} - no more retries (attempt {attempt + 1}/{max_retries})")
-                    if not error_info.is_retryable:
-                        break  # Don't retry non-retryable errors
+                    break
                 
             except httpx.RequestError as e:
                 last_error = e
@@ -381,8 +385,7 @@ class KiroHttpClient:
                     await asyncio.sleep(delay)
                 else:
                     logger.error(f"{short_msg} - no more retries (attempt {attempt + 1}/{max_retries})")
-                    if not error_info.is_retryable:
-                        break  # Don't retry non-retryable errors
+                    break
         
         # If we have a last_response (429/5xx retry exhausted), return it
         # This allows the caller to see the real status code and error body

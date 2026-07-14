@@ -471,7 +471,7 @@ class TestKiroHttpClientRequestWithRetry:
             with patch('kiro.http_client.get_kiro_headers', return_value={}):
                 with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
                     with patch('kiro.http_client.INVALID_MODEL_ID_RETRY_DELAY', 0.5):
-                        with patch('kiro.http_client.INVALID_MODEL_ID_MAX_RETRIES', 2):
+                        with patch('kiro.http_client.INVALID_MODEL_ID_MAX_RETRIES', 5):
                             response = await http_client.request_with_retry(
                                 "POST",
                                 "https://api.example.com/test",
@@ -503,15 +503,15 @@ class TestKiroHttpClientRequestWithRetry:
         
         mock_client = AsyncMock()
         mock_client.is_closed = False
-        # MAX_RETRIES default 3 → 1 initial + up to 2 INVALID retries
-        mock_client.request = AsyncMock(side_effect=[make_400(), make_400(), make_400()])
+        # 1 initial + 5 INVALID retries = 6 attempts; delays 0.5..2.5 linear
+        mock_client.request = AsyncMock(side_effect=[make_400() for _ in range(6)])
         
         print("Action: Executing request...")
         with patch.object(http_client, '_get_client', return_value=mock_client):
             with patch('kiro.http_client.get_kiro_headers', return_value={}):
                 with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
                     with patch('kiro.http_client.INVALID_MODEL_ID_RETRY_DELAY', 0.5):
-                        with patch('kiro.http_client.INVALID_MODEL_ID_MAX_RETRIES', 2):
+                        with patch('kiro.http_client.INVALID_MODEL_ID_MAX_RETRIES', 5):
                             with patch('kiro.http_client.MAX_RETRIES', 3):
                                 response = await http_client.request_with_retry(
                                     "POST",
@@ -519,10 +519,12 @@ class TestKiroHttpClientRequestWithRetry:
                                     {"data": "value"}
                                 )
         
-        print("Verification: 3 attempts, delays 0.5 then 1.0, final 400...")
+        print("Verification: 6 attempts, delays 0.5..2.5, final 400...")
         assert response.status_code == 400
-        assert mock_client.request.call_count == 3
-        assert mock_sleep.call_args_list == [((0.5,),), ((1.0,),)]
+        assert mock_client.request.call_count == 6
+        assert mock_sleep.call_args_list == [
+            ((0.5,),), ((1.0,),), ((1.5,),), ((2.0,),), ((2.5,),)
+        ]
     
     @pytest.mark.asyncio
     async def test_content_length_exceeded_does_not_retry(self, mock_auth_manager_for_http):
@@ -624,7 +626,7 @@ class TestKiroHttpClientRequestWithRetry:
             with patch('kiro.http_client.get_kiro_headers', return_value={}):
                 with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
                     with patch('kiro.http_client.INVALID_MODEL_ID_RETRY_DELAY', 0.5):
-                        with patch('kiro.http_client.INVALID_MODEL_ID_MAX_RETRIES', 2):
+                        with patch('kiro.http_client.INVALID_MODEL_ID_MAX_RETRIES', 5):
                             response = await http_client.request_with_retry(
                                 "POST",
                                 "https://api.example.com/test",
