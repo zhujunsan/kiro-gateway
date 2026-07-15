@@ -24,11 +24,16 @@ Consumes parse_kiro_stream() directly (not chat.completion chunks) and emits
 Responses SSE events that Codex (wire_api=responses) consumes:
 
 - response.created
-- response.output_text.delta
-- response.output_item.added (function_call)
+- response.in_progress
+- response.output_item.added (message / function_call, status=in_progress)
+- response.output_text.delta / response.output_text.done
+- response.function_call_arguments.delta / response.function_call_arguments.done
 - response.output_item.done (message / function_call)
 - response.completed
 - response.failed
+
+Kiro usually delivers complete tool arguments in one tool_use event; we still
+chunk them into function_call_arguments.delta then .done for Codex compatibility.
 
 TODO(models_responses / converters_responses): routes may later pass typed
 request helpers; this module stays self-contained on response id helpers and
@@ -68,8 +73,14 @@ except ImportError:
     debug_logger = None
 
 
+# Slice complete tool-argument JSON into bounded deltas (same rationale as
+# streaming_openai.TOOL_CALL_ARG_CHUNK_SIZE: avoid oversized SSE lines).
+FUNCTION_CALL_ARG_CHUNK_SIZE = 1024
+
+
 __all__ = [
     "FirstTokenTimeoutError",
+    "FUNCTION_CALL_ARG_CHUNK_SIZE",
     "generate_response_id",
     "format_sse_event",
     "stream_kiro_to_responses",
@@ -248,12 +259,25 @@ async def stream_kiro_to_responses_internal(
             },
         )
 
+    def emit_in_progress() -> str:
+        """Emit response.in_progress immediately after created."""
+        return format_sse_event(
+            "response.in_progress",
+            {
+                "response": _base_response(
+                    response_id, model, created_at, "in_progress"
+                ),
+                "sequence_number": next_seq(),
+            },
+        )
+
     try:
         # Defer response.created until the first Kiro event so first-token
         # timeout can retry before any SSE bytes reach the client.
         async for event in parse_kiro_stream(response, first_token_timeout):
             if not created_emitted:
                 yield emit_created()
+                yield emit_in_progress()
 
             if event.type == "content" and event.content:
                 full_content += event.content
@@ -384,8 +408,9 @@ async def stream_kiro_to_responses_internal(
                 context_usage_percentage = event.context_usage_percentage
 
         if not created_emitted:
-            # Empty stream still needs a created → completed handshake.
+            # Empty stream still needs a created → in_progress → completed handshake.
             yield emit_created()
+            yield emit_in_progress()
 
         received_usage = metering_data is not None
         received_context_usage = context_usage_percentage is not None
@@ -489,6 +514,16 @@ async def stream_kiro_to_responses_internal(
                         "sequence_number": next_seq(),
                     },
                 )
+            yield format_sse_event(
+                "response.output_text.done",
+                {
+                    "item_id": message_item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "text": full_content,
+                    "sequence_number": next_seq(),
+                },
+            )
             msg_item = _message_item(message_item_id, full_content, status="completed")
             yield format_sse_event(
                 "response.output_item.done",
@@ -501,7 +536,7 @@ async def stream_kiro_to_responses_internal(
             output_items.append(msg_item)
             output_index += 1
 
-        # Emit function_call items
+        # Emit function_call items (added → arg deltas → args done → item done)
         for tc in all_tool_calls:
             normalized = _normalize_tool_call(tc)
             fc_item_id = generate_function_call_item_id()
@@ -520,11 +555,48 @@ async def stream_kiro_to_responses_internal(
                     "sequence_number": next_seq(),
                 },
             )
+
+            tool_args = normalized["arguments"]
+            # Always emit at least one delta so Codex sees a complete arg stream
+            # even when arguments are "{}" or empty.
+            if tool_args:
+                for start in range(0, len(tool_args), FUNCTION_CALL_ARG_CHUNK_SIZE):
+                    yield format_sse_event(
+                        "response.function_call_arguments.delta",
+                        {
+                            "item_id": fc_item_id,
+                            "output_index": output_index,
+                            "delta": tool_args[start : start + FUNCTION_CALL_ARG_CHUNK_SIZE],
+                            "sequence_number": next_seq(),
+                        },
+                    )
+            else:
+                yield format_sse_event(
+                    "response.function_call_arguments.delta",
+                    {
+                        "item_id": fc_item_id,
+                        "output_index": output_index,
+                        "delta": "",
+                        "sequence_number": next_seq(),
+                    },
+                )
+
+            yield format_sse_event(
+                "response.function_call_arguments.done",
+                {
+                    "item_id": fc_item_id,
+                    "output_index": output_index,
+                    "name": normalized["name"],
+                    "arguments": tool_args,
+                    "sequence_number": next_seq(),
+                },
+            )
+
             done_item = _function_call_item(
                 fc_item_id,
                 normalized["call_id"],
                 normalized["name"],
-                normalized["arguments"],
+                tool_args,
                 status="completed",
             )
             yield format_sse_event(
