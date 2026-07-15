@@ -57,7 +57,7 @@ class TestResponsesAuth:
 
 
 class TestResponsesValidation:
-    """Validation → HTTP 400 for unsupported Responses items."""
+    """Validation → HTTP 400 / 422 for unsupported Responses items."""
 
     def test_unknown_input_item_returns_400(self, test_client, valid_proxy_api_key):
         response = test_client.post(
@@ -73,6 +73,64 @@ class TestResponsesValidation:
         assert response.status_code == 400
         detail = response.json().get("detail", "")
         assert "Unsupported" in detail or "web_search_call" in detail
+
+    def test_hosted_only_tools_returns_422(self, test_client, valid_proxy_api_key):
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "input": "Hello",
+                "tools": [{"type": "web_search"}, {"type": "file_search"}],
+            },
+        )
+        assert response.status_code == 422
+        detail = response.json().get("detail", {})
+        if isinstance(detail, dict):
+            assert detail.get("code") == "hosted_tools_not_supported"
+        else:
+            assert "hosted" in str(detail).lower()
+
+    def test_tool_choice_hosted_type_returns_422(
+        self, test_client, valid_proxy_api_key
+    ):
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "input": "Hello",
+                "tools": [
+                    {"type": "function", "name": "Read", "parameters": {}},
+                    {"type": "web_search"},
+                ],
+                "tool_choice": {"type": "web_search"},
+            },
+        )
+        assert response.status_code == 422
+        detail = response.json().get("detail", {})
+        if isinstance(detail, dict):
+            assert detail.get("code") == "hosted_tools_not_supported"
+
+    def test_tool_choice_unknown_function_returns_400(
+        self, test_client, valid_proxy_api_key
+    ):
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "input": "Hello",
+                "tools": [
+                    {"type": "function", "name": "Read", "parameters": {}},
+                ],
+                "tool_choice": {"type": "function", "name": "missing_tool"},
+            },
+        )
+        assert response.status_code == 400
+        detail = response.json().get("detail", {})
+        detail_text = detail.get("message", detail) if isinstance(detail, dict) else detail
+        assert "not found" in str(detail_text).lower() or "missing_tool" in str(detail_text)
 
     def test_namespace_and_web_search_tools_do_not_400(
         self, test_client, valid_proxy_api_key
@@ -117,10 +175,11 @@ class TestResponsesValidation:
                 },
             )
 
-        # Must not be the old Unsupported tool type 400
-        assert response.status_code != 400
+        # Must not be 400/422 — mixed hosted+function is allowed (hosted stripped)
+        assert response.status_code not in (400, 422)
         detail = str(response.json().get("detail", ""))
         assert "Unsupported tool type" not in detail
+        assert "hosted_tools_not_supported" not in detail
 
 
 class TestResponsesCompact:

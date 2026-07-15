@@ -26,14 +26,22 @@ Endpoints:
 """
 
 import json
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from kiro.config import PROFILE_ARN
-from kiro.models_responses import ResponsesRequest
-from kiro.converters_responses import build_kiro_payload_from_responses
+from kiro.models_responses import (
+    ResponsesRequest,
+    ResponsesRequestError,
+    ResponsesUnprocessableError,
+)
+from kiro.converters_responses import (
+    ResponsesBuildResult,
+    build_kiro_payload_from_responses,
+)
 from kiro.streaming_responses import (
     stream_with_first_token_retry,
     collect_stream_response,
@@ -77,6 +85,44 @@ def _log_kiro_payload(kiro_payload: dict) -> None:
         logger.warning(f"Failed to log Kiro request: {e}")
 
 
+def _http_exception_for_conversion_error(exc: Exception) -> HTTPException:
+    """
+    Map converter / validation errors to HTTP 400 or 422.
+
+    - ResponsesUnprocessableError → 422 (e.g. hosted_tools_not_supported)
+    - ResponsesRequestError → status from exception (usually 400)
+    - other ValueError → 400
+    """
+    if isinstance(exc, ResponsesRequestError):
+        return HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "message": str(exc),
+                "type": (
+                    "unsupported_feature"
+                    if isinstance(exc, ResponsesUnprocessableError)
+                    else "invalid_request_error"
+                ),
+                "code": exc.code,
+            },
+        )
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail=str(exc))
+    raise exc
+
+
+def _merge_conversion_metadata(
+    responses_json: dict,
+    build_result: ResponsesBuildResult,
+) -> dict:
+    """Attach unsupported_features / parallel_tool_calls to non-stream JSON."""
+    if build_result.unsupported_features:
+        responses_json["unsupported_features"] = list(build_result.unsupported_features)
+    if build_result.parallel_tool_calls is not None:
+        responses_json["parallel_tool_calls"] = build_result.parallel_tool_calls
+    return responses_json
+
+
 async def _handle_success_response(
     *,
     request: Request,
@@ -87,6 +133,7 @@ async def _handle_success_response(
     kiro_payload: dict,
     model_cache,
     auth_manager,
+    build_result: Optional[ResponsesBuildResult] = None,
 ) -> StreamingResponse | JSONResponse:
     """Stream or collect a successful Kiro generateAssistantResponse."""
     messages_for_tokenizer, tools_for_tokenizer = _tokenizer_inputs(request_data)
@@ -161,6 +208,8 @@ async def _handle_success_response(
         request_messages=messages_for_tokenizer,
         request_tools=tools_for_tokenizer,
     )
+    if build_result is not None:
+        responses_json = _merge_conversion_metadata(responses_json, build_result)
     await http_client.close()
     logger.info("HTTP 200 - POST /v1/responses (non-streaming) - completed")
     if debug_logger:
@@ -234,14 +283,15 @@ async def create_response(request: Request, request_data: ResponsesRequest):
             profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
 
             try:
-                kiro_payload = build_kiro_payload_from_responses(
+                build_result = build_kiro_payload_from_responses(
                     request_data,
                     conversation_id,
                     profile_arn_for_payload,
                 )
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
+            except (ResponsesRequestError, ValueError) as e:
+                raise _http_exception_for_conversion_error(e) from e
 
+            kiro_payload = build_result.payload
             _log_kiro_payload(kiro_payload)
 
             url = f"{auth_manager.api_host}/generateAssistantResponse"
@@ -270,6 +320,7 @@ async def create_response(request: Request, request_data: ResponsesRequest):
                         kiro_payload=kiro_payload,
                         model_cache=model_cache,
                         auth_manager=auth_manager,
+                        build_result=build_result,
                     )
 
                 try:
@@ -386,14 +437,15 @@ async def create_response(request: Request, request_data: ResponsesRequest):
     profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
 
     try:
-        kiro_payload = build_kiro_payload_from_responses(
+        build_result = build_kiro_payload_from_responses(
             request_data,
             conversation_id,
             profile_arn_for_payload,
         )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except (ResponsesRequestError, ValueError) as e:
+        raise _http_exception_for_conversion_error(e) from e
 
+    kiro_payload = build_result.payload
     _log_kiro_payload(kiro_payload)
 
     url = f"{auth_manager.api_host}/generateAssistantResponse"
@@ -453,6 +505,7 @@ async def create_response(request: Request, request_data: ResponsesRequest):
             kiro_payload=kiro_payload,
             model_cache=model_cache,
             auth_manager=auth_manager,
+            build_result=build_result,
         )
 
     except HTTPException as e:

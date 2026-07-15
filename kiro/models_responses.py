@@ -21,10 +21,11 @@
 Pydantic models for OpenAI Responses API (POST /v1/responses).
 
 Uses a loose input shape (string or list of dicts) plus explicit validation
-helpers that raise ValueError for route handlers to map to HTTP 400.
+helpers that raise ValueError / ResponsesRequestError for route handlers to
+map to HTTP 400 or 422.
 """
 
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 from pydantic import BaseModel
 
@@ -38,8 +39,8 @@ SUPPORTED_INPUT_ITEM_TYPES = frozenset({
 })
 
 # Built-in / hosted tools that are not client function tools.
-# These are ignored (stripped) during conversion rather than rejecting the
-# whole request — Codex and other clients often send them alongside functions.
+# Mixed with function tools → stripped (reported via unsupported_features).
+# Hosted-only → HTTP 422 hosted_tools_not_supported (do not silently succeed).
 UNSUPPORTED_BUILTIN_TOOL_TYPES = frozenset({
     "web_search",
     "web_search_preview",
@@ -60,6 +61,41 @@ UNSUPPORTED_BUILTIN_TOOL_TYPES = frozenset({
 # Codex / Responses wrapper that groups nested function tools.
 # Nested ``tools`` are expanded into flat function tools for Kiro.
 NAMESPACE_TOOL_TYPE = "namespace"
+
+# tool_choice string modes accepted by Responses API.
+TOOL_CHOICE_STRING_MODES = frozenset({"none", "auto", "required"})
+
+
+class ResponsesRequestError(ValueError):
+    """
+    Responses request error with HTTP status mapping for route handlers.
+
+    Default status is 400 (bad request). Use :class:`ResponsesUnprocessableError`
+    (or status_code=422) for unsupported-but-recognized features.
+    """
+
+    status_code: int = 400
+    code: str = "invalid_request"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Optional[str] = None,
+        status_code: Optional[int] = None,
+    ):
+        super().__init__(message)
+        if code is not None:
+            self.code = code
+        if status_code is not None:
+            self.status_code = status_code
+
+
+class ResponsesUnprocessableError(ResponsesRequestError):
+    """Recognized but unsupported Responses feature → HTTP 422."""
+
+    status_code: int = 422
+    code: str = "unprocessable_entity"
 
 
 def _tool_as_dict(tool: Any) -> Dict[str, Any]:
@@ -236,9 +272,9 @@ def validate_responses_tools(tools: Optional[List[Any]]) -> None:
     - ``type: function`` (must have a name)
     - ``type: namespace`` (Codex wrapper; nested function tools are validated)
 
-    Built-in tools (``web_search``, ``local_shell``, …) and other unknown
-    wrapper types are **not** rejected here — converters strip them so Codex
-    requests still succeed as long as function tools remain.
+    Built-in / hosted tools (``web_search``, ``local_shell``, …) and other
+    unknown wrappers are **not** rejected here — converters apply hosted
+    policy (422 if hosted-only; strip + report if mixed with functions).
 
     Raises:
         ValueError: Malformed function / namespace entries (400-ready).
@@ -283,16 +319,263 @@ def validate_responses_tools(tools: Optional[List[Any]]) -> None:
                     )
             continue
 
-        # Built-ins / unknown wrappers: tolerate (stripped during conversion).
+        # Built-ins / unknown wrappers: tolerate (hosted policy in converters).
         continue
+
+
+def is_hosted_tool_type(tool_type: Optional[str]) -> bool:
+    """Return True if ``tool_type`` is a known OpenAI hosted / built-in tool."""
+    if not tool_type:
+        return False
+    return tool_type in UNSUPPORTED_BUILTIN_TOOL_TYPES
+
+
+def _namespace_has_function_tools(tool_dict: Dict[str, Any]) -> bool:
+    nested = tool_dict.get("tools")
+    if not isinstance(nested, list):
+        return False
+    for nested_tool in nested:
+        try:
+            nested_dict = _tool_as_dict(nested_tool)
+        except TypeError:
+            continue
+        nested_type = nested_dict.get("type") or "function"
+        if nested_type == "function" and _function_tool_name(nested_dict):
+            return True
+    return False
+
+
+def classify_responses_tools(
+    tools: Optional[Sequence[Any]],
+) -> Tuple[List[Any], List[str], List[str]]:
+    """
+    Split Responses ``tools`` into keepable vs hosted/unsupported.
+
+    Returns:
+        Tuple of:
+        - tools to keep (``function`` + ``namespace`` entries)
+        - hosted / built-in tool types found (for unsupported_features)
+        - unknown non-function wrapper types found
+    """
+    if not tools:
+        return [], [], []
+
+    keep: List[Any] = []
+    hosted_types: List[str] = []
+    unknown_types: List[str] = []
+
+    for tool in tools:
+        try:
+            tool_dict = _tool_as_dict(tool)
+        except TypeError:
+            continue
+
+        tool_type = tool_dict.get("type") or "function"
+
+        if tool_type == "function" or tool_type == NAMESPACE_TOOL_TYPE:
+            keep.append(tool)
+            continue
+
+        if is_hosted_tool_type(tool_type):
+            if tool_type not in hosted_types:
+                hosted_types.append(str(tool_type))
+            continue
+
+        type_name = str(tool_type)
+        if type_name not in unknown_types:
+            unknown_types.append(type_name)
+
+    return keep, hosted_types, unknown_types
+
+
+def collect_function_tool_names(tools: Optional[Sequence[Any]]) -> List[str]:
+    """
+    Collect client-facing function tool names from flat + namespace tools.
+
+    Does not apply namespace qualification — that is owned by converters.
+    Order follows first-seen occurrence; duplicates are skipped.
+    """
+    if not tools:
+        return []
+
+    names: List[str] = []
+    seen: set[str] = set()
+
+    def _add(name: Optional[str]) -> None:
+        if not name or name in seen:
+            return
+        seen.add(name)
+        names.append(name)
+
+    for tool in tools:
+        try:
+            tool_dict = _tool_as_dict(tool)
+        except TypeError:
+            continue
+
+        tool_type = tool_dict.get("type") or "function"
+
+        if tool_type == "function":
+            _add(_function_tool_name(tool_dict))
+            continue
+
+        if tool_type != NAMESPACE_TOOL_TYPE:
+            continue
+
+        nested = tool_dict.get("tools")
+        if not isinstance(nested, list):
+            continue
+        for nested_tool in nested:
+            try:
+                nested_dict = _tool_as_dict(nested_tool)
+            except TypeError:
+                continue
+            nested_type = nested_dict.get("type") or "function"
+            if nested_type == "function":
+                _add(_function_tool_name(nested_dict))
+
+    return names
+
+
+def collect_hosted_tool_names(tools: Optional[Sequence[Any]]) -> List[str]:
+    """Collect names declared on hosted / built-in tool entries."""
+    if not tools:
+        return []
+
+    names: List[str] = []
+    seen: set[str] = set()
+    for tool in tools:
+        try:
+            tool_dict = _tool_as_dict(tool)
+        except TypeError:
+            continue
+        tool_type = tool_dict.get("type") or "function"
+        if not is_hosted_tool_type(tool_type):
+            continue
+        name = tool_dict.get("name")
+        if name is None:
+            # Hosted tools often use type as the selectable name.
+            name = tool_type
+        name_str = str(name)
+        if name_str not in seen:
+            seen.add(name_str)
+            names.append(name_str)
+    return names
+
+
+def parse_responses_tool_choice(
+    tool_choice: Optional[Union[str, Dict[str, Any]]],
+) -> Tuple[str, Optional[str]]:
+    """
+    Normalize ``tool_choice`` to ``(mode, function_name)``.
+
+    Modes: ``none`` | ``auto`` | ``required`` | ``function``.
+
+    Raises:
+        ResponsesRequestError: Invalid shape (400).
+        ResponsesUnprocessableError: Hosted tool selected (422).
+    """
+    if tool_choice is None:
+        return "auto", None
+
+    if isinstance(tool_choice, str):
+        mode = tool_choice.strip().lower()
+        if mode in TOOL_CHOICE_STRING_MODES:
+            return mode, None
+        raise ResponsesRequestError(
+            f"Unsupported tool_choice string '{tool_choice}'. "
+            f"Expected one of: {', '.join(sorted(TOOL_CHOICE_STRING_MODES))}.",
+            code="invalid_tool_choice",
+        )
+
+    if not isinstance(tool_choice, dict):
+        raise ResponsesRequestError(
+            f"tool_choice must be a string or object, got {type(tool_choice).__name__}",
+            code="invalid_tool_choice",
+        )
+
+    choice_type = tool_choice.get("type")
+    if not choice_type:
+        raise ResponsesRequestError(
+            "tool_choice object requires 'type'",
+            code="invalid_tool_choice",
+        )
+
+    choice_type_str = str(choice_type)
+
+    if choice_type_str == "function":
+        name = tool_choice.get("name")
+        if not name and isinstance(tool_choice.get("function"), dict):
+            name = tool_choice["function"].get("name")
+        if not name:
+            raise ResponsesRequestError(
+                "tool_choice type=function requires 'name'",
+                code="invalid_tool_choice",
+            )
+        return "function", str(name)
+
+    if choice_type_str in TOOL_CHOICE_STRING_MODES:
+        # Some clients send {"type": "auto"} etc.
+        return choice_type_str, None
+
+    if is_hosted_tool_type(choice_type_str):
+        raise ResponsesUnprocessableError(
+            f"tool_choice type '{choice_type_str}' selects a hosted tool, "
+            f"which is not supported by this gateway.",
+            code="hosted_tools_not_supported",
+        )
+
+    raise ResponsesRequestError(
+        f"Unsupported tool_choice type '{choice_type_str}'. "
+        f"Expected none/auto/required or type=function.",
+        code="invalid_tool_choice",
+    )
+
+
+def validate_responses_tool_choice(
+    tool_choice: Optional[Union[str, Dict[str, Any]]],
+    tools: Optional[Sequence[Any]] = None,
+) -> Tuple[str, Optional[str]]:
+    """
+    Validate ``tool_choice`` and that a named function exists among tools.
+
+    Raises:
+        ResponsesRequestError: Invalid / unknown function name (400).
+        ResponsesUnprocessableError: Hosted tool selected by type or name (422).
+    """
+    mode, function_name = parse_responses_tool_choice(tool_choice)
+
+    if mode != "function" or not function_name:
+        return mode, function_name
+
+    hosted_names = set(collect_hosted_tool_names(tools))
+    if function_name in hosted_names or is_hosted_tool_type(function_name):
+        raise ResponsesUnprocessableError(
+            f"tool_choice function '{function_name}' refers to a hosted tool, "
+            f"which is not supported by this gateway.",
+            code="hosted_tools_not_supported",
+        )
+
+    function_names = collect_function_tool_names(tools)
+    if function_name not in function_names:
+        available = ", ".join(function_names) if function_names else "(none)"
+        raise ResponsesRequestError(
+            f"tool_choice function '{function_name}' not found in tools. "
+            f"Available function tools: {available}.",
+            code="invalid_tool_choice",
+        )
+
+    return mode, function_name
 
 
 def validate_responses_request(request: ResponsesRequest) -> None:
     """
-    Run all Responses request checks that should map to HTTP 400.
+    Run Responses request checks that map to HTTP 400 / 422.
 
     Raises:
-        ValueError: On unsupported input items or malformed function tools.
+        ValueError / ResponsesRequestError: Unsupported input or bad tools.
+        ResponsesUnprocessableError: Hosted tool_choice (422).
     """
     validate_responses_input(request.input)
     validate_responses_tools(request.tools)
+    validate_responses_tool_choice(request.tool_choice, request.tools)

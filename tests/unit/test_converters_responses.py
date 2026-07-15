@@ -13,20 +13,45 @@ import pytest
 
 from kiro.converters_core import sanitize_tool_use_id, TOOL_USE_ID_MAX_LENGTH
 from kiro.converters_responses import (
+    apply_parallel_tool_calls_constraint,
+    apply_responses_tool_choice,
     build_kiro_payload_from_responses,
     convert_responses_input_to_unified,
     convert_responses_tools_to_unified,
     extract_thinking_config_from_responses,
+    prepare_responses_tools_policy,
+    _TOOL_CHOICE_NAMED_PROMPT,
+    _TOOL_CHOICE_NONE_PROMPT,
+    _TOOL_CHOICE_REQUIRED_PROMPT,
+    _PARALLEL_TOOL_CALLS_FALSE_PROMPT,
     _extract_responses_text,
 )
 from kiro.models_responses import (
     ResponsesFunctionTool,
     ResponsesReasoning,
     ResponsesRequest,
+    ResponsesRequestError,
+    ResponsesUnprocessableError,
     validate_responses_input,
     validate_responses_request,
+    validate_responses_tool_choice,
     validate_responses_tools,
 )
+
+
+def _payload_of(build_result):
+    """Unwrap ResponsesBuildResult.payload for assertions."""
+    return build_result.payload if hasattr(build_result, "payload") else build_result
+
+
+def _system_text_from_payload(payload: dict) -> str:
+    """Best-effort extract of system constraints embedded in user content."""
+    current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+    parts = [current.get("content") or ""]
+    for turn in payload["conversationState"].get("history") or []:
+        user = turn.get("userInputMessage") or {}
+        parts.append(user.get("content") or "")
+    return "\n".join(parts)
 
 
 # ==================================================================================================
@@ -403,10 +428,24 @@ class TestConvertResponsesToolsToUnified:
         assert len(tools) == 1
         assert tools[0].name == "Read"
 
-    def test_builtin_only_returns_none(self):
-        assert convert_responses_tools_to_unified([
-            ResponsesFunctionTool(type="file_search", name="file_search"),
-        ]) is None
+    def test_hosted_only_raises_422(self):
+        with pytest.raises(ResponsesUnprocessableError, match="hosted_tools_not_supported|Hosted"):
+            convert_responses_tools_to_unified([
+                ResponsesFunctionTool(type="file_search", name="file_search"),
+            ])
+
+    def test_mixed_hosted_keeps_functions_and_reports_unsupported(self):
+        filtered, unsupported = prepare_responses_tools_policy([
+            ResponsesFunctionTool(type="function", name="Read", parameters={}),
+            ResponsesFunctionTool(type="web_search", name="web_search"),
+            ResponsesFunctionTool(type="file_search"),
+        ])
+        assert filtered is not None
+        assert len(filtered) == 1
+        assert "tool:web_search" in unsupported
+        assert "tool:file_search" in unsupported
+        tools = convert_responses_tools_to_unified(filtered)
+        assert [t.name for t in tools] == ["Read"]
 
     def test_namespace_expands_nested_functions(self):
         tools = convert_responses_tools_to_unified([
@@ -610,6 +649,121 @@ class TestConvertResponsesToolsToUnified:
 
 
 # ==================================================================================================
+# tool_choice / parallel_tool_calls
+# ==================================================================================================
+
+class TestValidateResponsesToolChoice:
+    def test_string_modes(self):
+        assert validate_responses_tool_choice("none") == ("none", None)
+        assert validate_responses_tool_choice("auto") == ("auto", None)
+        assert validate_responses_tool_choice("required", [
+            {"type": "function", "name": "f", "parameters": {}},
+        ]) == ("required", None)
+
+    def test_named_function_ok(self):
+        mode, name = validate_responses_tool_choice(
+            {"type": "function", "name": "Read"},
+            [{"type": "function", "name": "Read", "parameters": {}}],
+        )
+        assert mode == "function"
+        assert name == "Read"
+
+    def test_named_missing_raises_400(self):
+        with pytest.raises(ResponsesRequestError, match="not found"):
+            validate_responses_tool_choice(
+                {"type": "function", "name": "missing"},
+                [{"type": "function", "name": "Read", "parameters": {}}],
+            )
+
+    def test_hosted_type_raises_422(self):
+        with pytest.raises(ResponsesUnprocessableError) as exc_info:
+            validate_responses_tool_choice({"type": "web_search"})
+        assert exc_info.value.code == "hosted_tools_not_supported"
+
+    def test_hosted_function_name_raises_422(self):
+        with pytest.raises(ResponsesUnprocessableError) as exc_info:
+            validate_responses_tool_choice(
+                {"type": "function", "name": "web_search"},
+                [
+                    {"type": "function", "name": "Read", "parameters": {}},
+                    {"type": "web_search", "name": "web_search"},
+                ],
+            )
+        assert exc_info.value.code == "hosted_tools_not_supported"
+
+
+class TestApplyResponsesToolChoice:
+    def _tools(self):
+        return convert_responses_tools_to_unified([
+            ResponsesFunctionTool(type="function", name="Read", parameters={}),
+            ResponsesFunctionTool(type="function", name="Write", parameters={}),
+        ])
+
+    def test_none_omits_tools_and_adds_constraint(self):
+        prompt, tools, mode = apply_responses_tool_choice(
+            "Be helpful.",
+            self._tools(),
+            "none",
+            raw_tools=[{"type": "function", "name": "Read", "parameters": {}}],
+        )
+        assert mode == "none"
+        assert tools is None
+        assert _TOOL_CHOICE_NONE_PROMPT in prompt
+
+    def test_auto_unchanged(self):
+        original = self._tools()
+        prompt, tools, mode = apply_responses_tool_choice(
+            "Sys",
+            original,
+            "auto",
+            raw_tools=[{"type": "function", "name": "Read", "parameters": {}}],
+        )
+        assert mode == "auto"
+        assert tools is original
+        assert prompt == "Sys"
+
+    def test_required_adds_constraint(self):
+        raw = [
+            {"type": "function", "name": "Read", "parameters": {}},
+            {"type": "function", "name": "Write", "parameters": {}},
+        ]
+        prompt, tools, mode = apply_responses_tool_choice(
+            "",
+            self._tools(),
+            "required",
+            raw_tools=raw,
+        )
+        assert mode == "required"
+        assert tools is not None
+        assert _TOOL_CHOICE_REQUIRED_PROMPT in prompt
+
+    def test_named_adds_constraint(self):
+        raw = [
+            {"type": "function", "name": "Read", "parameters": {}},
+            {"type": "function", "name": "Write", "parameters": {}},
+        ]
+        prompt, tools, mode = apply_responses_tool_choice(
+            "Sys",
+            self._tools(),
+            {"type": "function", "name": "Write"},
+            raw_tools=raw,
+        )
+        assert mode == "function"
+        assert tools is not None
+        assert _TOOL_CHOICE_NAMED_PROMPT.format(name="Write") in prompt
+
+
+class TestParallelToolCallsConstraint:
+    def test_false_adds_constraint(self):
+        prompt = apply_parallel_tool_calls_constraint("Sys", False)
+        assert _PARALLEL_TOOL_CALLS_FALSE_PROMPT in prompt
+
+    def test_true_or_none_noop(self):
+        assert apply_parallel_tool_calls_constraint("Sys", True) == "Sys"
+        assert apply_parallel_tool_calls_constraint("Sys", None) == "Sys"
+
+
+# ==================================================================================================
 # Thinking config
 # ==================================================================================================
 
@@ -661,7 +815,7 @@ class TestBuildKiroPayloadFromResponses:
             input="Hello",
             instructions="Be nice",
         )
-        payload = build_kiro_payload_from_responses(req, "conv-1", "arn:aws:test")
+        payload = _payload_of(build_kiro_payload_from_responses(req, "conv-1", "arn:aws:test"))
         assert "conversationState" in payload
         current = payload["conversationState"]["currentMessage"]["userInputMessage"]
         assert "Hello" in current["content"]
@@ -692,7 +846,7 @@ class TestBuildKiroPayloadFromResponses:
                 parameters={"type": "object", "properties": {}},
             )],
         )
-        payload = build_kiro_payload_from_responses(req, "conv-2", "arn:aws:test")
+        payload = _payload_of(build_kiro_payload_from_responses(req, "conv-2", "arn:aws:test"))
         history = payload["conversationState"]["history"]
         tool_use_ids = [
             tu["toolUseId"]
@@ -741,7 +895,8 @@ class TestBuildKiroPayloadFromResponses:
                 ResponsesFunctionTool(type="file_search", name="file_search"),
             ],
         )
-        payload = build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        result = build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        payload = _payload_of(result)
         ctx = (
             payload["conversationState"]["currentMessage"]["userInputMessage"]
             .get("userInputMessageContext") or {}
@@ -755,6 +910,84 @@ class TestBuildKiroPayloadFromResponses:
         assert "js" not in names
         assert "file_search" not in names
         assert "mcp__node_repl" not in names
+        assert "tool:file_search" in result.unsupported_features
+
+    def test_hosted_only_raises(self):
+        req = ResponsesRequest(
+            model="m",
+            input="hi",
+            tools=[ResponsesFunctionTool(type="web_search")],
+        )
+        with pytest.raises(ResponsesUnprocessableError) as exc_info:
+            build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        assert exc_info.value.code == "hosted_tools_not_supported"
+
+    def test_tool_choice_none_omits_tools_in_payload(self):
+        req = ResponsesRequest(
+            model="m",
+            input="hi",
+            tools=[ResponsesFunctionTool(type="function", name="Read", parameters={})],
+            tool_choice="none",
+        )
+        result = build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        payload = _payload_of(result)
+        ctx = (
+            payload["conversationState"]["currentMessage"]["userInputMessage"]
+            .get("userInputMessageContext") or {}
+        )
+        assert not ctx.get("tools")
+        assert result.tool_choice_mode == "none"
+        assert _TOOL_CHOICE_NONE_PROMPT in _system_text_from_payload(payload)
+
+    def test_tool_choice_required_keeps_tools(self):
+        req = ResponsesRequest(
+            model="m",
+            input="hi",
+            tools=[ResponsesFunctionTool(type="function", name="Read", parameters={})],
+            tool_choice="required",
+        )
+        result = build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        payload = _payload_of(result)
+        ctx = (
+            payload["conversationState"]["currentMessage"]["userInputMessage"]
+            .get("userInputMessageContext") or {}
+        )
+        names = [
+            t.get("toolSpecification", {}).get("name")
+            for t in (ctx.get("tools") or [])
+        ]
+        assert "Read" in names
+        assert _TOOL_CHOICE_REQUIRED_PROMPT in _system_text_from_payload(payload)
+
+    def test_tool_choice_named_keeps_tools(self):
+        req = ResponsesRequest(
+            model="m",
+            input="hi",
+            tools=[
+                ResponsesFunctionTool(type="function", name="Read", parameters={}),
+                ResponsesFunctionTool(type="function", name="Write", parameters={}),
+            ],
+            tool_choice={"type": "function", "name": "Write"},
+        )
+        result = build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        payload = _payload_of(result)
+        assert result.tool_choice_mode == "function"
+        assert _TOOL_CHOICE_NAMED_PROMPT.format(name="Write") in _system_text_from_payload(
+            payload
+        )
+
+    def test_parallel_tool_calls_false_adds_constraint(self):
+        req = ResponsesRequest(
+            model="m",
+            input="hi",
+            tools=[ResponsesFunctionTool(type="function", name="Read", parameters={})],
+            parallel_tool_calls=False,
+        )
+        result = build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        assert result.parallel_tool_calls is False
+        assert _PARALLEL_TOOL_CALLS_FALSE_PROMPT in _system_text_from_payload(
+            _payload_of(result)
+        )
 
     def test_validate_responses_request_wires_both_checks(self):
         req = ResponsesRequest(

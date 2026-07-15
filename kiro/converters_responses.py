@@ -24,7 +24,8 @@ Adapter layer: Responses input/tools/instructions/reasoning → unified format �
 converters_core.build_kiro_payload.
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from loguru import logger
 
@@ -33,7 +34,10 @@ from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_responses import (
     ResponsesFunctionTool,
     ResponsesRequest,
+    ResponsesUnprocessableError,
+    classify_responses_tools,
     validate_responses_request,
+    validate_responses_tool_choice,
 )
 from kiro.converters_core import (
     UnifiedMessage,
@@ -44,6 +48,34 @@ from kiro.converters_core import (
     sanitize_tool_use_id,
 )
 from kiro.converters_openai import reasoning_effort_to_budget
+
+
+# System constraints used because Kiro has no native tool_choice /
+# parallel_tool_calls controls.
+_TOOL_CHOICE_REQUIRED_PROMPT = (
+    "You must call at least one tool/function before responding with plain text."
+)
+_TOOL_CHOICE_NAMED_PROMPT = (
+    "You must call the tool/function named '{name}' before responding with plain text. "
+    "Do not call any other tool."
+)
+_TOOL_CHOICE_NONE_PROMPT = (
+    "Do not call any tools or functions. Respond with plain text only."
+)
+_PARALLEL_TOOL_CALLS_FALSE_PROMPT = (
+    "You must call at most one tool/function in this turn. "
+    "Do not make parallel or multiple tool calls."
+)
+
+
+@dataclass
+class ResponsesBuildResult:
+    """Kiro payload plus Responses-side metadata for the route layer."""
+
+    payload: dict
+    unsupported_features: List[str] = field(default_factory=list)
+    parallel_tool_calls: Optional[bool] = None
+    tool_choice_mode: str = "auto"
 
 
 # ==================================================================================================
@@ -278,6 +310,161 @@ def _unified_tool_from_function_dict(tool_dict: Dict[str, Any]) -> Optional[Unif
     )
 
 
+def _append_system_constraint(system_prompt: str, constraint: str) -> str:
+    """Append a unique system constraint paragraph."""
+    constraint = (constraint or "").strip()
+    if not constraint:
+        return system_prompt or ""
+    existing = (system_prompt or "").strip()
+    if constraint in existing:
+        return existing
+    if not existing:
+        return constraint
+    return f"{existing}\n\n{constraint}"
+
+
+def prepare_responses_tools_policy(
+    tools: Optional[Sequence[Any]],
+) -> Tuple[Optional[List[Any]], List[str]]:
+    """
+    Hosted-tools policy for Responses ``tools``.
+
+    - Hosted-only (no function / namespace functions) → 422
+      ``hosted_tools_not_supported`` (never silent success).
+    - Mixed hosted + function → keep function/namespace tools; report stripped
+      types via ``unsupported_features``.
+    - Function-only / empty → unchanged.
+
+    Returns:
+        (tools_for_conversion, unsupported_features)
+    """
+    if not tools:
+        return None, []
+
+    keep, hosted_types, unknown_types = classify_responses_tools(tools)
+    stripped_types = list(hosted_types) + list(unknown_types)
+    unsupported = [f"tool:{t}" for t in stripped_types]
+
+    # Detect whether any keepable entry can yield function tools.
+    from kiro.models_responses import (
+        NAMESPACE_TOOL_TYPE,
+        _namespace_has_function_tools,
+        _tool_as_dict,
+        collect_function_tool_names,
+    )
+
+    has_functions = bool(collect_function_tool_names(keep))
+    if not has_functions:
+        # Namespace entries without nested functions still count as "no functions".
+        for tool in keep or []:
+            try:
+                tool_dict = _tool_as_dict(tool)
+            except TypeError:
+                continue
+            if (tool_dict.get("type") or "function") == NAMESPACE_TOOL_TYPE:
+                if _namespace_has_function_tools(tool_dict):
+                    has_functions = True
+                    break
+
+    if stripped_types and not has_functions:
+        types_label = ", ".join(stripped_types)
+        raise ResponsesUnprocessableError(
+            f"Hosted/built-in tools are not supported by this gateway "
+            f"(received only: {types_label}). Provide at least one function tool.",
+            code="hosted_tools_not_supported",
+        )
+
+    if stripped_types:
+        logger.info(
+            f"Stripping unsupported Responses tools {stripped_types}; "
+            f"forwarding {len(keep or [])} function/namespace tool entr(y/ies)"
+        )
+
+    return (list(keep) if keep else None), unsupported
+
+
+def apply_responses_tool_choice(
+    system_prompt: str,
+    unified_tools: Optional[List[UnifiedTool]],
+    tool_choice: Optional[Union[str, Dict[str, Any]]],
+    *,
+    raw_tools: Optional[Sequence[Any]] = None,
+) -> Tuple[str, Optional[List[UnifiedTool]], str]:
+    """
+    Apply Responses ``tool_choice`` without native Kiro support.
+
+    - ``none``: omit tools + system constraint (no tool calls).
+    - ``auto``: unchanged.
+    - ``required``: system constraint to call at least one tool.
+    - named function: system constraint to call that tool (validated first).
+
+    Returns:
+        (system_prompt, tools, mode)
+    """
+    mode, function_name = validate_responses_tool_choice(tool_choice, raw_tools)
+
+    if mode == "none":
+        prompt = _append_system_constraint(system_prompt, _TOOL_CHOICE_NONE_PROMPT)
+        return prompt, None, mode
+
+    if mode == "auto":
+        return system_prompt or "", unified_tools, mode
+
+    if not unified_tools:
+        # required / named without tools cannot be satisfied meaningfully.
+        from kiro.models_responses import ResponsesRequestError
+
+        raise ResponsesRequestError(
+            f"tool_choice={mode!r} requires at least one function tool",
+            code="invalid_tool_choice",
+        )
+
+    if mode == "required":
+        prompt = _append_system_constraint(system_prompt, _TOOL_CHOICE_REQUIRED_PROMPT)
+        return prompt, unified_tools, mode
+
+    # named function — accept client local name or namespace-qualified Kiro name
+    assert function_name is not None
+    matched = next(
+        (
+            t for t in unified_tools
+            if t.name == function_name or t.name.endswith(f"__{function_name}")
+        ),
+        None,
+    )
+    if matched is None:
+        from kiro.models_responses import ResponsesRequestError
+
+        available = ", ".join(sorted(t.name for t in unified_tools)) or "(none)"
+        raise ResponsesRequestError(
+            f"tool_choice function '{function_name}' not found in converted tools. "
+            f"Available: {available}.",
+            code="invalid_tool_choice",
+        )
+
+    # Prompt uses the Kiro-facing name the model actually sees.
+    prompt = _append_system_constraint(
+        system_prompt,
+        _TOOL_CHOICE_NAMED_PROMPT.format(name=matched.name),
+    )
+    return prompt, unified_tools, mode
+
+
+def apply_parallel_tool_calls_constraint(
+    system_prompt: str,
+    parallel_tool_calls: Optional[bool],
+) -> str:
+    """
+    When ``parallel_tool_calls is False``, add a system constraint to call
+    at most one tool. ``True`` / ``None`` leave the prompt unchanged.
+    """
+    if parallel_tool_calls is False:
+        return _append_system_constraint(
+            system_prompt, _PARALLEL_TOOL_CALLS_FALSE_PROMPT
+        )
+    return system_prompt or ""
+
+
 def convert_responses_tools_to_unified(
     tools: Optional[List[ResponsesFunctionTool]],
 ) -> Optional[List[UnifiedTool]]:
@@ -290,7 +477,8 @@ def convert_responses_tools_to_unified(
     3. Codex ``type: namespace`` wrappers — nested function tools are expanded
        with lossless qualified names ``{namespace}__{local_name}`` (truncated to
        Kiro's 64-char limit with reverse mapping for streaming restore)
-    4. Built-in / unknown wrapper types (``web_search``, etc.) — skipped with log
+    4. Built-in / unknown wrapper types (``web_search``, etc.) — hosted policy
+       at the start (422 if hosted-only; otherwise stripped)
 
     Exact duplicate tool names (same final Kiro name) are still collapsed: the
     first occurrence is kept and later ones are skipped with a log. Same local
@@ -298,6 +486,7 @@ def convert_responses_tools_to_unified(
 
     Raises:
         ValueError: Malformed function / namespace entries.
+        ResponsesUnprocessableError: Hosted-only tools (422).
     """
     from kiro.models_responses import (
         NAMESPACE_TOOL_TYPE,
@@ -308,6 +497,11 @@ def convert_responses_tools_to_unified(
 
     validate_responses_tools(tools)
 
+    if not tools:
+        return None
+
+    # Hosted policy hook only — do not alter namespace naming below.
+    tools, _unsupported = prepare_responses_tools_policy(tools)
     if not tools:
         return None
 
@@ -375,7 +569,7 @@ def convert_responses_tools_to_unified(
             _append_unique(unified, f"tools[{i}] function")
             continue
 
-        # Built-ins and other Codex-only wrappers: strip, do not fail the request.
+        # Defense in depth: hosted should already be stripped by policy hook.
         reason = (
             "built-in"
             if tool_type in UNSUPPORTED_BUILTIN_TOOL_TYPES
@@ -429,13 +623,15 @@ def build_kiro_payload_from_responses(
     request_data: ResponsesRequest,
     conversation_id: str,
     profile_arn: str,
-) -> dict:
+) -> ResponsesBuildResult:
     """
     Build complete Kiro API payload from a Responses API request.
 
-    Validates unsupported input items (ValueError → HTTP 400), expands
-    ``namespace`` tools / strips built-ins, converts to unified messages/tools,
-    then calls converters_core.build_kiro_payload.
+    Validates unsupported input items (ValueError → HTTP 400), applies
+    hosted-tools policy (422 if hosted-only), applies ``tool_choice`` /
+    ``parallel_tool_calls`` constraints, expands ``namespace`` tools,
+    converts to unified messages/tools, then calls
+    converters_core.build_kiro_payload.
 
     Args:
         request_data: Parsed ResponsesRequest
@@ -443,10 +639,11 @@ def build_kiro_payload_from_responses(
         profile_arn: AWS CodeWhisperer profile ARN
 
     Returns:
-        Payload dictionary for POST to Kiro API
+        ResponsesBuildResult with Kiro payload and response metadata
 
     Raises:
-        ValueError: Unsupported input/tools, or no messages to send
+        ValueError / ResponsesRequestError: Unsupported input/tools (400)
+        ResponsesUnprocessableError: Hosted-only tools / hosted tool_choice (422)
     """
     validate_responses_request(request_data)
 
@@ -454,7 +651,24 @@ def build_kiro_payload_from_responses(
         request_data.input,
         instructions=request_data.instructions,
     )
-    unified_tools = convert_responses_tools_to_unified(request_data.tools)
+
+    # Hosted policy first so unsupported_features is available to routes.
+    filtered_tools, unsupported_features = prepare_responses_tools_policy(
+        request_data.tools
+    )
+    unified_tools = convert_responses_tools_to_unified(filtered_tools)
+
+    system_prompt, unified_tools, tool_choice_mode = apply_responses_tool_choice(
+        system_prompt,
+        unified_tools,
+        request_data.tool_choice,
+        raw_tools=request_data.tools,
+    )
+    system_prompt = apply_parallel_tool_calls_constraint(
+        system_prompt,
+        request_data.parallel_tool_calls,
+    )
+
     model_id = get_model_id_for_kiro(request_data.model, HIDDEN_MODELS)
     thinking_config = extract_thinking_config_from_responses(request_data)
 
@@ -463,6 +677,9 @@ def build_kiro_payload_from_responses(
         f"messages={len(unified_messages)}, "
         f"tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}, "
+        f"tool_choice={tool_choice_mode}, "
+        f"parallel_tool_calls={request_data.parallel_tool_calls}, "
+        f"unsupported_features={unsupported_features}, "
         f"thinking_enabled={thinking_config.enabled}, "
         f"thinking_budget={thinking_config.budget_tokens}"
     )
@@ -476,4 +693,9 @@ def build_kiro_payload_from_responses(
         profile_arn=profile_arn,
         thinking_config=thinking_config,
     )
-    return result.payload
+    return ResponsesBuildResult(
+        payload=result.payload,
+        unsupported_features=unsupported_features,
+        parallel_tool_calls=request_data.parallel_tool_calls,
+        tool_choice_mode=tool_choice_mode,
+    )
