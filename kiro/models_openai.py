@@ -52,9 +52,14 @@ class ModelList(BaseModel):
     List of models in OpenAI format.
     
     Response of GET /v1/models endpoint.
+
+    ``models`` is an optional Codex-shaped array (ModelInfo stubs). Present
+    for dual compatibility: Cursor/tray keep using ``data``; Codex reads
+    ``models``. Omitted when not populated.
     """
     object: str = "list"
     data: List[OpenAIModel]
+    models: Optional[List[Dict[str, Any]]] = None
 
 
 # ==================================================================================================

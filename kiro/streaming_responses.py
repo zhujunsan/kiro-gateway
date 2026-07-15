@@ -25,10 +25,12 @@ Responses SSE events that Codex (wire_api=responses) consumes:
 
 - response.created
 - response.in_progress
-- response.output_item.added (message / function_call, status=in_progress)
+- response.output_item.added (reasoning / message / function_call)
+- response.reasoning_summary_part.added / response.reasoning_summary_text.delta|done /
+  response.reasoning_summary_part.done (when FAKE_REASONING_HANDLING=as_reasoning_content)
 - response.output_text.delta / response.output_text.done
 - response.function_call_arguments.delta / response.function_call_arguments.done
-- response.output_item.done (message / function_call)
+- response.output_item.done (reasoning / message / function_call)
 - response.completed
 - response.failed
 
@@ -103,6 +105,11 @@ def generate_message_item_id() -> str:
 def generate_function_call_item_id() -> str:
     """Generate a unique function_call output item id (fc_...)."""
     return f"fc_{uuid.uuid4().hex}"
+
+
+def generate_reasoning_item_id() -> str:
+    """Generate a unique reasoning output item id (rs_...)."""
+    return f"rs_{uuid.uuid4().hex}"
 
 
 def format_sse_event(event_type: str, data: Dict[str, Any]) -> str:
@@ -185,6 +192,23 @@ def _function_call_item(
     }
 
 
+def _reasoning_item(
+    item_id: str,
+    summary: Optional[List[Dict[str, Any]]] = None,
+    status: str = "completed",
+) -> Dict[str, Any]:
+    return {
+        "id": item_id,
+        "type": "reasoning",
+        "status": status,
+        "summary": summary if summary is not None else [],
+    }
+
+
+def _summary_text_part(text: str = "") -> Dict[str, Any]:
+    return {"type": "summary_text", "text": text}
+
+
 def _normalize_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize Kiro/OpenAI-shaped tool_use into name/arguments/call_id."""
     from kiro.converters_core import get_original_tool_name
@@ -218,15 +242,25 @@ async def stream_kiro_to_responses_internal(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     conversation_id: Optional[str] = None,
+    echo_reasoning_items: Optional[List[Dict[str, Any]]] = None,
+    emit_reasoning_summary: bool = True,
 ) -> AsyncGenerator[str, None]:
     """
     Internal generator: Kiro stream → Responses API SSE.
 
     Raises FirstTokenTimeoutError if the first token is not received in time
     (for stream_with_first_token_retry).
+
+    Args:
+        echo_reasoning_items: Input ``type:reasoning`` stubs to echo at the
+            start of ``output`` (id/summary preserved; no encrypted_content).
+        emit_reasoning_summary: When True and FAKE_REASONING_HANDLING is
+            ``as_reasoning_content``, stream thinking as reasoning summary
+            text. When False, still emit a reasoning item with empty summary.
     """
     response_id = generate_response_id()
     message_item_id = generate_message_item_id()
+    reasoning_item_id = generate_reasoning_item_id()
     created_at = int(time.time())
     sequence_number = 0
 
@@ -236,8 +270,17 @@ async def stream_kiro_to_responses_internal(
     full_thinking_content = ""
     tool_calls_from_stream: List[Dict[str, Any]] = []
     message_item_started = False
+    reasoning_item_started = False
+    reasoning_item_closed = False
+    reasoning_summary_part_started = False
     streaming_error_occurred = False
     created_emitted = False
+    # Live output_index for the next new item (echo stubs consume 0..n-1 first).
+    next_output_index = 0
+    message_output_index = 0
+    reasoning_output_index = 0
+
+    echo_items = list(echo_reasoning_items or [])
 
     def next_seq() -> int:
         nonlocal sequence_number
@@ -271,6 +314,129 @@ async def stream_kiro_to_responses_internal(
             },
         )
 
+    def emit_echo_reasoning_events() -> List[str]:
+        """Emit completed echo stubs for input reasoning items."""
+        nonlocal next_output_index
+        events: List[str] = []
+        for stub in echo_items:
+            idx = next_output_index
+            next_output_index += 1
+            item = {
+                "id": stub.get("id") or generate_reasoning_item_id(),
+                "type": "reasoning",
+                "status": stub.get("status") or "completed",
+                "summary": stub.get("summary") if isinstance(stub.get("summary"), list) else [],
+            }
+            events.append(
+                format_sse_event(
+                    "response.output_item.added",
+                    {
+                        "output_index": idx,
+                        "item": {**item, "status": "completed"},
+                        "sequence_number": next_seq(),
+                    },
+                )
+            )
+            events.append(
+                format_sse_event(
+                    "response.output_item.done",
+                    {
+                        "output_index": idx,
+                        "item": item,
+                        "sequence_number": next_seq(),
+                    },
+                )
+            )
+        return events
+
+    def start_reasoning_item_events() -> List[str]:
+        nonlocal reasoning_item_started, reasoning_output_index, next_output_index
+        nonlocal reasoning_summary_part_started
+        if reasoning_item_started:
+            return []
+        reasoning_item_started = True
+        reasoning_output_index = next_output_index
+        next_output_index += 1
+        events = [
+            format_sse_event(
+                "response.output_item.added",
+                {
+                    "output_index": reasoning_output_index,
+                    "item": _reasoning_item(
+                        reasoning_item_id, summary=[], status="in_progress"
+                    ),
+                    "sequence_number": next_seq(),
+                },
+            )
+        ]
+        if emit_reasoning_summary:
+            reasoning_summary_part_started = True
+            events.append(
+                format_sse_event(
+                    "response.reasoning_summary_part.added",
+                    {
+                        "item_id": reasoning_item_id,
+                        "output_index": reasoning_output_index,
+                        "summary_index": 0,
+                        "part": _summary_text_part(""),
+                        "sequence_number": next_seq(),
+                    },
+                )
+            )
+        return events
+
+    def close_reasoning_item_events() -> List[str]:
+        nonlocal reasoning_item_closed, reasoning_summary_part_started
+        if not reasoning_item_started or reasoning_item_closed:
+            return []
+        reasoning_item_closed = True
+        events: List[str] = []
+        summary_parts: List[Dict[str, Any]] = []
+        if emit_reasoning_summary and full_thinking_content:
+            if reasoning_summary_part_started:
+                events.append(
+                    format_sse_event(
+                        "response.reasoning_summary_text.done",
+                        {
+                            "item_id": reasoning_item_id,
+                            "output_index": reasoning_output_index,
+                            "summary_index": 0,
+                            "text": full_thinking_content,
+                            "sequence_number": next_seq(),
+                        },
+                    )
+                )
+                part = _summary_text_part(full_thinking_content)
+                events.append(
+                    format_sse_event(
+                        "response.reasoning_summary_part.done",
+                        {
+                            "item_id": reasoning_item_id,
+                            "output_index": reasoning_output_index,
+                            "summary_index": 0,
+                            "part": part,
+                            "sequence_number": next_seq(),
+                        },
+                    )
+                )
+                summary_parts = [part]
+            else:
+                summary_parts = [_summary_text_part(full_thinking_content)]
+        done_item = _reasoning_item(
+            reasoning_item_id, summary=summary_parts, status="completed"
+        )
+        events.append(
+            format_sse_event(
+                "response.output_item.done",
+                {
+                    "output_index": reasoning_output_index,
+                    "item": done_item,
+                    "sequence_number": next_seq(),
+                },
+            )
+        )
+        return events
+
     try:
         # Defer response.created until the first Kiro event so first-token
         # timeout can retry before any SSE bytes reach the client.
@@ -278,17 +444,23 @@ async def stream_kiro_to_responses_internal(
             if not created_emitted:
                 yield emit_created()
                 yield emit_in_progress()
+                for echo_evt in emit_echo_reasoning_events():
+                    yield echo_evt
 
             if event.type == "content" and event.content:
+                # Close open reasoning before starting message text.
+                for close_evt in close_reasoning_item_events():
+                    yield close_evt
+
                 full_content += event.content
 
                 if not message_item_started:
-                    # Optional handshake for message item; Codex primarily
-                    # needs deltas + output_item.done for text.
+                    message_output_index = next_output_index
+                    next_output_index += 1
                     yield format_sse_event(
                         "response.output_item.added",
                         {
-                            "output_index": 0,
+                            "output_index": message_output_index,
                             "item": _message_item(
                                 message_item_id, "", status="in_progress"
                             ),
@@ -301,7 +473,7 @@ async def stream_kiro_to_responses_internal(
                     "response.output_text.delta",
                     {
                         "item_id": message_item_id,
-                        "output_index": 0,
+                        "output_index": message_output_index,
                         "content_index": 0,
                         "delta": event.content,
                         "sequence_number": next_seq(),
@@ -310,15 +482,39 @@ async def stream_kiro_to_responses_internal(
 
             elif event.type == "thinking" and event.thinking_content:
                 full_thinking_content += event.thinking_content
-                # Responses API has native reasoning items; for fake reasoning
-                # we only surface thinking as text when configured that way.
-                if FAKE_REASONING_HANDLING == "include_as_text":
+
+                if FAKE_REASONING_HANDLING == "as_reasoning_content":
+                    # Native Responses reasoning item — do not dump into output_text.
+                    for start_evt in start_reasoning_item_events():
+                        yield start_evt
+                    if emit_reasoning_summary:
+                        yield format_sse_event(
+                            "response.reasoning_summary_text.delta",
+                            {
+                                "item_id": reasoning_item_id,
+                                "output_index": reasoning_output_index,
+                                "summary_index": 0,
+                                "delta": event.thinking_content,
+                                "sequence_number": next_seq(),
+                            },
+                        )
+                elif FAKE_REASONING_HANDLING in (
+                    "pass",
+                    "strip_tags",
+                    "include_as_text",
+                ):
+                    # Include thinking in regular output_text (do not also emit
+                    # a reasoning item — avoids double-dumping).
                     full_content += event.thinking_content
                     if not message_item_started:
+                        for close_evt in close_reasoning_item_events():
+                            yield close_evt
+                        message_output_index = next_output_index
+                        next_output_index += 1
                         yield format_sse_event(
                             "response.output_item.added",
                             {
-                                "output_index": 0,
+                                "output_index": message_output_index,
                                 "item": _message_item(
                                     message_item_id, "", status="in_progress"
                                 ),
@@ -330,15 +526,18 @@ async def stream_kiro_to_responses_internal(
                         "response.output_text.delta",
                         {
                             "item_id": message_item_id,
-                            "output_index": 0,
+                            "output_index": message_output_index,
                             "content_index": 0,
                             "delta": event.thinking_content,
                             "sequence_number": next_seq(),
                         },
                     )
-                # else: accumulate for token counting only (as_reasoning_content)
+                # else (remove): keep full_thinking_content for token counting only
 
             elif event.type == "tool_use" and event.tool_use:
+                for close_evt in close_reasoning_item_events():
+                    yield close_evt
+
                 tool = event.tool_use
                 tool_name = ""
                 if tool:
@@ -372,10 +571,12 @@ async def stream_kiro_to_responses_internal(
                         if results is not None:
                             summary = generate_search_summary(query, results)
                             if not message_item_started:
+                                message_output_index = next_output_index
+                                next_output_index += 1
                                 yield format_sse_event(
                                     "response.output_item.added",
                                     {
-                                        "output_index": 0,
+                                        "output_index": message_output_index,
                                         "item": _message_item(
                                             message_item_id, "", status="in_progress"
                                         ),
@@ -391,7 +592,7 @@ async def stream_kiro_to_responses_internal(
                                     "response.output_text.delta",
                                     {
                                         "item_id": message_item_id,
-                                        "output_index": 0,
+                                        "output_index": message_output_index,
                                         "content_index": 0,
                                         "delta": piece,
                                         "sequence_number": next_seq(),
@@ -411,6 +612,12 @@ async def stream_kiro_to_responses_internal(
             # Empty stream still needs a created → in_progress → completed handshake.
             yield emit_created()
             yield emit_in_progress()
+            for echo_evt in emit_echo_reasoning_events():
+                yield echo_evt
+
+        # Close reasoning if stream ended with thinking and no content/tools yet.
+        for close_evt in close_reasoning_item_events():
+            yield close_evt
 
         received_usage = metering_data is not None
         received_context_usage = context_usage_percentage is not None
@@ -419,6 +626,9 @@ async def stream_kiro_to_responses_internal(
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         all_tool_calls = deduplicate_tool_calls(tool_calls_from_stream + bracket_tool_calls)
 
+        # Kiro has no hard max_output_tokens API. Abrupt stream end without
+        # usage/context_usage (and with content, no tools) is treated as
+        # truncation → Responses status=incomplete / reason=max_output_tokens.
         content_was_truncated = (
             not stream_completed_normally
             and len(full_content) > 0
@@ -432,13 +642,6 @@ async def stream_kiro_to_responses_internal(
                 f"completion signals, length={len(full_content)} chars. "
                 f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
             )
-
-        if content_was_truncated:
-            status = "incomplete"
-        elif all_tool_calls:
-            status = "completed"  # function calls are a normal completed turn
-        else:
-            status = "completed"
 
         output_tokens = count_tokens(full_content + full_thinking_content)
         input_tokens, total_tokens, prompt_source, total_source = (
@@ -499,15 +702,37 @@ async def stream_kiro_to_responses_internal(
                 )
 
         output_items: List[Dict[str, Any]] = []
-        output_index = 0
 
+        # Echoed input reasoning stubs (already streamed as added/done).
+        for stub in echo_items:
+            output_items.append({
+                "id": stub.get("id") or generate_reasoning_item_id(),
+                "type": "reasoning",
+                "status": stub.get("status") or "completed",
+                "summary": stub.get("summary") if isinstance(stub.get("summary"), list) else [],
+            })
+
+        # New reasoning item from this turn's thinking.
+        if reasoning_item_started:
+            summary_parts: List[Dict[str, Any]] = []
+            if emit_reasoning_summary and full_thinking_content:
+                summary_parts = [_summary_text_part(full_thinking_content)]
+            output_items.append(
+                _reasoning_item(
+                    reasoning_item_id, summary=summary_parts, status="completed"
+                )
+            )
+
+        output_index = next_output_index
         # Close message item if we streamed any text
         if message_item_started or (full_content and not all_tool_calls):
             if not message_item_started and full_content:
+                message_output_index = output_index
+                output_index += 1
                 yield format_sse_event(
                     "response.output_item.added",
                     {
-                        "output_index": output_index,
+                        "output_index": message_output_index,
                         "item": _message_item(
                             message_item_id, "", status="in_progress"
                         ),
@@ -518,25 +743,33 @@ async def stream_kiro_to_responses_internal(
                 "response.output_text.done",
                 {
                     "item_id": message_item_id,
-                    "output_index": output_index,
+                    "output_index": message_output_index,
                     "content_index": 0,
                     "text": full_content,
                     "sequence_number": next_seq(),
                 },
             )
-            msg_item = _message_item(message_item_id, full_content, status="completed")
+            msg_status = "incomplete" if content_was_truncated else "completed"
+            msg_item = _message_item(
+                message_item_id, full_content, status=msg_status
+            )
             yield format_sse_event(
                 "response.output_item.done",
                 {
-                    "output_index": output_index,
+                    "output_index": message_output_index,
                     "item": msg_item,
                     "sequence_number": next_seq(),
                 },
             )
             output_items.append(msg_item)
-            output_index += 1
 
         # Emit function_call items (added → arg deltas → args done → item done)
+        # Use indices after message / reasoning already assigned during stream.
+        fc_output_index = next_output_index
+        if message_item_started or (full_content and not all_tool_calls):
+            # message already consumed an index during stream (or just above)
+            fc_output_index = max(next_output_index, message_output_index + 1)
+
         for tc in all_tool_calls:
             normalized = _normalize_tool_call(tc)
             fc_item_id = generate_function_call_item_id()
@@ -550,7 +783,7 @@ async def stream_kiro_to_responses_internal(
             yield format_sse_event(
                 "response.output_item.added",
                 {
-                    "output_index": output_index,
+                    "output_index": fc_output_index,
                     "item": added_item,
                     "sequence_number": next_seq(),
                 },
@@ -565,7 +798,7 @@ async def stream_kiro_to_responses_internal(
                         "response.function_call_arguments.delta",
                         {
                             "item_id": fc_item_id,
-                            "output_index": output_index,
+                            "output_index": fc_output_index,
                             "delta": tool_args[start : start + FUNCTION_CALL_ARG_CHUNK_SIZE],
                             "sequence_number": next_seq(),
                         },
@@ -575,7 +808,7 @@ async def stream_kiro_to_responses_internal(
                     "response.function_call_arguments.delta",
                     {
                         "item_id": fc_item_id,
-                        "output_index": output_index,
+                        "output_index": fc_output_index,
                         "delta": "",
                         "sequence_number": next_seq(),
                     },
@@ -585,7 +818,7 @@ async def stream_kiro_to_responses_internal(
                 "response.function_call_arguments.done",
                 {
                     "item_id": fc_item_id,
-                    "output_index": output_index,
+                    "output_index": fc_output_index,
                     "name": normalized["name"],
                     "arguments": tool_args,
                     "sequence_number": next_seq(),
@@ -602,13 +835,13 @@ async def stream_kiro_to_responses_internal(
             yield format_sse_event(
                 "response.output_item.done",
                 {
-                    "output_index": output_index,
+                    "output_index": fc_output_index,
                     "item": done_item,
                     "sequence_number": next_seq(),
                 },
             )
             output_items.append(done_item)
-            output_index += 1
+            fc_output_index += 1
 
         completed_status = "incomplete" if content_was_truncated else "completed"
         completed_response = _base_response(
@@ -681,6 +914,8 @@ async def stream_kiro_to_responses(
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
+    echo_reasoning_items: Optional[List[Dict[str, Any]]] = None,
+    emit_reasoning_summary: bool = True,
 ) -> AsyncGenerator[str, None]:
     """
     Convert Kiro stream to Responses API SSE (no first-token retry).
@@ -695,6 +930,8 @@ async def stream_kiro_to_responses(
         auth_manager,
         request_messages=request_messages,
         request_tools=request_tools,
+        echo_reasoning_items=echo_reasoning_items,
+        emit_reasoning_summary=emit_reasoning_summary,
     ):
         yield chunk
 
@@ -710,6 +947,8 @@ async def stream_with_first_token_retry(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
+    echo_reasoning_items: Optional[List[Dict[str, Any]]] = None,
+    emit_reasoning_summary: bool = True,
 ) -> AsyncGenerator[str, None]:
     """
     Responses streaming with automatic retry on first-token timeout.
@@ -743,6 +982,8 @@ async def stream_with_first_token_retry(
             first_token_timeout=first_token_timeout,
             request_messages=request_messages,
             request_tools=request_tools,
+            echo_reasoning_items=echo_reasoning_items,
+            emit_reasoning_summary=emit_reasoning_summary,
         ):
             yield chunk
 
@@ -766,6 +1007,8 @@ async def collect_stream_response(
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
+    echo_reasoning_items: Optional[List[Dict[str, Any]]] = None,
+    emit_reasoning_summary: bool = True,
 ) -> dict:
     """
     Collect a full non-streaming Responses JSON object from the Kiro stream.
@@ -785,6 +1028,8 @@ async def collect_stream_response(
         auth_manager,
         request_messages=request_messages,
         request_tools=request_tools,
+        echo_reasoning_items=echo_reasoning_items,
+        emit_reasoning_summary=emit_reasoning_summary,
     ):
         if "data:" not in chunk_str:
             continue

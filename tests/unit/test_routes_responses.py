@@ -181,6 +181,71 @@ class TestResponsesValidation:
         assert "Unsupported tool type" not in detail
         assert "hosted_tools_not_supported" not in detail
 
+    def test_explicit_temperature_returns_400_sampling_not_supported(
+        self, test_client, valid_proxy_api_key
+    ):
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "input": "Hello",
+                "temperature": 0.7,
+            },
+        )
+        assert response.status_code == 400
+        detail = response.json().get("detail")
+        if isinstance(detail, dict):
+            assert detail.get("code") == "sampling_not_supported"
+        else:
+            assert "sampling" in str(detail).lower() or "temperature" in str(detail)
+
+    def test_explicit_top_p_returns_400_sampling_not_supported(
+        self, test_client, valid_proxy_api_key
+    ):
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "input": "Hello",
+                "top_p": 0.95,
+            },
+        )
+        assert response.status_code == 400
+        detail = response.json().get("detail")
+        if isinstance(detail, dict):
+            assert detail.get("code") == "sampling_not_supported"
+
+    def test_null_temperature_does_not_400_on_validation(
+        self, test_client, valid_proxy_api_key
+    ):
+        """Omit/null sampling params must not fail validation (may fail later on mock)."""
+        with patch("kiro.routes_responses.KiroHttpClient") as mock_cls:
+            mock_instance = AsyncMock()
+            mock_instance.request_with_retry = AsyncMock(
+                side_effect=Exception("Network blocked")
+            )
+            mock_instance.close = AsyncMock()
+            mock_cls.return_value = mock_instance
+
+            response = test_client.post(
+                "/v1/responses",
+                headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "input": "Hello",
+                    "temperature": None,
+                    "top_p": None,
+                },
+            )
+
+        assert response.status_code != 400
+        detail = response.json().get("detail")
+        if isinstance(detail, dict):
+            assert detail.get("code") != "sampling_not_supported"
+
+
 
 class TestResponsesCompact:
     """POST /v1/responses/compact is intentionally unimplemented."""

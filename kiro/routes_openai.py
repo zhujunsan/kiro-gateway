@@ -126,6 +126,10 @@ async def get_models(request: Request):
     
     Models are loaded at startup (blocking) and cached.
     This endpoint returns the cached list.
+
+    Dual-compatible payload:
+    - OpenAI / Cursor / tray: ``object`` + ``data`` (unchanged)
+    - Codex: also ``models`` (ModelInfo stubs) so decode finds the field
     
     Args:
         request: FastAPI Request for accessing app.state
@@ -153,8 +157,13 @@ async def get_models(request: Request):
         )
         for model_id in available_model_ids
     ]
-    
-    return ModelList(data=openai_models)
+
+    from kiro.codex_models import build_codex_models_list
+
+    return ModelList(
+        data=openai_models,
+        models=build_codex_models_list(available_model_ids),
+    )
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])

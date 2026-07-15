@@ -34,8 +34,12 @@ from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_responses import (
     ResponsesFunctionTool,
     ResponsesRequest,
+    ResponsesRequestError,
     ResponsesUnprocessableError,
     classify_responses_tools,
+    reasoning_summary_budget_factor,
+    resolve_responses_text_format,
+    should_emit_reasoning_summary,
     validate_responses_request,
     validate_responses_tool_choice,
 )
@@ -44,6 +48,7 @@ from kiro.converters_core import (
     UnifiedTool,
     ThinkingConfig,
     build_kiro_payload as core_build_kiro_payload,
+    extract_images_from_content,
     prepare_tool_name_for_kiro,
     sanitize_tool_use_id,
 )
@@ -66,6 +71,15 @@ _PARALLEL_TOOL_CALLS_FALSE_PROMPT = (
     "You must call at most one tool/function in this turn. "
     "Do not make parallel or multiple tool calls."
 )
+_JSON_OBJECT_PROMPT = (
+    "You must respond with a single valid JSON object only. "
+    "Do not wrap it in markdown code fences or add commentary."
+)
+_JSON_SCHEMA_PROMPT = (
+    "You must respond with a single valid JSON value that conforms to this JSON Schema"
+    "{name_part}. Do not wrap it in markdown code fences or add commentary.\n"
+    "JSON Schema:\n{schema_json}"
+)
 
 
 @dataclass
@@ -76,6 +90,65 @@ class ResponsesBuildResult:
     unsupported_features: List[str] = field(default_factory=list)
     parallel_tool_calls: Optional[bool] = None
     tool_choice_mode: str = "auto"
+    # Structured outputs: json_object / json_schema (for non-stream validate).
+    text_format_type: Optional[str] = None
+    text_format_schema: Optional[Dict[str, Any]] = None
+    text_format_name: Optional[str] = None
+    # Input reasoning items stubbed for multi-turn echo (no encrypted_content).
+    echo_reasoning_items: List[Dict[str, Any]] = field(default_factory=list)
+    # Whether to emit reasoning summary text from thinking (request.reasoning.summary).
+    emit_reasoning_summary: bool = True
+
+
+# ==================================================================================================
+# Reasoning input stubs (multi-turn echo)
+# ==================================================================================================
+
+def stub_reasoning_item_from_input(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build an echo/stub reasoning item for multi-turn continuity.
+
+    Preserves ``id`` and ``summary`` shape. Never copies ``encrypted_content``
+    (must not be forwarded to Kiro or re-emitted).
+    """
+    import uuid
+
+    item_id = item.get("id")
+    if not item_id:
+        item_id = f"rs_{uuid.uuid4().hex}"
+
+    summary = item.get("summary")
+    if not isinstance(summary, list):
+        summary = []
+
+    stub: Dict[str, Any] = {
+        "id": str(item_id),
+        "type": "reasoning",
+        "summary": summary,
+    }
+    status = item.get("status")
+    if status is not None:
+        stub["status"] = status
+    return stub
+
+
+def extract_reasoning_input_stubs(
+    input_data: Union[str, List[Any], None],
+) -> List[Dict[str, Any]]:
+    """
+    Collect reasoning stubs from Responses ``input`` (for response output echo).
+
+    Does not forward anything to Kiro — callers still skip reasoning in
+    :func:`convert_responses_input_to_unified`.
+    """
+    if not isinstance(input_data, list):
+        return []
+
+    stubs: List[Dict[str, Any]] = []
+    for item in input_data:
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            stubs.append(stub_reasoning_item_from_input(item))
+    return stubs
 
 
 # ==================================================================================================
@@ -122,6 +195,241 @@ def _extract_function_call_output_text(output: Any) -> str:
     return text if text else "(empty result)"
 
 
+def _responses_image_url(item: Dict[str, Any]) -> str:
+    """Resolve image URL string from an input_image content part."""
+    image_url = item.get("image_url")
+    if isinstance(image_url, str):
+        return image_url
+    if isinstance(image_url, dict):
+        return str(image_url.get("url") or "")
+    return ""
+
+
+def _extract_responses_images(content: Any) -> Optional[List[Dict[str, Any]]]:
+    """
+    Extract base64 images from Responses message content into unified format.
+
+    Uses converters_core.extract_images_from_content after normalizing
+    ``input_image`` parts to OpenAI ``image_url`` / Anthropic ``image`` shapes.
+
+    Raises:
+        ResponsesRequestError: URL images, file_id, or input_file (HTTP 400).
+    """
+    if not isinstance(content, list):
+        return None
+
+    normalized: List[Dict[str, Any]] = []
+
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+
+        if item_type == "input_file":
+            raise ResponsesRequestError(
+                "input_file content parts are not supported by this gateway. "
+                "Inline text or base64 input_image data URLs instead.",
+                code="input_file_not_supported",
+            )
+
+        if item_type != "input_image":
+            # Pass through image_url / image blocks for extract_images_from_content.
+            if item_type in ("image_url", "image"):
+                normalized.append(item)
+            continue
+
+        if item.get("file_id"):
+            raise ResponsesRequestError(
+                "input_image with file_id is not supported; "
+                "send a base64 data URL in image_url.",
+                code="input_image_file_id_not_supported",
+            )
+
+        url = _responses_image_url(item)
+        source = item.get("source")
+
+        if url.startswith(("http://", "https://")):
+            raise ResponsesRequestError(
+                "input_image URL references are not supported; "
+                "send a base64 data URL (data:image/...;base64,...) in image_url.",
+                code="input_image_url_not_supported",
+            )
+
+        if url.startswith("data:"):
+            normalized.append({
+                "type": "image_url",
+                "image_url": {"url": url},
+            })
+            continue
+
+        # Anthropic-like inline source on input_image
+        if isinstance(source, dict) and source.get("type") == "base64" and source.get("data"):
+            normalized.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": source.get("media_type") or "image/jpeg",
+                    "data": source["data"],
+                },
+            })
+            continue
+
+        # Raw base64 in image_url without data: prefix (treat as jpeg)
+        if url and not url.startswith(("http://", "https://", "data:")):
+            normalized.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": item.get("media_type") or "image/jpeg",
+                    "data": url,
+                },
+            })
+            continue
+
+        raise ResponsesRequestError(
+            "input_image requires a base64 data URL in image_url "
+            "(URL fetch and file_id are not supported).",
+            code="input_image_invalid",
+        )
+
+    if not normalized:
+        return None
+
+    images = extract_images_from_content(normalized)
+    return images or None
+
+
+def apply_text_format_constraint(
+    system_prompt: str,
+    text: Any = None,
+) -> Tuple[str, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Inject system instructions for ``text.format`` json_object / json_schema.
+
+    Returns:
+        (system_prompt, format_type, schema, name)
+    """
+    fmt_type, schema, name = resolve_responses_text_format(text)
+    if not fmt_type:
+        return system_prompt or "", None, None, None
+
+    if fmt_type == "json_object":
+        prompt = _append_system_constraint(system_prompt, _JSON_OBJECT_PROMPT)
+        return prompt, fmt_type, None, name
+
+    # json_schema
+    import json as _json
+    schema_json = _json.dumps(schema or {}, ensure_ascii=False, indent=2)
+    name_part = f" named '{name}'" if name else ""
+    constraint = _JSON_SCHEMA_PROMPT.format(
+        name_part=name_part,
+        schema_json=schema_json,
+    )
+    prompt = _append_system_constraint(system_prompt, constraint)
+    return prompt, fmt_type, schema, name
+
+
+def _strip_json_fences(text: str) -> str:
+    """Strip optional markdown ```json fences around model output."""
+    cleaned = (text or "").strip()
+    if not cleaned.startswith("```"):
+        return cleaned
+    lines = cleaned.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def collect_responses_output_text(response: Dict[str, Any]) -> str:
+    """Collect concatenated output_text from a Responses JSON object."""
+    parts: List[str] = []
+    for item in response.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                parts.append(part.get("text") or "")
+    return "".join(parts)
+
+
+def validate_responses_json_output(
+    output_text: str,
+    format_type: Optional[str],
+    schema: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """
+    Validate non-stream model text against text.format.
+
+    Returns an error message string if invalid, else None.
+    Full JSON Schema validation is not required — parseability (+ object/array
+    top-level type when declared) is enough without adding jsonschema dep.
+    """
+    if not format_type or format_type not in ("json_object", "json_schema"):
+        return None
+
+    import json as _json
+
+    cleaned = _strip_json_fences(output_text)
+    if not cleaned:
+        return "Model output was empty; expected JSON for text.format"
+
+    try:
+        parsed = _json.loads(cleaned)
+    except _json.JSONDecodeError as exc:
+        return f"Model output is not valid JSON required by text.format: {exc}"
+
+    if format_type == "json_object" and not isinstance(parsed, dict):
+        return "Model output must be a JSON object (text.format.type=json_object)"
+
+    if format_type == "json_schema" and isinstance(schema, dict):
+        expected = schema.get("type")
+        if expected == "object" and not isinstance(parsed, dict):
+            return "Model output must be a JSON object per text.format.schema"
+        if expected == "array" and not isinstance(parsed, list):
+            return "Model output must be a JSON array per text.format.schema"
+
+    return None
+
+
+def apply_text_format_validation_to_response(
+    response: Dict[str, Any],
+    format_type: Optional[str],
+    schema: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    For non-stream responses: if text.format requires JSON and output is
+    invalid, set ``status=failed`` with an error object. Tool-call turns
+    (function_call in output) are skipped.
+    """
+    if not format_type or format_type not in ("json_object", "json_schema"):
+        return response
+
+    output = response.get("output") or []
+    if any(isinstance(i, dict) and i.get("type") == "function_call" for i in output):
+        return response
+
+    err = validate_responses_json_output(
+        collect_responses_output_text(response),
+        format_type,
+        schema,
+    )
+    if not err:
+        return response
+
+    updated = dict(response)
+    updated["status"] = "failed"
+    updated["error"] = {
+        "code": "invalid_json_output",
+        "message": err,
+    }
+    return updated
+
+
+
 # ==================================================================================================
 # Input → UnifiedMessage
 # ==================================================================================================
@@ -166,7 +474,8 @@ def convert_responses_input_to_unified(
     - ``message`` / EasyInputMessage → user or assistant
     - ``function_call`` → assistant ``tool_calls`` (``call_id`` preserved as id)
     - ``function_call_output`` → user ``tool_results`` (``call_id`` → tool_use_id)
-    - ``reasoning`` → ignored (accepted for multi-turn continuity)
+    - ``reasoning`` → skipped for Kiro (use :func:`extract_reasoning_input_stubs`
+      for multi-turn echo; encrypted_content is never forwarded)
 
     Args:
         input_data: Responses input (string or list of items)
@@ -216,7 +525,27 @@ def convert_responses_input_to_unified(
             item_type = "message"
 
         if item_type == "reasoning":
-            # Accept and ignore (summary / encrypted_content not forwarded)
+            # Do not forward to Kiro (including encrypted_content).
+            # Echo stubs are collected separately via extract_reasoning_input_stubs.
+            continue
+
+        if item_type == "compaction_trigger":
+            # Codex remote-compaction v2 transient marker — not forwarded.
+            continue
+
+        if item_type == "compaction":
+            # Local compact stub: surface plaintext encrypted_content as a
+            # synthetic user summary so Kiro still sees prior context.
+            _flush_pending_tool_calls(pending_tool_calls, processed)
+            _flush_pending_tool_results(pending_tool_results, processed)
+            stub_text = item.get("encrypted_content") or ""
+            if stub_text:
+                processed.append(
+                    UnifiedMessage(
+                        role="user",
+                        content=f"[compacted prior context]\n{stub_text}",
+                    )
+                )
             continue
 
         if item_type == "function_call":
@@ -249,7 +578,9 @@ def convert_responses_input_to_unified(
             _flush_pending_tool_results(pending_tool_results, processed)
 
             role = item.get("role") or "user"
-            content_text = _extract_responses_text(item.get("content"))
+            raw_content = item.get("content")
+            content_text = _extract_responses_text(raw_content)
+            images = _extract_responses_images(raw_content)
 
             if role in ("system", "developer"):
                 if content_text:
@@ -260,12 +591,17 @@ def convert_responses_input_to_unified(
                 # Treat unknown roles as user text for forward compatibility
                 role = "user"
 
-            processed.append(UnifiedMessage(role=role, content=content_text))
+            processed.append(UnifiedMessage(
+                role=role,
+                content=content_text,
+                images=images,
+            ))
             continue
 
         raise ValueError(
             f"Unsupported input item type '{item_type}'. "
-            f"Supported: message, function_call, function_call_output, reasoning."
+            f"Supported: message, function_call, function_call_output, "
+            f"reasoning, compaction, compaction_trigger."
         )
 
     _flush_pending_tool_calls(pending_tool_calls, processed)
@@ -589,16 +925,38 @@ def convert_responses_tools_to_unified(
 
 def extract_thinking_config_from_responses(request: ResponsesRequest) -> ThinkingConfig:
     """
-    Extract thinking configuration from Responses ``reasoning.effort``.
+    Extract thinking configuration from Responses ``reasoning.effort`` /
+    ``reasoning.summary``.
 
     Mirrors :func:`kiro.converters_openai.extract_thinking_config_from_openai`:
     - missing effort → enabled with default budget
     - ``none`` → disabled
     - otherwise → percentage budget from ``max_output_tokens`` (fallback 4096)
+
+    When ``reasoning.summary`` is ``concise`` / ``detailed``, the budget is
+    scaled by :func:`reasoning_summary_budget_factor`. Budgets are capped by
+    ``FAKE_REASONING_BUDGET_CAP``.
+
+    Important: Kiro's generateAssistantResponse API has **no hard output-token
+    cap**. ``max_output_tokens`` therefore only drives thinking-budget sizing
+    here; it cannot be forwarded as an absolute stop to Kiro. Truncation is
+    detected heuristically in streaming and surfaced as
+    ``status=incomplete`` + ``incomplete_details.reason=max_output_tokens``.
     """
     effort = request.reasoning.effort if request.reasoning else None
+    summary = request.reasoning.summary if request.reasoning else None
+    summary_factor = reasoning_summary_budget_factor(summary)
 
     if not effort:
+        # Summary alone can still size a budget when concise/detailed.
+        if summary_factor != 1.0:
+            max_tokens = request.max_output_tokens or 4096
+            budget = int(reasoning_effort_to_budget(max_tokens, "medium") * summary_factor)
+            budget = max(budget, 1)
+            from kiro.config import FAKE_REASONING_BUDGET_CAP
+            if FAKE_REASONING_BUDGET_CAP > 0 and budget > FAKE_REASONING_BUDGET_CAP:
+                budget = FAKE_REASONING_BUDGET_CAP
+            return ThinkingConfig(enabled=True, budget_tokens=budget)
         return ThinkingConfig(enabled=True, budget_tokens=None)
 
     if effort == "none":
@@ -606,9 +964,21 @@ def extract_thinking_config_from_responses(request: ResponsesRequest) -> Thinkin
 
     max_tokens = request.max_output_tokens or 4096
     budget = reasoning_effort_to_budget(max_tokens, effort)
+    if summary_factor != 1.0:
+        budget = max(int(budget * summary_factor), 1)
+
+    from kiro.config import FAKE_REASONING_BUDGET_CAP
+
+    if FAKE_REASONING_BUDGET_CAP > 0 and budget > FAKE_REASONING_BUDGET_CAP:
+        logger.debug(
+            f"Responses thinking budget {budget} exceeds cap "
+            f"{FAKE_REASONING_BUDGET_CAP}; using capped value"
+        )
+        budget = FAKE_REASONING_BUDGET_CAP
 
     logger.debug(
         f"Extracted thinking config from Responses: reasoning.effort='{effort}', "
+        f"reasoning.summary={summary!r}, factor={summary_factor}, "
         f"max_output_tokens={max_tokens}, budget={budget}"
     )
 
@@ -651,6 +1021,10 @@ def build_kiro_payload_from_responses(
         request_data.input,
         instructions=request_data.instructions,
     )
+    echo_reasoning_items = extract_reasoning_input_stubs(request_data.input)
+    emit_summary = should_emit_reasoning_summary(
+        request_data.reasoning.summary if request_data.reasoning else None
+    )
 
     # Hosted policy first so unsupported_features is available to routes.
     filtered_tools, unsupported_features = prepare_responses_tools_policy(
@@ -668,6 +1042,9 @@ def build_kiro_payload_from_responses(
         system_prompt,
         request_data.parallel_tool_calls,
     )
+    system_prompt, text_format_type, text_format_schema, text_format_name = (
+        apply_text_format_constraint(system_prompt, request_data.text)
+    )
 
     model_id = get_model_id_for_kiro(request_data.model, HIDDEN_MODELS)
     thinking_config = extract_thinking_config_from_responses(request_data)
@@ -680,6 +1057,8 @@ def build_kiro_payload_from_responses(
         f"tool_choice={tool_choice_mode}, "
         f"parallel_tool_calls={request_data.parallel_tool_calls}, "
         f"unsupported_features={unsupported_features}, "
+        f"echo_reasoning_items={len(echo_reasoning_items)}, "
+        f"emit_reasoning_summary={emit_summary}, "
         f"thinking_enabled={thinking_config.enabled}, "
         f"thinking_budget={thinking_config.budget_tokens}"
     )
@@ -698,4 +1077,9 @@ def build_kiro_payload_from_responses(
         unsupported_features=unsupported_features,
         parallel_tool_calls=request_data.parallel_tool_calls,
         tool_choice_mode=tool_choice_mode,
+        echo_reasoning_items=echo_reasoning_items,
+        emit_reasoning_summary=emit_summary,
+        text_format_type=text_format_type,
+        text_format_schema=text_format_schema,
+        text_format_name=text_format_name,
     )

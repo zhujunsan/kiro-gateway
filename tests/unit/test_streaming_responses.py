@@ -461,6 +461,35 @@ class TestCollectStreamResponse:
         assert message["content"][0]["text"] == "Hello World"
 
     @pytest.mark.asyncio
+    async def test_truncated_stream_sets_incomplete_max_output_tokens(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        Kiro has no hard token cap; abrupt stream end (content, no usage/tools)
+        → status=incomplete + incomplete_details.reason=max_output_tokens.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Cut off mid-sente")
+            # No usage / context_usage → treated as truncation
+
+        with patch("kiro.streaming_responses.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_responses.parse_bracket_tool_calls", return_value=[]):
+                result = await collect_stream_response(
+                    mock_http_client,
+                    mock_response,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                )
+
+        assert result["status"] == "incomplete"
+        assert result.get("incomplete_details") == {"reason": "max_output_tokens"}
+        message = next(o for o in result["output"] if o["type"] == "message")
+        assert message["status"] == "incomplete"
+        assert message["content"][0]["text"] == "Cut off mid-sente"
+
+
+    @pytest.mark.asyncio
     async def test_collects_tool_calls(
         self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
     ):
@@ -592,3 +621,165 @@ class TestStreamingResponsesErrors:
         assert any(e[0] == "response.output_text.delta" for e in events)
         assert any(e[0] == "response.output_text.done" for e in events)
         assert _event_types(events)[-1] == "response.completed"
+
+
+# ==================================================================================================
+# Reasoning / thinking streaming
+# ==================================================================================================
+
+class TestStreamKiroToResponsesReasoning:
+    @pytest.mark.asyncio
+    async def test_thinking_emits_reasoning_summary_sse(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="Step 1. ")
+            yield KiroEvent(type="thinking", thinking_content="Step 2.")
+            yield KiroEvent(type="content", content="Answer")
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+
+        chunks = []
+        with patch("kiro.streaming_responses.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_responses.parse_bracket_tool_calls", return_value=[]):
+                with patch(
+                    "kiro.streaming_responses.FAKE_REASONING_HANDLING",
+                    "as_reasoning_content",
+                ):
+                    async for chunk in stream_kiro_to_responses(
+                        mock_http_client,
+                        mock_response,
+                        "claude-sonnet-4",
+                        mock_model_cache,
+                        mock_auth_manager,
+                    ):
+                        chunks.append(chunk)
+
+        events = _parse_sse_events(chunks)
+        types = _event_types(events)
+        _assert_monotonic_sequence_numbers(events)
+
+        assert "response.reasoning_summary_text.delta" in types
+        assert "response.reasoning_summary_text.done" in types
+        assert "response.reasoning_summary_part.added" in types
+        assert "response.reasoning_summary_part.done" in types
+
+        deltas = [
+            e[1]["delta"]
+            for e in events
+            if e[0] == "response.reasoning_summary_text.delta"
+        ]
+        assert deltas == ["Step 1. ", "Step 2."]
+
+        # Reasoning item comes before message; thinking must not leak into output_text
+        text_deltas = [e[1]["delta"] for e in events if e[0] == "response.output_text.delta"]
+        assert text_deltas == ["Answer"]
+        assert all("Step" not in d for d in text_deltas)
+
+        completed = events[-1][1]["response"]
+        reasoning_items = [o for o in completed["output"] if o.get("type") == "reasoning"]
+        assert len(reasoning_items) == 1
+        assert reasoning_items[0]["summary"][0]["text"] == "Step 1. Step 2."
+        assert any(o.get("type") == "message" for o in completed["output"])
+
+    @pytest.mark.asyncio
+    async def test_echo_reasoning_stubs_precede_message(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Hi")
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+
+        echo = [
+            {
+                "id": "rs_echo",
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": "prior"}],
+            }
+        ]
+
+        chunks = []
+        with patch("kiro.streaming_responses.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_responses.parse_bracket_tool_calls", return_value=[]):
+                async for chunk in stream_kiro_to_responses(
+                    mock_http_client,
+                    mock_response,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                    echo_reasoning_items=echo,
+                ):
+                    chunks.append(chunk)
+
+        events = _parse_sse_events(chunks)
+        completed = events[-1][1]["response"]
+        assert completed["output"][0]["id"] == "rs_echo"
+        assert completed["output"][0]["type"] == "reasoning"
+        assert "encrypted_content" not in completed["output"][0]
+        assert any(o.get("type") == "message" for o in completed["output"])
+
+    @pytest.mark.asyncio
+    async def test_summary_disabled_emits_reasoning_item_without_summary_text(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="hidden")
+            yield KiroEvent(type="content", content="out")
+            yield KiroEvent(type="context_usage", context_usage_percentage=2.0)
+
+        chunks = []
+        with patch("kiro.streaming_responses.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_responses.parse_bracket_tool_calls", return_value=[]):
+                with patch(
+                    "kiro.streaming_responses.FAKE_REASONING_HANDLING",
+                    "as_reasoning_content",
+                ):
+                    async for chunk in stream_kiro_to_responses(
+                        mock_http_client,
+                        mock_response,
+                        "claude-sonnet-4",
+                        mock_model_cache,
+                        mock_auth_manager,
+                        emit_reasoning_summary=False,
+                    ):
+                        chunks.append(chunk)
+
+        events = _parse_sse_events(chunks)
+        types = _event_types(events)
+        assert "response.reasoning_summary_text.delta" not in types
+        completed = events[-1][1]["response"]
+        reasoning = next(o for o in completed["output"] if o["type"] == "reasoning")
+        assert reasoning["summary"] == []
+
+    @pytest.mark.asyncio
+    async def test_strip_tags_dumps_thinking_into_output_text_not_reasoning_item(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="think-text")
+            yield KiroEvent(type="content", content="final")
+            yield KiroEvent(type="context_usage", context_usage_percentage=2.0)
+
+        chunks = []
+        with patch("kiro.streaming_responses.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_responses.parse_bracket_tool_calls", return_value=[]):
+                with patch(
+                    "kiro.streaming_responses.FAKE_REASONING_HANDLING",
+                    "strip_tags",
+                ):
+                    async for chunk in stream_kiro_to_responses(
+                        mock_http_client,
+                        mock_response,
+                        "claude-sonnet-4",
+                        mock_model_cache,
+                        mock_auth_manager,
+                    ):
+                        chunks.append(chunk)
+
+        events = _parse_sse_events(chunks)
+        types = _event_types(events)
+        assert "response.reasoning_summary_text.delta" not in types
+        text_deltas = [e[1]["delta"] for e in events if e[0] == "response.output_text.delta"]
+        assert text_deltas == ["think-text", "final"]
+        completed = events[-1][1]["response"]
+        assert not any(o.get("type") == "reasoning" for o in completed["output"])

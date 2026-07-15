@@ -22,7 +22,7 @@ FastAPI routes for OpenAI Responses API (Codex wire_api=responses).
 
 Endpoints:
 - POST /v1/responses — create a response (stream or JSON)
-- POST /v1/responses/compact — not implemented (501)
+- POST /v1/responses/compact — local history compaction (no Kiro call)
 """
 
 import json
@@ -38,6 +38,7 @@ from kiro.models_responses import (
     ResponsesRequestError,
     ResponsesUnprocessableError,
 )
+from kiro.converters_compact import CompactRequest, build_compacted_response
 from kiro.converters_responses import (
     ResponsesBuildResult,
     build_kiro_payload_from_responses,
@@ -539,9 +540,41 @@ async def create_response(request: Request, request_data: ResponsesRequest):
 
 
 @router.post("/v1/responses/compact", dependencies=[Depends(verify_api_key)])
-async def compact_response():
-    """Responses compact endpoint — not implemented for Kiro proxy."""
-    raise HTTPException(
-        status_code=501,
-        detail="POST /v1/responses/compact is not implemented",
+async def compact_response(request_data: CompactRequest):
+    """
+    Compact conversation history for the next ``/v1/responses`` call.
+
+    Client-side approximation of OpenAI ``POST /responses/compact``:
+    merge adjacent messages + byte-budget trim (AUTO_TRIM spirit). Never
+    calls Kiro. Stateless on request body only (no response store /
+    ``previous_response_id`` chaining here).
+    """
+    logger.info(f"Request to /v1/responses/compact (model={request_data.model})")
+
+    if request_data.input is None:
+        if request_data.previous_response_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "previous_response_id without input is not supported on "
+                    "/v1/responses/compact; send the full input window to compact."
+                ),
+            )
+        raise HTTPException(status_code=400, detail="input is required")
+
+    try:
+        body = build_compacted_response(
+            model=request_data.model,
+            input_data=request_data.input,
+            instructions=request_data.instructions,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    meta = body.get("metadata") or {}
+    logger.info(
+        "HTTP 200 - POST /v1/responses/compact - "
+        f"items={meta.get('original_items')}->{meta.get('final_items')} "
+        f"trimmed={meta.get('compacted')}"
     )
+    return JSONResponse(content=body)

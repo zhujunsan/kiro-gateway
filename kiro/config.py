@@ -587,6 +587,16 @@ ACCOUNT_PROBABILISTIC_RETRY_CHANCE: float = float(os.getenv("ACCOUNT_PROBABILIST
 ACCOUNT_CACHE_TTL: int = int(os.getenv("ACCOUNT_CACHE_TTL", "43200"))
 
 # ==================================================================================================
+# Responses API in-process store (store / previous_response_id)
+# ==================================================================================================
+
+# TTL for stored response objects (seconds). Default 1 hour.
+RESPONSE_STORE_TTL: int = int(os.getenv("RESPONSE_STORE_TTL", "3600"))
+
+# Max number of stored responses (LRU eviction when exceeded).
+RESPONSE_STORE_MAX_SIZE: int = int(os.getenv("RESPONSE_STORE_MAX_SIZE", "1000"))
+
+# ==================================================================================================
 # State Persistence Settings
 # ==================================================================================================
 

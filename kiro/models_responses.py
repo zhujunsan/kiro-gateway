@@ -27,16 +27,25 @@ map to HTTP 400 or 422.
 
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
-# Input item types we accept (reasoning content/summary is ignored downstream).
+# Input item types we accept.
+# ``reasoning`` is kept for multi-turn shape: converters echo id+summary stubs
+# and never forward encrypted_content to Kiro.
 SUPPORTED_INPUT_ITEM_TYPES = frozenset({
     "message",
     "function_call",
     "function_call_output",
     "reasoning",
+    # From POST /v1/responses/compact — plaintext stub in encrypted_content.
+    "compaction",
+    # Codex remote-compaction v2 transient marker (ignored by converters).
+    "compaction_trigger",
 })
+
+# Values that disable reasoning summary text emission (reasoning item may still exist).
+REASONING_SUMMARY_DISABLED = frozenset({False, "none", "null"})
 
 # Built-in / hosted tools that are not client function tools.
 # Mixed with function tools → stripped (reported via unsupported_features).
@@ -124,12 +133,47 @@ class ResponsesReasoning(BaseModel):
 
     Attributes:
         effort: Reasoning effort level (maps to thinking budget)
-        summary: Optional summary preference (accepted, ignored)
+        summary: Summary preference. ``none``/false disables summary text
+            emission; ``auto``/``concise``/``detailed``/omitted emit summary
+            from Kiro thinking when available. Concise/detailed also scale
+            the thinking budget proportion.
     """
     effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = None
     summary: Optional[Any] = None
 
     model_config = {"extra": "allow"}
+
+
+def should_emit_reasoning_summary(summary: Optional[Any]) -> bool:
+    """
+    Whether to emit reasoning summary text for this request.
+
+    ``none`` / false / ``\"null\"`` → False. Missing / auto / concise /
+    detailed → True (thinking text is reused as summary).
+    """
+    if summary is None:
+        return True
+    if isinstance(summary, str) and summary.strip().lower() in REASONING_SUMMARY_DISABLED:
+        return False
+    if summary in REASONING_SUMMARY_DISABLED:
+        return False
+    return True
+
+
+def reasoning_summary_budget_factor(summary: Optional[Any]) -> float:
+    """
+    Scale factor applied to thinking budget when ``reasoning.summary`` is set.
+
+    ``concise`` → 0.5, ``detailed`` → 1.25, ``auto``/other/missing → 1.0.
+    """
+    if not isinstance(summary, str):
+        return 1.0
+    key = summary.strip().lower()
+    if key == "concise":
+        return 0.5
+    if key == "detailed":
+        return 1.25
+    return 1.0
 
 
 class ResponsesFunctionTool(BaseModel):
@@ -151,6 +195,33 @@ class ResponsesFunctionTool(BaseModel):
     model_config = {"extra": "allow"}
 
 
+
+class ResponsesTextFormat(BaseModel):
+    """
+    Structured output format for Responses ``text.format``.
+
+    Supported:
+    - ``text`` — free-form (default / no-op)
+    - ``json_object`` — require a JSON object
+    - ``json_schema`` — require JSON conforming to ``schema``
+    """
+    type: str = "text"
+    name: Optional[str] = None
+    description: Optional[str] = None
+    # OpenAI wire key is ``schema``; alias avoids BaseModel.schema clash.
+    schema_: Optional[Dict[str, Any]] = Field(default=None, alias="schema")
+    strict: Optional[bool] = None
+
+    model_config = {"extra": "allow", "populate_by_name": True}
+
+
+class ResponsesText(BaseModel):
+    """Responses ``text`` configuration (structured outputs)."""
+    format: Optional[ResponsesTextFormat] = None
+
+    model_config = {"extra": "allow"}
+
+
 class ResponsesRequest(BaseModel):
     """
     Request body for OpenAI Responses API (``POST /v1/responses``).
@@ -168,12 +239,21 @@ class ResponsesRequest(BaseModel):
     parallel_tool_calls: Optional[bool] = None
     stream: bool = False
     reasoning: Optional[ResponsesReasoning] = None
+    # Thinking-budget basis only. Kiro has no hard output-token cap API;
+    # see extract_thinking_config_from_responses / streaming incomplete_details.
     max_output_tokens: Optional[int] = None
+    # Explicit values → 400 sampling_not_supported. Omit / null = OK.
     temperature: Optional[float] = None
     top_p: Optional[float] = None
-    # Accepted for compatibility; store / previous_response_id are not implemented.
+    # Structured outputs (json_schema / json_object).
+    text: Optional[ResponsesText] = None
+    # Store / previous_response_id: in-memory chaining (see response_store.py).
+    # OpenAI-ish: store when ``store`` is not explicitly false (omit/true → store).
+    # Missing previous_response_id → HTTP 400. background=true → 400.
     store: Optional[bool] = None
     previous_response_id: Optional[str] = None
+    # background mode is not supported (no async job runner).
+    background: Optional[bool] = None
     user: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
 
@@ -225,7 +305,8 @@ def validate_responses_input_item(item: Any, index: Optional[int] = None) -> Non
     raise ValueError(
         f"Unsupported {loc} type '{item_type}'. "
         f"Supported item types: {', '.join(sorted(SUPPORTED_INPUT_ITEM_TYPES))} "
-        f"(message, function_call, function_call_output, reasoning). "
+        f"(message, function_call, function_call_output, reasoning, "
+        f"compaction, compaction_trigger). "
         f"Built-in tool items are not supported."
     )
 
@@ -568,14 +649,130 @@ def validate_responses_tool_choice(
     return mode, function_name
 
 
+def validate_responses_sampling_params(request: ResponsesRequest) -> None:
+    """
+    Reject explicit ``temperature`` / ``top_p`` (Kiro cannot honor sampling).
+
+    Omit or JSON ``null`` is allowed. Any concrete numeric value → HTTP 400
+    with code ``sampling_not_supported`` (do not silently ignore).
+
+    Raises:
+        ResponsesRequestError: When temperature or top_p is explicitly set.
+    """
+    bad: List[str] = []
+    if request.temperature is not None:
+        bad.append("temperature")
+    if request.top_p is not None:
+        bad.append("top_p")
+    if not bad:
+        return
+    names = " and ".join(bad)
+    raise ResponsesRequestError(
+        f"Sampling parameter(s) not supported by this gateway: {names}. "
+        f"Omit them (or pass null); Kiro does not expose temperature/top_p controls.",
+        code="sampling_not_supported",
+        status_code=400,
+    )
+
+
+
+def resolve_responses_text_format(
+    text: Optional[Any],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Normalize ``text.format`` to ``(type, schema, name)``.
+
+    Returns ``(None, None, None)`` when absent or type=text.
+    Accepts ResponsesText model or a raw dict.
+    """
+    if text is None:
+        return None, None, None
+
+    if hasattr(text, "model_dump"):
+        text_dict = text.model_dump(by_alias=True)
+    elif isinstance(text, dict):
+        text_dict = text
+    else:
+        return None, None, None
+
+    fmt = text_dict.get("format")
+    if fmt is None:
+        return None, None, None
+    if hasattr(fmt, "model_dump"):
+        fmt = fmt.model_dump(by_alias=True)
+    if not isinstance(fmt, dict):
+        return None, None, None
+
+    fmt_type = fmt.get("type") or "text"
+    if isinstance(fmt_type, str):
+        fmt_type = fmt_type.strip().lower()
+    else:
+        fmt_type = "text"
+
+    if fmt_type in ("", "text"):
+        return None, None, None
+
+    if fmt_type not in ("json_object", "json_schema"):
+        raise ResponsesRequestError(
+            f"Unsupported text.format.type '{fmt_type}'. "
+            f"Supported: text, json_object, json_schema.",
+            code="invalid_text_format",
+        )
+
+    schema = fmt.get("schema")
+    if schema is None:
+        schema = fmt.get("schema_")
+    if fmt_type == "json_schema" and not isinstance(schema, dict):
+        raise ResponsesRequestError(
+            "text.format.type=json_schema requires a 'schema' object",
+            code="invalid_text_format",
+        )
+
+    name = fmt.get("name")
+    return fmt_type, (schema if isinstance(schema, dict) else None), (
+        str(name) if name else None
+    )
+
+
+def validate_store_and_previous(
+    store: Optional[bool],
+    previous_response_id: Optional[str],
+    *,
+    background: Optional[bool] = None,
+) -> None:
+    """
+    Validate store / previous_response_id / background fields.
+
+    Raises:
+        ResponsesRequestError: Unsupported background=true.
+    """
+    if background is True:
+        raise ResponsesRequestError(
+            "background=true is not supported by this gateway "
+            "(responses are processed synchronously).",
+            code="not_supported",
+        )
+    # store=false + previous_response_id is allowed (OpenAI-ish): look up prior,
+    # but do not persist the new response.
+    _ = store
+    _ = previous_response_id
+
+
 def validate_responses_request(request: ResponsesRequest) -> None:
     """
     Run Responses request checks that map to HTTP 400 / 422.
 
     Raises:
-        ValueError / ResponsesRequestError: Unsupported input or bad tools.
+        ValueError / ResponsesRequestError: Unsupported input, sampling, or bad tools.
         ResponsesUnprocessableError: Hosted tool_choice (422).
     """
+    validate_store_and_previous(
+        request.store,
+        request.previous_response_id,
+        background=request.background,
+    )
     validate_responses_input(request.input)
     validate_responses_tools(request.tools)
     validate_responses_tool_choice(request.tool_choice, request.tools)
+    resolve_responses_text_format(request.text)
+    validate_responses_sampling_params(request)

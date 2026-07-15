@@ -18,8 +18,10 @@ from kiro.converters_responses import (
     build_kiro_payload_from_responses,
     convert_responses_input_to_unified,
     convert_responses_tools_to_unified,
+    extract_reasoning_input_stubs,
     extract_thinking_config_from_responses,
     prepare_responses_tools_policy,
+    stub_reasoning_item_from_input,
     _TOOL_CHOICE_NAMED_PROMPT,
     _TOOL_CHOICE_NONE_PROMPT,
     _TOOL_CHOICE_REQUIRED_PROMPT,
@@ -32,8 +34,10 @@ from kiro.models_responses import (
     ResponsesRequest,
     ResponsesRequestError,
     ResponsesUnprocessableError,
+    should_emit_reasoning_summary,
     validate_responses_input,
     validate_responses_request,
+    validate_responses_sampling_params,
     validate_responses_tool_choice,
     validate_responses_tools,
 )
@@ -349,13 +353,39 @@ class TestConvertResponsesInputToUnified:
         assert len(msgs[0].tool_calls) == 2
         assert len(msgs[1].tool_results) == 2
 
-    def test_reasoning_items_ignored(self):
-        _, msgs = convert_responses_input_to_unified([
-            {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "think"}]},
+    def test_reasoning_items_not_forwarded_to_kiro_but_stubbed(self):
+        """reasoning input is skipped for Kiro messages; stubs preserve id/summary."""
+        items = [
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "think"}],
+                "encrypted_content": "SECRET_BLOB",
+            },
             {"type": "message", "role": "user", "content": "hi"},
-        ])
+        ]
+        _, msgs = convert_responses_input_to_unified(items)
         assert len(msgs) == 1
         assert msgs[0].content == "hi"
+
+        stubs = extract_reasoning_input_stubs(items)
+        assert len(stubs) == 1
+        assert stubs[0]["id"] == "rs_1"
+        assert stubs[0]["type"] == "reasoning"
+        assert stubs[0]["summary"] == [{"type": "summary_text", "text": "think"}]
+        assert "encrypted_content" not in stubs[0]
+
+    def test_stub_reasoning_drops_encrypted_content(self):
+        stub = stub_reasoning_item_from_input({
+            "type": "reasoning",
+            "id": "rs_x",
+            "summary": [],
+            "encrypted_content": "nope",
+            "status": "completed",
+        })
+        assert stub["id"] == "rs_x"
+        assert stub["status"] == "completed"
+        assert "encrypted_content" not in stub
 
     def test_unknown_item_raises_value_error(self):
         with pytest.raises(ValueError, match="Unsupported"):
@@ -802,6 +832,104 @@ class TestExtractThinkingConfigFromResponses:
         )
         cfg = extract_thinking_config_from_responses(req)
         assert cfg.budget_tokens == int(4096 * 0.50)
+
+    def test_budget_is_capped_by_fake_reasoning_budget_cap(self, monkeypatch):
+        monkeypatch.setattr("kiro.config.FAKE_REASONING_BUDGET_CAP", 1000)
+        req = ResponsesRequest(
+            model="m",
+            input="x",
+            reasoning=ResponsesReasoning(effort="high"),
+            max_output_tokens=50_000,
+        )
+        cfg = extract_thinking_config_from_responses(req)
+        assert cfg.enabled is True
+        assert cfg.budget_tokens == 1000
+
+    def test_summary_concise_scales_budget(self):
+        req = ResponsesRequest(
+            model="m",
+            input="x",
+            reasoning=ResponsesReasoning(effort="high", summary="concise"),
+            max_output_tokens=4096,
+        )
+        cfg = extract_thinking_config_from_responses(req)
+        assert cfg.budget_tokens == int(int(4096 * 0.80) * 0.5)
+
+    def test_summary_none_sets_emit_false_and_echoes_stubs(self):
+        req = ResponsesRequest(
+            model="claude-sonnet-4-5",
+            input=[
+                {
+                    "type": "reasoning",
+                    "id": "rs_prev",
+                    "summary": [{"type": "summary_text", "text": "old"}],
+                    "encrypted_content": "SECRET",
+                },
+                {"type": "message", "role": "user", "content": "hi"},
+            ],
+            reasoning=ResponsesReasoning(summary="none"),
+        )
+        result = build_kiro_payload_from_responses(req, "conv-rs", "arn:aws:test")
+        assert result.emit_reasoning_summary is False
+        assert len(result.echo_reasoning_items) == 1
+        assert result.echo_reasoning_items[0]["id"] == "rs_prev"
+        assert "encrypted_content" not in result.echo_reasoning_items[0]
+        assert "SECRET" not in str(result.payload)
+
+
+class TestReasoningSummaryHelpers:
+    def test_should_emit_defaults_true(self):
+        assert should_emit_reasoning_summary(None) is True
+        assert should_emit_reasoning_summary("auto") is True
+        assert should_emit_reasoning_summary("none") is False
+        assert should_emit_reasoning_summary(False) is False
+
+    def test_budget_factor(self):
+        from kiro.models_responses import reasoning_summary_budget_factor
+
+        assert reasoning_summary_budget_factor(None) == 1.0
+        assert reasoning_summary_budget_factor("auto") == 1.0
+        assert reasoning_summary_budget_factor("concise") == 0.5
+        assert reasoning_summary_budget_factor("detailed") == 1.25
+
+
+# ==================================================================================================
+# Sampling params (temperature / top_p)
+# ==================================================================================================
+
+class TestValidateResponsesSamplingParams:
+    def test_omit_temperature_and_top_p_ok(self):
+        req = ResponsesRequest(model="m", input="hi")
+        validate_responses_sampling_params(req)
+        validate_responses_request(req)
+
+    def test_explicit_null_temperature_and_top_p_ok(self):
+        req = ResponsesRequest.model_validate(
+            {"model": "m", "input": "hi", "temperature": None, "top_p": None}
+        )
+        validate_responses_sampling_params(req)
+
+    def test_explicit_temperature_raises_sampling_not_supported(self):
+        req = ResponsesRequest(model="m", input="hi", temperature=0.7)
+        with pytest.raises(ResponsesRequestError) as exc_info:
+            validate_responses_sampling_params(req)
+        assert exc_info.value.code == "sampling_not_supported"
+        assert exc_info.value.status_code == 400
+        assert "temperature" in str(exc_info.value)
+
+    def test_explicit_top_p_raises_sampling_not_supported(self):
+        req = ResponsesRequest(model="m", input="hi", top_p=0.9)
+        with pytest.raises(ResponsesRequestError) as exc_info:
+            validate_responses_request(req)
+        assert exc_info.value.code == "sampling_not_supported"
+        assert "top_p" in str(exc_info.value)
+
+    def test_both_sampling_params_mentioned_in_error(self):
+        req = ResponsesRequest(model="m", input="hi", temperature=0.0, top_p=1.0)
+        with pytest.raises(ResponsesRequestError) as exc_info:
+            validate_responses_sampling_params(req)
+        msg = str(exc_info.value)
+        assert "temperature" in msg and "top_p" in msg
 
 
 # ==================================================================================================
