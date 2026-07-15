@@ -327,6 +327,11 @@ class TestStreamKiroToResponsesToolCalls:
         assert completed["status"] == "completed"
         assert "usage" in completed
         assert "input_tokens" in completed["usage"]
+        # Responses usage must count generated function name/arguments as output,
+        # not only the visible "Let me check" text.
+        from kiro.tokenizer import count_tokens
+
+        assert completed["usage"]["output_tokens"] > count_tokens("Let me check")
         assert any(o.get("type") == "function_call" for o in completed["output"])
         assert any(o.get("type") == "message" for o in completed["output"])
 
@@ -422,6 +427,9 @@ class TestStreamKiroToResponsesToolCalls:
         ]
         assert "".join(arg_deltas) == "{}"
         assert types[-1] == "response.completed"
+        completed = events[-1][1]["response"]
+        assert completed["usage"]["output_tokens"] > 0
+        assert completed["usage"]["total_tokens"] >= completed["usage"]["output_tokens"]
         _assert_monotonic_sequence_numbers(events)
 
 

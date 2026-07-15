@@ -232,6 +232,35 @@ def _normalize_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _count_response_output_tokens(
+    content: str,
+    thinking_content: str,
+    tool_calls: List[Dict[str, Any]],
+) -> int:
+    """Count all model-generated Responses output, including function calls.
+
+    Responses ``output_tokens`` covers generated function names and arguments
+    as well as visible/reasoning text. Kiro does not provide an exact output
+    token count, so use the same tiktoken approximation as text responses.
+
+    Args:
+        content: Visible assistant text.
+        thinking_content: Generated reasoning text.
+        tool_calls: Deduplicated Kiro/OpenAI-shaped function calls.
+
+    Returns:
+        Approximate token count for the complete generated output.
+    """
+    tool_text_parts: List[str] = []
+    for tool_call in tool_calls:
+        normalized = _normalize_tool_call(tool_call)
+        tool_text_parts.extend([
+            normalized["name"],
+            normalized["arguments"],
+        ])
+    return count_tokens(content + thinking_content + "".join(tool_text_parts))
+
+
 async def stream_kiro_to_responses_internal(
     client: httpx.AsyncClient,
     response: httpx.Response,
@@ -643,7 +672,11 @@ async def stream_kiro_to_responses_internal(
                 f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
             )
 
-        output_tokens = count_tokens(full_content + full_thinking_content)
+        output_tokens = _count_response_output_tokens(
+            full_content,
+            full_thinking_content,
+            all_tool_calls,
+        )
         input_tokens, total_tokens, prompt_source, total_source = (
             calculate_tokens_from_context_usage(
                 context_usage_percentage, output_tokens, model_cache, model
