@@ -264,9 +264,15 @@ MODEL_ALIASES: Dict[str, str] = {
     "kiro-o-4.7": "claude-opus-4.7",
     "kiro-o-4.6": "claude-opus-4.6",
     # Claude Sonnet (use -s- code, see note above)
+    "kiro-s-5": "claude-sonnet-5",
     "kiro-s-4.6": "claude-sonnet-4.6",
     # Claude Haiku (use -h- code, see note above)
     "kiro-h-4.5": "claude-haiku-4.5",
+    # GPT 5.6 (omit "gpt" in the alias so Cursor does not sniff it as a
+    # native OpenAI model and bypass the custom base URL)
+    "kiro-5.6-sol": "gpt-5.6-sol",
+    "kiro-5.6-terra": "gpt-5.6-terra",
+    "kiro-5.6-luna": "gpt-5.6-luna",
     # Non-Claude models
     "kiro-deepseek-3.2": "deepseek-3.2",
     "kiro-glm-5": "glm-5",
@@ -307,11 +313,15 @@ HIDDEN_FROM_LIST: List[str] = [
 # - Update gateway regularly to get the latest model list
 FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
+    {"modelId": "claude-sonnet-5"},
     {"modelId": "claude-sonnet-4.6"},
     {"modelId": "claude-haiku-4.5"},
     {"modelId": "claude-opus-4.6"},
     {"modelId": "claude-opus-4.7"},
     {"modelId": "claude-opus-4.8"},
+    {"modelId": "gpt-5.6-sol"},
+    {"modelId": "gpt-5.6-terra"},
+    {"modelId": "gpt-5.6-luna"},
     {"modelId": "deepseek-3.2"},
     {"modelId": "glm-5"},
     {"modelId": "minimax-m2.5"},
