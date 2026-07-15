@@ -6,7 +6,7 @@ Unit tests for OpenAI Responses API endpoints (routes_responses.py).
 Covers:
 - Authentication on POST /v1/responses
 - HTTP 400 for unsupported input items
-- POST /v1/responses/compact → 501
+- POST /v1/responses/compact → local compaction (200)
 - Mocked KiroHttpClient streaming success (200)
 """
 
@@ -248,20 +248,52 @@ class TestResponsesValidation:
 
 
 class TestResponsesCompact:
-    """POST /v1/responses/compact is intentionally unimplemented."""
+    """POST /v1/responses/compact performs local history compaction."""
 
     def test_compact_requires_auth(self, test_client):
         response = test_client.post("/v1/responses/compact", json={})
         assert response.status_code == 401
 
-    def test_compact_returns_501(self, test_client, valid_proxy_api_key):
+    def test_compact_requires_model(self, test_client, valid_proxy_api_key):
         response = test_client.post(
             "/v1/responses/compact",
             headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
             json={},
         )
-        assert response.status_code == 501
-        assert "not implemented" in response.json().get("detail", "").lower()
+        assert response.status_code == 422
+
+    def test_compact_requires_input(self, test_client, valid_proxy_api_key):
+        response = test_client.post(
+            "/v1/responses/compact",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={"model": "claude-sonnet-4-5"},
+        )
+        assert response.status_code == 400
+        assert "input is required" in str(response.json().get("detail", "")).lower()
+
+    def test_compact_returns_compaction_object(self, test_client, valid_proxy_api_key):
+        response = test_client.post(
+            "/v1/responses/compact",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "input": [
+                    {"type": "message", "role": "user", "content": "Hello"},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Hi"}],
+                    },
+                    {"type": "message", "role": "user", "content": "Again"},
+                ],
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body.get("object") == "response.compaction"
+        assert body.get("model") == "claude-sonnet-4-5"
+        assert isinstance(body.get("output"), list)
+        assert len(body["output"]) >= 1
 
 
 class TestResponsesStreaming:

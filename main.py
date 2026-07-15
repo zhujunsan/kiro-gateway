@@ -577,10 +577,10 @@ app.include_router(openai_router)
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
 
+# Responses compat first so /v1/responses/models is not captured by {response_id}
+app.include_router(responses_compat_router)
 # OpenAI Responses API (Codex wire_api=responses): /v1/responses
 app.include_router(responses_router)
-# Responses compat: /v1/responses/compact, /v1/responses/models
-app.include_router(responses_compat_router)
 
 
 # --- Account usage endpoint ---

@@ -22,11 +22,14 @@ FastAPI routes for OpenAI Responses API (Codex wire_api=responses).
 
 Endpoints:
 - POST /v1/responses — create a response (stream or JSON)
+- GET /v1/responses/{response_id} — retrieve a stored response
+- DELETE /v1/responses/{response_id} — delete a stored response
+- POST /v1/responses/{response_id}/cancel — not supported (501)
 - POST /v1/responses/compact — local history compaction (no Kiro call)
 """
 
 import json
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -47,6 +50,11 @@ from kiro.streaming_responses import (
     stream_with_first_token_retry,
     collect_stream_response,
 )
+from kiro.response_store import (
+    chain_input_with_previous,
+    get_response_store,
+    should_store_response,
+)
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.routes_openai import verify_api_key
@@ -58,6 +66,87 @@ except ImportError:
 
 
 router = APIRouter(tags=["OpenAI Responses API"])
+
+
+
+def _reject_unsupported_request_flags(request_data: ResponsesRequest) -> None:
+    """Reject features this gateway cannot run (background jobs, …)."""
+    if request_data.background is True:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "background=true is not supported by this gateway",
+                "type": "invalid_request_error",
+                "code": "not_supported",
+            },
+        )
+
+
+def _apply_previous_response_id(request_data: ResponsesRequest) -> None:
+    """
+    Expand ``previous_response_id`` into effective ``input`` before convert.
+
+    Missing id → HTTP 400 (OpenAI-ish).
+    """
+    prev_id = request_data.previous_response_id
+    if not prev_id:
+        return
+
+    prior = get_response_store().get(prev_id)
+    if prior is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"Previous response with id '{prev_id}' not found.",
+                "type": "invalid_request_error",
+                "code": "previous_response_not_found",
+            },
+        )
+
+    request_data.input = chain_input_with_previous(prior, request_data.input)
+
+
+def _maybe_store_completed(
+    request_data: ResponsesRequest,
+    responses_json: Dict[str, Any],
+) -> None:
+    """Persist completed response when ``store`` is not explicitly false."""
+    if not should_store_response(request_data.store):
+        return
+    response_id = responses_json.get("id")
+    if not response_id or not isinstance(response_id, str):
+        return
+
+    responses_json.setdefault("store", True)
+    if request_data.previous_response_id:
+        responses_json.setdefault(
+            "previous_response_id", request_data.previous_response_id
+        )
+
+    get_response_store().put(
+        response_id=response_id,
+        response=responses_json,
+        input_items=request_data.input,
+    )
+
+
+def _extract_completed_response_from_sse(chunk: str) -> Optional[Dict[str, Any]]:
+    """Parse ``response.completed`` payload from one SSE chunk, if present."""
+    data_line = None
+    for line in chunk.splitlines():
+        if line.startswith("data:"):
+            data_line = line[len("data:") :].strip()
+            break
+    if not data_line or data_line == "[DONE]":
+        return None
+    try:
+        event = json.loads(data_line)
+    except json.JSONDecodeError:
+        return None
+    if event.get("type") != "response.completed":
+        return None
+    response_obj = event.get("response")
+    return response_obj if isinstance(response_obj, dict) else None
 
 
 def _tokenizer_inputs(request_data: ResponsesRequest):
@@ -144,6 +233,7 @@ async def _handle_success_response(
         async def stream_wrapper():
             streaming_error = None
             client_disconnected = False
+            completed_response = None
             try:
 
                 async def make_retry_request():
@@ -161,6 +251,9 @@ async def _handle_success_response(
                     request_messages=messages_for_tokenizer,
                     request_tools=tools_for_tokenizer,
                 ):
+                    extracted = _extract_completed_response_from_sse(chunk)
+                    if extracted is not None:
+                        completed_response = extracted
                     yield chunk
             except GeneratorExit:
                 client_disconnected = True
@@ -173,6 +266,15 @@ async def _handle_success_response(
                     pass
                 raise
             finally:
+                if (
+                    completed_response is not None
+                    and not streaming_error
+                    and not client_disconnected
+                ):
+                    try:
+                        _maybe_store_completed(request_data, completed_response)
+                    except Exception as store_exc:
+                        logger.warning(f"Failed to store Responses result: {store_exc}")
                 await http_client.close()
                 if streaming_error:
                     error_type = type(streaming_error).__name__
@@ -211,6 +313,7 @@ async def _handle_success_response(
     )
     if build_result is not None:
         responses_json = _merge_conversion_metadata(responses_json, build_result)
+    _maybe_store_completed(request_data, responses_json)
     await http_client.close()
     logger.info("HTTP 200 - POST /v1/responses (non-streaming) - completed")
     if debug_logger:
@@ -247,6 +350,9 @@ async def create_response(request: Request, request_data: ResponsesRequest):
     logger.info(
         f"Request to /v1/responses (model={request_data.model}, stream={request_data.stream})"
     )
+
+    _reject_unsupported_request_flags(request_data)
+    _apply_previous_response_id(request_data)
 
     if request.app.state.account_system:
         from kiro.account_errors import classify_error, ErrorType
@@ -537,6 +643,60 @@ async def create_response(request: Request, request_data: ResponsesRequest):
                 phase="unknown",
             )
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+
+
+@router.get("/v1/responses/{response_id}", dependencies=[Depends(verify_api_key)])
+async def get_stored_response(response_id: str):
+    """Retrieve a previously stored response object."""
+    stored = get_response_store().get(response_id)
+    if stored is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Response with id '{response_id}' not found.",
+                "type": "invalid_request_error",
+                "code": "response_not_found",
+            },
+        )
+    return JSONResponse(content=stored.response)
+
+
+@router.delete("/v1/responses/{response_id}", dependencies=[Depends(verify_api_key)])
+async def delete_stored_response(response_id: str):
+    """Delete a stored response. Returns OpenAI-style deleted confirmation."""
+    deleted = get_response_store().delete(response_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Response with id '{response_id}' not found.",
+                "type": "invalid_request_error",
+                "code": "response_not_found",
+            },
+        )
+    return JSONResponse(
+        content={"id": response_id, "object": "response", "deleted": True}
+    )
+
+
+@router.post(
+    "/v1/responses/{response_id}/cancel",
+    dependencies=[Depends(verify_api_key)],
+)
+async def cancel_response(response_id: str):
+    """Cancel is not supported (no background/async runner)."""
+    raise HTTPException(
+        status_code=501,
+        detail={
+            "message": (
+                f"Cancel is not supported for response '{response_id}'. "
+                "This gateway has no background response runner."
+            ),
+            "type": "invalid_request_error",
+            "code": "not_supported",
+        },
+    )
 
 
 @router.post("/v1/responses/compact", dependencies=[Depends(verify_api_key)])
