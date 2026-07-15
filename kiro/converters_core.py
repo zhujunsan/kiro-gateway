@@ -580,7 +580,7 @@ def process_tools_with_long_descriptions(
 
 import hashlib
 
-# Global mapping for tool name truncation (short_name -> original_name)
+# Global mapping for tool name truncation / remapping (kiro_name -> client-facing name)
 _tool_name_map: Dict[str, str] = {}
 
 
@@ -593,9 +593,37 @@ def _shorten_tool_name(name: str) -> str:
     return name[:56] + "_" + h
 
 
+def register_tool_name_mapping(kiro_name: str, original_name: str) -> None:
+    """
+    Register reverse mapping so streaming can restore client-facing tool names.
+
+    Used when the name sent to Kiro differs from what clients (e.g. Codex)
+    expect in ``function_call.name`` — truncation, namespace qualification, etc.
+    """
+    if not kiro_name or not original_name or kiro_name == original_name:
+        return
+    _tool_name_map[kiro_name] = original_name
+
+
 def get_original_tool_name(short_name: str) -> str:
-    """Reverse-map a shortened tool name back to the original."""
+    """Reverse-map a Kiro/truncated tool name back to the client-facing original."""
     return _tool_name_map.get(short_name, short_name)
+
+
+def prepare_tool_name_for_kiro(original_name: str) -> str:
+    """
+    Return a Kiro-safe tool name (≤64 chars).
+
+    When shortened, registers a reverse mapping so
+    :func:`get_original_tool_name` can restore ``original_name``.
+    """
+    if not original_name:
+        return original_name
+    short = _shorten_tool_name(original_name)
+    if short != original_name:
+        register_tool_name_mapping(short, original_name)
+        logger.info(f"Truncated tool name '{original_name}' -> '{short}'")
+    return short
 
 
 def validate_tool_names(tools: Optional[List[UnifiedTool]]) -> None:
@@ -612,11 +640,7 @@ def validate_tool_names(tools: Optional[List[UnifiedTool]]) -> None:
         return
     
     for tool in tools:
-        if len(tool.name) > 64:
-            short = _shorten_tool_name(tool.name)
-            _tool_name_map[short] = tool.name
-            logger.info(f"Truncated tool name '{tool.name}' -> '{short}'")
-            tool.name = short
+        tool.name = prepare_tool_name_for_kiro(tool.name)
 
 
 def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dict[str, Any]]:

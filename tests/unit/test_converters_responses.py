@@ -440,7 +440,11 @@ class TestConvertResponsesToolsToUnified:
         ])
         assert tools is not None
         names = [t.name for t in tools]
-        assert names == ["exec_command", "spawn_agent", "close_agent"]
+        assert names == [
+            "exec_command",
+            "multi_agent_v1__spawn_agent",
+            "multi_agent_v1__close_agent",
+        ]
         assert tools[1].description == "Spawn a sub-agent"
         assert tools[1].input_schema["properties"]["prompt"]["type"] == "string"
 
@@ -455,7 +459,7 @@ class TestConvertResponsesToolsToUnified:
         assert [t.name for t in tools] == ["f"]
 
     def test_dedupe_same_local_name_across_namespaces(self):
-        """Codex MCP apps often reuse local names like `_get_profile` per app."""
+        """Same local name in different namespaces → distinct qualified names."""
         tools = convert_responses_tools_to_unified([
             ResponsesFunctionTool.model_validate({
                 "type": "namespace",
@@ -506,13 +510,20 @@ class TestConvertResponsesToolsToUnified:
         ])
         assert tools is not None
         names = [t.name for t in tools]
-        assert names == ["_get_profile", "_search", "_fetch"]
-        assert names.count("_get_profile") == 1
-        # First occurrence wins (github description).
+        assert names == [
+            "mcp__codex_apps__github___get_profile",
+            "mcp__codex_apps__github___search",
+            "mcp__codex_apps__gmail___get_profile",
+            "mcp__codex_apps__gmail___fetch",
+            "mcp__codex_apps__google_drive___get_profile",
+        ]
+        assert names.count("mcp__codex_apps__github___get_profile") == 1
         assert tools[0].description == "github profile"
+        assert tools[2].description == "gmail profile (duplicate local name)"
+        assert tools[4].description == "drive profile"
 
-    def test_dedupe_namespace_vs_flat_function(self):
-        """Flat function and namespace-expanded local name must not both ship."""
+    def test_namespace_vs_flat_function_both_kept(self):
+        """Flat function and namespace-qualified name are distinct — both ship."""
         tools = convert_responses_tools_to_unified([
             ResponsesFunctionTool(
                 type="function",
@@ -527,7 +538,7 @@ class TestConvertResponsesToolsToUnified:
                     {
                         "type": "function",
                         "name": "_get_profile",
-                        "description": "ns duplicate",
+                        "description": "ns variant",
                         "parameters": {"type": "object"},
                     },
                     {
@@ -538,10 +549,16 @@ class TestConvertResponsesToolsToUnified:
                 ],
             }),
         ])
-        assert [t.name for t in tools] == ["_get_profile", "_list_repos"]
+        assert [t.name for t in tools] == [
+            "_get_profile",
+            "mcp__codex_apps__github___get_profile",
+            "mcp__codex_apps__github___list_repos",
+        ]
         assert tools[0].description == "flat first"
+        assert tools[1].description == "ns variant"
 
-    def test_dedupe_flat_after_namespace_keeps_namespace_first(self):
+    def test_flat_after_namespace_both_kept(self):
+        """Qualified namespace name and flat local name do not collide."""
         tools = convert_responses_tools_to_unified([
             ResponsesFunctionTool.model_validate({
                 "type": "namespace",
@@ -562,8 +579,34 @@ class TestConvertResponsesToolsToUnified:
                 parameters={"type": "object"},
             ),
         ])
-        assert [t.name for t in tools] == ["shared"]
+        assert [t.name for t in tools] == ["ns_a__shared", "shared"]
         assert tools[0].description == "from namespace"
+        assert tools[1].description == "flat later"
+
+    def test_namespace_long_qualified_name_round_trip(self):
+        """Qualified names over 64 chars are shortened with reverse mapping."""
+        from kiro.converters_core import get_original_tool_name
+
+        long_ns = "mcp__codex_apps__" + ("very_long_server_name_" * 3)
+        assert len(f"{long_ns}___get_profile") > 64
+        tools = convert_responses_tools_to_unified([
+            ResponsesFunctionTool.model_validate({
+                "type": "namespace",
+                "name": long_ns,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "_get_profile",
+                        "parameters": {"type": "object"},
+                    },
+                ],
+            }),
+        ])
+        assert tools is not None
+        assert len(tools) == 1
+        assert len(tools[0].name) <= 64
+        expected = f"{long_ns}___get_profile"
+        assert get_original_tool_name(tools[0].name) == expected
 
 
 # ==================================================================================================
@@ -708,7 +751,8 @@ class TestBuildKiroPayloadFromResponses:
             for t in (ctx.get("tools") or [])
         ]
         assert "Read" in names
-        assert "js" in names
+        assert "mcp__node_repl__js" in names
+        assert "js" not in names
         assert "file_search" not in names
         assert "mcp__node_repl" not in names
 

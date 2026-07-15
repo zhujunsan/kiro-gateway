@@ -40,6 +40,7 @@ from kiro.converters_core import (
     UnifiedTool,
     ThinkingConfig,
     build_kiro_payload as core_build_kiro_payload,
+    prepare_tool_name_for_kiro,
     sanitize_tool_use_id,
 )
 from kiro.converters_openai import reasoning_effort_to_budget
@@ -287,12 +288,13 @@ def convert_responses_tools_to_unified(
     1. Responses flat: ``{"type": "function", "name": "...", "parameters": {...}}``
     2. Chat Completions nested: ``{"type": "function", "function": {"name": ...}}``
     3. Codex ``type: namespace`` wrappers — nested function tools are expanded
-       with their local names (not namespace-prefixed)
+       with lossless qualified names ``{namespace}__{local_name}`` (truncated to
+       Kiro's 64-char limit with reverse mapping for streaming restore)
     4. Built-in / unknown wrapper types (``web_search``, etc.) — skipped with log
 
-    Duplicate tool names (same local name across namespaces, or namespace vs
-    top-level ``function``) are collapsed: the first occurrence is kept and
-    later ones are skipped with a log. Bedrock/Kiro reject TOOL_DUPLICATE.
+    Exact duplicate tool names (same final Kiro name) are still collapsed: the
+    first occurrence is kept and later ones are skipped with a log. Same local
+    names across different namespaces are kept as distinct qualified names.
 
     Raises:
         ValueError: Malformed function / namespace entries.
@@ -354,6 +356,10 @@ def convert_responses_tools_to_unified(
                         f"no name found"
                     )
                     continue
+                # Lossless qualification: keep all namespace tools even when
+                # local names collide (e.g. MCP apps each expose _get_profile).
+                qualified = f"{ns_name}__{unified.name}"
+                unified.name = prepare_tool_name_for_kiro(qualified)
                 if _append_unique(unified, f"namespace '{ns_name}'"):
                     expanded += 1
             logger.debug(
