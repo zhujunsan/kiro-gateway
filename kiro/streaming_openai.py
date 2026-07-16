@@ -37,6 +37,7 @@ from fastapi import HTTPException
 from loguru import logger
 
 from kiro.converters_core import EMPTY_CONTENT_PLACEHOLDER
+from kiro.output_tokens import count_generated_output_tokens
 from kiro.parsers import parse_bracket_tool_calls, parse_xml_tool_calls, deduplicate_tool_calls
 from kiro.utils import generate_completion_id
 from kiro.config import (
@@ -44,7 +45,7 @@ from kiro.config import (
     FIRST_TOKEN_MAX_RETRIES,
     FAKE_REASONING_HANDLING,
 )
-from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
+from kiro.tokenizer import count_message_tokens, count_tools_tokens
 
 # Import from streaming_core - reuse shared parsing logic
 from kiro.streaming_core import (
@@ -457,8 +458,13 @@ async def stream_kiro_to_openai_internal(
         else:
             finish_reason = "stop"
         
-        # Count completion_tokens (output) using tiktoken
-        completion_tokens = count_tokens(full_content + full_thinking_content)
+        # The single-space placeholder is protocol scaffolding, not model output.
+        generated_content = (
+            "" if full_content == EMPTY_CONTENT_PLACEHOLDER and all_tool_calls else full_content
+        )
+        completion_tokens = count_generated_output_tokens(
+            generated_content, full_thinking_content, all_tool_calls
+        )
         
         # Calculate total_tokens based on context_usage_percentage from Kiro API
         # context_usage shows TOTAL percentage of context usage (input + output)

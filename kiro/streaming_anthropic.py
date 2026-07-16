@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional, Any
 import httpx
 from loguru import logger
 
+from kiro.output_tokens import count_generated_output_tokens
 from kiro.streaming_core import (
     parse_kiro_stream,
     collect_stream_to_result,
@@ -571,6 +572,10 @@ async def stream_kiro_to_anthropic(
                         })
                         current_block_index += 1
                         
+                        # The summary is visible generated output and must be
+                        # retained for terminal usage accounting.
+                        full_content += summary
+
                         # Skip normal tool_use processing
                         continue
                 
@@ -730,8 +735,10 @@ async def stream_kiro_to_anthropic(
                 f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
             )
         
-        # Calculate output tokens
-        output_tokens = count_tokens(full_content + full_thinking_content)
+        # Count all generated output, including tool names and JSON input.
+        output_tokens = count_generated_output_tokens(
+            full_content, full_thinking_content, tool_blocks
+        )
         
         # Calculate total tokens from context usage if available
         if context_usage_percentage is not None:
@@ -912,8 +919,13 @@ async def collect_anthropic_response(
             "input": tool_input
         })
     
-    # Calculate output tokens
-    output_tokens = count_tokens(result.content + result.thinking_content)
+    # Count all generated output, including tool names and JSON input.
+    emitted_tool_blocks = [
+        block for block in content_blocks if block.get("type") == "tool_use"
+    ]
+    output_tokens = count_generated_output_tokens(
+        result.content, result.thinking_content, emitted_tool_blocks
+    )
     
     # Calculate from context usage if available
     if result.context_usage_percentage is not None:

@@ -1911,3 +1911,149 @@ class TestStreamingAnthropicTruncationDetection:
         # Should detect truncation and set max_tokens
         assert result["stop_reason"] == "max_tokens"
         print("✓ collect_anthropic_response detects truncation correctly")
+
+
+class TestStreamingAnthropicOutputTokenAccounting:
+    """Regression tests for complete Anthropic output-token accounting."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("arguments", "canonical_arguments"),
+        [
+            ('{"city":"Paris"}', '{"city": "Paris"}'),
+            (None, "{}"),
+        ],
+    )
+    async def test_tool_only_stream_counts_name_and_input(
+        self,
+        mock_response,
+        mock_model_cache,
+        mock_auth_manager,
+        arguments,
+        canonical_arguments,
+    ):
+        """Streaming tool-only usage includes the tool name and JSON input."""
+        tool_call = {
+            "id": "toolu_tokens",
+            "function": {"name": "get_weather", "arguments": arguments},
+        }
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use=tool_call)
+
+        events = []
+        with patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                ):
+                    events.append(event)
+
+        message_delta = next(
+            json.loads(event.split("data: ", 1)[1])
+            for event in events
+            if event.startswith("event: message_delta")
+        )
+        from kiro.tokenizer import count_tokens
+
+        assert message_delta["usage"]["output_tokens"] == count_tokens(
+            "get_weather" + canonical_arguments
+        )
+        assert message_delta["usage"]["output_tokens"] > 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("arguments", "canonical_arguments"),
+        [
+            ({"city": "Paris"}, '{"city": "Paris"}'),
+            ('{"city":"Paris"}', '{"city": "Paris"}'),
+            (None, "{}"),
+        ],
+    )
+    async def test_tool_only_non_streaming_counts_name_and_input(
+        self,
+        mock_response,
+        mock_model_cache,
+        mock_auth_manager,
+        arguments,
+        canonical_arguments,
+    ):
+        """Non-streaming tool usage handles dict, JSON string, and empty input."""
+        mock_result = StreamResult(
+            content="",
+            thinking_content="",
+            tool_calls=[{
+                "id": "toolu_collected",
+                "function": {"name": "lookup", "arguments": arguments},
+            }],
+            usage=None,
+            context_usage_percentage=None,
+        )
+
+        with patch(
+            "kiro.streaming_anthropic.collect_stream_to_result",
+            return_value=mock_result,
+        ):
+            result = await collect_anthropic_response(
+                mock_response,
+                "claude-sonnet-4",
+                mock_model_cache,
+                mock_auth_manager,
+            )
+
+        from kiro.tokenizer import count_tokens
+
+        assert result["usage"]["output_tokens"] == count_tokens(
+            "lookup" + canonical_arguments
+        )
+        assert result["usage"]["output_tokens"] > 0
+
+    @pytest.mark.asyncio
+    async def test_web_search_summary_is_retained_for_terminal_usage(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """Path B visible search summary remains in final output usage once."""
+        summary = "Search summary with one visible result."
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={
+                    "id": "toolu_search",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": '{"query":"kiro"}',
+                    },
+                },
+            )
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+
+        with patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(
+                return_value=("server_toolu_search", {"results": []})
+            )):
+                with patch(
+                    "kiro.mcp_tools.generate_search_summary", return_value=summary
+                ):
+                    events = [
+                        event
+                        async for event in stream_kiro_to_anthropic(
+                            mock_response,
+                            "claude-sonnet-4",
+                            mock_model_cache,
+                            mock_auth_manager,
+                        )
+                    ]
+
+        message_delta = next(
+            json.loads(event.split("data: ", 1)[1])
+            for event in events
+            if event.startswith("event: message_delta")
+        )
+        from kiro.tokenizer import count_tokens
+
+        assert message_delta["usage"]["output_tokens"] == count_tokens(summary)
+        assert sum(summary in event for event in events) == 1

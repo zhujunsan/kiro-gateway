@@ -1538,3 +1538,83 @@ class TestStreamingOpenaiTruncationDetection:
         # Should extract "length" from streaming chunks
         assert result["choices"][0]["finish_reason"] == "length"
         print("✓ collect_stream_response extracts finish_reason correctly")
+
+class TestStreamingOpenaiOutputTokenAccounting:
+    """Regression tests for tool-only completion token accounting."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("arguments", "counted_arguments"),
+        [
+            ('{"city":"Paris"}', '{"city":"Paris"}'),
+            (None, "{}"),
+        ],
+    )
+    async def test_tool_only_stream_counts_name_and_arguments(
+        self,
+        mock_http_client,
+        mock_response,
+        mock_model_cache,
+        mock_auth_manager,
+        arguments,
+        counted_arguments,
+    ):
+        """Tool-only usage includes generated function name and arguments."""
+        tool_call = {
+            "id": "call_tokens",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": arguments},
+        }
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use=tool_call)
+
+        chunks = []
+        with patch("kiro.streaming_openai.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_openai.parse_bracket_tool_calls", return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client,
+                    mock_response,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                ):
+                    chunks.append(chunk)
+
+        final = json.loads(chunks[-2][len("data: "):])
+        from kiro.tokenizer import count_tokens
+
+        expected = count_tokens("get_weather" + counted_arguments)
+        assert final["usage"]["completion_tokens"] == expected
+        assert final["usage"]["completion_tokens"] > count_tokens(" ")
+
+    @pytest.mark.asyncio
+    async def test_collected_tool_only_response_keeps_stream_usage(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """Non-streaming collection preserves corrected terminal stream usage."""
+        tool_call = {
+            "id": "call_collected",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"id":7}'},
+        }
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use=tool_call)
+
+        with patch("kiro.streaming_openai.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_openai.parse_bracket_tool_calls", return_value=[]):
+                result = await collect_stream_response(
+                    mock_http_client,
+                    mock_response,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                )
+
+        from kiro.tokenizer import count_tokens
+
+        assert result["usage"]["completion_tokens"] == count_tokens(
+            'lookup{"id":7}'
+        )
+        assert result["choices"][0]["message"]["tool_calls"] == [tool_call]
