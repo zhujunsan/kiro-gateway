@@ -353,6 +353,49 @@ class TestConvertResponsesInputToUnified:
         assert len(msgs[0].tool_calls) == 2
         assert len(msgs[1].tool_results) == 2
 
+    def test_duplicate_call_id_keeps_complete_call_and_first_output(self):
+        """Duplicate replay items are collapsed without losing assistant text."""
+        _, msgs = convert_responses_input_to_unified([
+            {"type": "message", "role": "user", "content": "inspect"},
+            {
+                "type": "function_call",
+                "call_id": "call_dup",
+                "name": "exec_command",
+                "arguments": '{"cmd":"pwd"}',
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_dup",
+                "name": "exec_command",
+                "arguments": "{}",
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "I will inspect the workspace.",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_dup",
+                "output": "/workspace",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_dup",
+                "output": "failed to parse function arguments",
+            },
+        ])
+
+        assert len(msgs) == 3
+        assistant = msgs[1]
+        assert assistant.role == "assistant"
+        assert assistant.content == "I will inspect the workspace."
+        assert len(assistant.tool_calls) == 1
+        assert assistant.tool_calls[0]["id"] == "call_dup"
+        assert assistant.tool_calls[0]["function"]["arguments"] == '{"cmd":"pwd"}'
+        assert len(msgs[2].tool_results) == 1
+        assert msgs[2].tool_results[0]["content"] == "/workspace"
+
     def test_reasoning_items_not_forwarded_to_kiro_but_stubbed(self):
         """reasoning input is skipped for Kiro messages; stubs preserve id/summary."""
         items = [
@@ -994,6 +1037,83 @@ class TestBuildKiroPayloadFromResponses:
 
         assert "call_list" in tool_use_ids
         assert "call_list" in tool_result_ids
+
+    def test_duplicate_replay_ids_are_unique_in_kiro_history(self):
+        """Kiro payloads contain one tool use/result for duplicated Codex replay."""
+        req = ResponsesRequest(
+            model="claude-sonnet-4-5",
+            input=[
+                {"type": "message", "role": "user", "content": "inspect"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_dup",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"pwd"}',
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_dup",
+                    "name": "exec_command",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "I will inspect the workspace.",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_dup",
+                    "output": "/workspace",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_dup",
+                    "output": "failed to parse function arguments",
+                },
+                {"type": "message", "role": "user", "content": "continue"},
+            ],
+            tools=[ResponsesFunctionTool(
+                type="function",
+                name="exec_command",
+                description="Run a command",
+                parameters={
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                },
+            )],
+        )
+
+        payload = _payload_of(
+            build_kiro_payload_from_responses(req, "conv-dup", "arn:aws:test")
+        )
+        history = payload["conversationState"]["history"]
+        tool_uses = [
+            tool_use
+            for turn in history
+            for tool_use in (
+                (turn.get("assistantResponseMessage") or {}).get("toolUses") or []
+            )
+        ]
+        tool_results = [
+            tool_result
+            for turn in history
+            for tool_result in (
+                ((turn.get("userInputMessage") or {}).get("userInputMessageContext") or {})
+                .get("toolResults") or []
+            )
+        ]
+        current_context = (
+            payload["conversationState"]["currentMessage"]["userInputMessage"]
+            .get("userInputMessageContext") or {}
+        )
+        tool_results.extend(current_context.get("toolResults") or [])
+
+        assert [item["toolUseId"] for item in tool_uses] == ["call_dup"]
+        assert tool_uses[0]["input"] == {"cmd": "pwd"}
+        assert [item["toolUseId"] for item in tool_results] == ["call_dup"]
+        assert tool_results[0]["content"][0]["text"] == "/workspace"
 
     def test_rejects_unknown_input_item(self):
         req = ResponsesRequest(

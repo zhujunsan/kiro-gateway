@@ -547,6 +547,11 @@ async def stream_kiro_to_responses_internal(
                 tool = event.tool_use
                 function = tool.get("function") or {}
                 tool_id = tool.get("id") or generate_function_call_item_id()
+                if tool_id in streamed_tool_ids:
+                    logger.warning(
+                        f"Ignoring duplicate Responses tool_start for tool_use_id={tool_id}"
+                    )
+                    continue
                 tool_name = get_original_tool_name(
                     function.get("name") or tool.get("name") or ""
                 )

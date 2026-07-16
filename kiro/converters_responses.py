@@ -462,6 +462,94 @@ def _flush_pending_tool_results(
     pending_results.clear()
 
 
+def _tool_arguments_score(arguments: Any) -> int:
+    """Score function-call arguments when choosing between duplicate calls.
+
+    Args:
+        arguments: Raw Responses function-call arguments.
+
+    Returns:
+        Zero for empty arguments, otherwise the serialized argument length.
+    """
+    if arguments is None:
+        return 0
+    if isinstance(arguments, str):
+        stripped = arguments.strip()
+        return 0 if stripped in ("", "{}") else len(stripped)
+    if isinstance(arguments, dict):
+        return 0 if not arguments else len(json.dumps(arguments, sort_keys=True))
+    return len(str(arguments))
+
+
+def _deduplicate_responses_tool_items(items: List[Any]) -> List[Any]:
+    """Remove duplicate Responses calls and outputs by sanitized call ID.
+
+    Kiro requires every toolUseId and matching toolResult to be unique. Some
+    upstream streams repeat a completed call with empty arguments; Responses
+    clients then replay both copies on the next turn. Calls retain the copy
+    with the most complete arguments, while outputs retain the first result.
+
+    Args:
+        items: Validated Responses input items.
+
+    Returns:
+        Input items with duplicate function calls and outputs removed.
+    """
+    result: List[Any] = []
+    call_positions: Dict[str, int] = {}
+    output_ids: set[str] = set()
+    duplicate_calls = 0
+    duplicate_outputs = 0
+
+    for item in items:
+        if not isinstance(item, dict):
+            result.append(item)
+            continue
+
+        item_type = item.get("type")
+        if item_type not in ("function_call", "function_call_output"):
+            result.append(item)
+            continue
+
+        raw_call_id = item.get("call_id") or (
+            item.get("id") if item_type == "function_call" else ""
+        )
+        call_id = sanitize_tool_use_id(raw_call_id or "")
+        if not call_id:
+            result.append(item)
+            continue
+
+        if item_type == "function_call":
+            existing_position = call_positions.get(call_id)
+            if existing_position is None:
+                call_positions[call_id] = len(result)
+                result.append(item)
+                continue
+
+            duplicate_calls += 1
+            existing = result[existing_position]
+            if _tool_arguments_score(item.get("arguments")) > _tool_arguments_score(
+                existing.get("arguments")
+            ):
+                result[existing_position] = item
+            continue
+
+        if call_id in output_ids:
+            duplicate_outputs += 1
+            continue
+        output_ids.add(call_id)
+        result.append(item)
+
+    if duplicate_calls or duplicate_outputs:
+        logger.warning(
+            "Deduplicated Responses replay items: "
+            f"{duplicate_calls} function_call(s), "
+            f"{duplicate_outputs} function_call_output(s)"
+        )
+
+    return result
+
+
 def convert_responses_input_to_unified(
     input_data: Union[str, List[Any]],
     instructions: Optional[str] = None,
@@ -499,7 +587,7 @@ def convert_responses_input_to_unified(
     if isinstance(input_data, str):
         items: List[Any] = [{"type": "message", "role": "user", "content": input_data}]
     else:
-        items = input_data
+        items = _deduplicate_responses_tool_items(input_data)
 
     processed: List[UnifiedMessage] = []
     pending_tool_calls: List[Dict[str, Any]] = []
@@ -574,7 +662,6 @@ def convert_responses_input_to_unified(
             continue
 
         if item_type == "message":
-            _flush_pending_tool_calls(pending_tool_calls, processed)
             _flush_pending_tool_results(pending_tool_results, processed)
 
             role = item.get("role") or "user"
@@ -591,6 +678,17 @@ def convert_responses_input_to_unified(
                 # Treat unknown roles as user text for forward compatibility
                 role = "user"
 
+            if role == "assistant" and pending_tool_calls:
+                processed.append(UnifiedMessage(
+                    role="assistant",
+                    content=content_text,
+                    tool_calls=pending_tool_calls.copy(),
+                    images=images,
+                ))
+                pending_tool_calls.clear()
+                continue
+
+            _flush_pending_tool_calls(pending_tool_calls, processed)
             processed.append(UnifiedMessage(
                 role=role,
                 content=content_text,

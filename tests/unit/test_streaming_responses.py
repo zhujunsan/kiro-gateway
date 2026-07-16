@@ -503,6 +503,92 @@ class TestStreamKiroToResponsesToolCalls:
         _assert_monotonic_sequence_numbers(events)
 
     @pytest.mark.asyncio
+    async def test_duplicate_tool_lifecycle_emits_one_function_call(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """A repeated empty lifecycle cannot create a duplicate Responses item."""
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_start",
+                tool_use={
+                    "id": "call_dup",
+                    "type": "function",
+                    "function": {"name": "exec_command", "arguments": ""},
+                },
+            )
+            yield KiroEvent(
+                type="tool_input",
+                tool_call_id="call_dup",
+                tool_input_delta='{"cmd":"pwd"}',
+            )
+            yield KiroEvent(
+                type="tool_stop",
+                tool_use={
+                    "id": "call_dup",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"pwd"}',
+                    },
+                },
+            )
+            yield KiroEvent(
+                type="tool_start",
+                tool_use={
+                    "id": "call_dup",
+                    "type": "function",
+                    "function": {"name": "exec_command", "arguments": ""},
+                },
+            )
+            yield KiroEvent(
+                type="tool_stop",
+                tool_use={
+                    "id": "call_dup",
+                    "type": "function",
+                    "function": {"name": "exec_command", "arguments": "{}"},
+                },
+            )
+            yield KiroEvent(type="usage", usage={"credits": 0.1})
+
+        chunks = []
+        with patch("kiro.streaming_responses.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_responses.parse_bracket_tool_calls", return_value=[]):
+                async for chunk in stream_kiro_to_responses(
+                    mock_http_client,
+                    mock_response,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                ):
+                    chunks.append(chunk)
+
+        events = _parse_sse_events(chunks)
+        added_calls = [
+            data["item"]
+            for event_type, data in events
+            if event_type == "response.output_item.added"
+            and data["item"].get("type") == "function_call"
+        ]
+        done_calls = [
+            data["item"]
+            for event_type, data in events
+            if event_type == "response.output_item.done"
+            and data["item"].get("type") == "function_call"
+        ]
+
+        assert len(added_calls) == 1
+        assert len(done_calls) == 1
+        assert done_calls[0]["call_id"] == "call_dup"
+        assert done_calls[0]["arguments"] == '{"cmd":"pwd"}'
+        completed_calls = [
+            item
+            for item in events[-1][1]["response"]["output"]
+            if item["type"] == "function_call"
+        ]
+        assert completed_calls == done_calls
+        _assert_monotonic_sequence_numbers(events)
+
+    @pytest.mark.asyncio
     async def test_xml_fallback_emits_function_call_events(
         self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
     ):
