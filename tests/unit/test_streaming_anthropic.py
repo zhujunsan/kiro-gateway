@@ -349,6 +349,76 @@ class TestStreamKiroToAnthropic:
         assert len(tool_use_events) >= 1
         assert "get_weather" in tool_use_events[0]
         print("✓ tool_use block yielded for tool calls")
+
+    @pytest.mark.asyncio
+    async def test_streams_tool_input_fragments_as_they_arrive(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Converts upstream tool lifecycle events to partial_json deltas.
+        Goal: Ensure Anthropic clients receive arguments before stream completion.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_start",
+                tool_use={
+                    "id": "toolu_live",
+                    "type": "function",
+                    "function": {"name": "Write", "arguments": ""},
+                },
+            )
+            yield KiroEvent(
+                type="tool_input",
+                tool_call_id="toolu_live",
+                tool_input_delta='{"path":',
+            )
+            yield KiroEvent(
+                type="tool_input",
+                tool_call_id="toolu_live",
+                tool_input_delta='"live.txt"}',
+            )
+            yield KiroEvent(
+                type="tool_stop",
+                tool_use={
+                    "id": "toolu_live",
+                    "type": "function",
+                    "function": {
+                        "name": "Write",
+                        "arguments": '{"path":"live.txt"}',
+                    },
+                },
+            )
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+
+        events = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
+        partial_json = []
+        for event in events:
+            if not event.startswith("event: content_block_delta"):
+                continue
+            data = json.loads(event.split("data: ", 1)[1])
+            if data["delta"]["type"] == "input_json_delta":
+                partial_json.append(data["delta"]["partial_json"])
+
+        assert partial_json == ['{"path":', '"live.txt"}']
+        assert json.loads("".join(partial_json)) == {"path": "live.txt"}
+        tool_stop_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.startswith("event: content_block_stop")
+        )
+        message_stop_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.startswith("event: message_stop")
+        )
+        assert tool_stop_index < message_stop_index
     
     @pytest.mark.asyncio
     async def test_yields_message_delta_with_stop_reason(self, mock_response, mock_model_cache, mock_auth_manager):
@@ -472,6 +542,48 @@ class TestStreamKiroToAnthropic:
         tool_use_events = [e for e in events if "tool_use" in e and "content_block_start" in e]
         assert len(tool_use_events) >= 1
         print("✓ Bracket tool calls handled correctly")
+
+    @pytest.mark.asyncio
+    async def test_handles_xml_tool_calls(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Converts legacy XML invoke output to a streamed tool block.
+        Goal: Keep fallback behavior consistent with OpenAI streaming.
+        """
+        xml = (
+            '<invoke name="Shell">'
+            '<parameter name="command">pwd</parameter>'
+            '</invoke>'
+        )
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content=xml)
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+
+        events = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
+        tool_start = next(
+            event
+            for event in events
+            if event.startswith("event: content_block_start")
+            and '"type": "tool_use"' in event
+        )
+        input_delta = next(
+            event
+            for event in events
+            if event.startswith("event: content_block_delta")
+            and "input_json_delta" in event
+        )
+        assert '"name": "Shell"' in tool_start
+        delta_data = json.loads(input_delta.split("data: ", 1)[1])
+        assert json.loads(delta_data["delta"]["partial_json"]) == {"command": "pwd"}
     
     @pytest.mark.asyncio
     async def test_closes_response_on_completion(self, mock_response, mock_model_cache, mock_auth_manager):

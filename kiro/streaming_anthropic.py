@@ -48,7 +48,7 @@ from kiro.streaming_core import (
     stream_with_first_token_retry,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
-from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.parsers import parse_bracket_tool_calls, parse_xml_tool_calls, deduplicate_tool_calls
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
 
 if TYPE_CHECKING:
@@ -189,7 +189,7 @@ async def stream_kiro_to_anthropic(
     text_block_started = False
     text_block_index: Optional[int] = None
     tool_blocks: List[Dict[str, Any]] = []
-    tool_input_buffers: Dict[int, str] = {}  # index -> accumulated JSON
+    tool_streams: Dict[str, Dict[str, Any]] = {}
     
     # Generate signature for thinking block (used if thinking is present)
     thinking_signature = generate_thinking_signature()
@@ -335,7 +335,98 @@ async def stream_kiro_to_anthropic(
                         })
                 # For "strip" mode, we just skip the thinking content
             
-            elif event.type == "tool_use" and event.tool_use:
+            elif event.type == "tool_start" and event.tool_use:
+                # Anthropic content blocks cannot overlap. Close text/reasoning
+                # before opening the tool block as soon as Kiro announces it.
+                if thinking_block_started and thinking_block_index is not None:
+                    yield format_sse_event("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": thinking_block_index,
+                    })
+                    thinking_block_started = False
+                    current_block_index += 1
+                if text_block_started and text_block_index is not None:
+                    yield format_sse_event("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": text_block_index,
+                    })
+                    text_block_started = False
+                    current_block_index += 1
+
+                tool = event.tool_use
+                tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
+                tool_name = tool.get("function", {}).get("name", "") or tool.get("name", "")
+                from kiro.converters_core import get_original_tool_name
+                tool_name = get_original_tool_name(tool_name)
+                suppress = tool_name == "web_search"
+                tool_streams[tool_id] = {
+                    "index": current_block_index,
+                    "name": tool_name,
+                    "suppress": suppress,
+                }
+                if suppress:
+                    continue
+
+                yield format_sse_event("content_block_start", {
+                    "type": "content_block_start",
+                    "index": current_block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": {},
+                    },
+                })
+
+            elif event.type == "tool_input":
+                state = tool_streams.get(event.tool_call_id or "")
+                if not state or state["suppress"] or not event.tool_input_delta:
+                    continue
+                yield format_sse_event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": state["index"],
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": event.tool_input_delta,
+                    },
+                })
+
+            elif event.type in ("tool_stop", "tool_use") and event.tool_use:
+                tool_id_from_event = event.tool_use.get("id")
+                stream_state = tool_streams.pop(tool_id_from_event, None)
+                if stream_state and not stream_state["suppress"]:
+                    tool = event.tool_use
+                    if tool.get("_truncation_detected"):
+                        truncated_tools.append({
+                            "id": tool_id_from_event,
+                            "name": stream_state["name"],
+                            "truncation_info": tool.get("_truncation_info", {}),
+                        })
+
+                    yield format_sse_event("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": stream_state["index"],
+                    })
+
+                    tool_input = (tool.get("function") or {}).get(
+                        "arguments", {}
+                    ) or tool.get("input", {})
+                    if isinstance(tool_input, str):
+                        try:
+                            tool_input = json.loads(tool_input)
+                        except json.JSONDecodeError:
+                            tool_input = {}
+                    tool_blocks.append({
+                        "id": tool_id_from_event,
+                        "name": stream_state["name"],
+                        "input": tool_input,
+                    })
+                    current_block_index = max(
+                        current_block_index,
+                        stream_state["index"] + 1,
+                    )
+                    continue
+
                 # Close thinking block if open
                 if thinking_block_started and thinking_block_index is not None:
                     yield format_sse_event("content_block_stop", {
@@ -543,8 +634,10 @@ async def stream_kiro_to_anthropic(
         stream_completed_normally = context_usage_percentage is not None
         
         # Check for bracket-style tool calls in full content
-        bracket_tool_calls = parse_bracket_tool_calls(full_content)
-        if bracket_tool_calls:
+        fallback_tool_calls = deduplicate_tool_calls(
+            parse_bracket_tool_calls(full_content) + parse_xml_tool_calls(full_content)
+        )
+        if fallback_tool_calls:
             # Close thinking block if open
             if thinking_block_started and thinking_block_index is not None:
                 yield format_sse_event("content_block_stop", {
@@ -563,7 +656,7 @@ async def stream_kiro_to_anthropic(
                 text_block_started = False
                 current_block_index += 1
             
-            for tc in bracket_tool_calls:
+            for tc in fallback_tool_calls:
                 tool_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
                 tool_name = tc.get("function", {}).get("name", "")
                 tool_input = tc.get("function", {}).get("arguments", {})

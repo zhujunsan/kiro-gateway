@@ -37,7 +37,7 @@ from fastapi import HTTPException
 from loguru import logger
 
 from kiro.converters_core import EMPTY_CONTENT_PLACEHOLDER
-from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.parsers import parse_bracket_tool_calls, parse_xml_tool_calls, deduplicate_tool_calls
 from kiro.utils import generate_completion_id
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
@@ -133,6 +133,36 @@ async def stream_kiro_to_openai_internal(
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    tool_streams = {}
+    streamed_tool_ids = set()
+    next_tool_index = 0
+
+    def _emit_tool_call_chunk(delta_tool_call: dict) -> str:
+        """Wrap a single tool_call delta in an OpenAI chunk and log it."""
+        chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [delta_tool_call]},
+                "finish_reason": None
+            }]
+        }
+        text = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        if debug_logger:
+            debug_logger.log_modified_chunk(text.encode('utf-8'))
+        return text
+
+    def _tool_identity(tool: dict) -> tuple:
+        """Return downstream tool id and original function name."""
+        from kiro.converters_core import get_original_tool_name
+
+        function = tool.get("function") or {}
+        tool_id = tool.get("id") or generate_completion_id()
+        tool_name = function.get("name") or tool.get("name") or ""
+        return tool_id, get_original_tool_name(tool_name)
     
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
@@ -192,7 +222,71 @@ async def stream_kiro_to_openai_internal(
                 
                 yield chunk_text
             
-            elif event.type == "tool_use" and event.tool_use:
+            elif event.type == "tool_start" and event.tool_use:
+                tool_id, tool_name = _tool_identity(event.tool_use)
+                suppress = tool_name == "web_search"
+                tool_streams[tool_id] = {
+                    "index": next_tool_index,
+                    "name": tool_name,
+                    "suppress": suppress,
+                }
+                if suppress:
+                    continue
+
+                # Tool-only responses need an assistant role/content chunk before
+                # the first tool delta for clients that render an empty placeholder.
+                if first_chunk:
+                    empty_preventer_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": EMPTY_CONTENT_PLACEHOLDER,
+                            },
+                            "finish_reason": None,
+                        }],
+                    }
+                    empty_preventer_text = (
+                        f"data: {json.dumps(empty_preventer_chunk, ensure_ascii=False)}\n\n"
+                    )
+                    if debug_logger:
+                        debug_logger.log_modified_chunk(
+                            empty_preventer_text.encode("utf-8")
+                        )
+                    yield empty_preventer_text
+                    first_chunk = False
+                    full_content = EMPTY_CONTENT_PLACEHOLDER
+
+                yield _emit_tool_call_chunk({
+                    "index": next_tool_index,
+                    "id": tool_id,
+                    "type": event.tool_use.get("type", "function"),
+                    "function": {"name": tool_name, "arguments": ""},
+                })
+                streamed_tool_ids.add(tool_id)
+                next_tool_index += 1
+
+            elif event.type == "tool_input":
+                state = tool_streams.get(event.tool_call_id)
+                if not state or state["suppress"] or not event.tool_input_delta:
+                    continue
+                for start in range(
+                    0, len(event.tool_input_delta), TOOL_CALL_ARG_CHUNK_SIZE
+                ):
+                    yield _emit_tool_call_chunk({
+                        "index": state["index"],
+                        "function": {
+                            "arguments": event.tool_input_delta[
+                                start:start + TOOL_CALL_ARG_CHUNK_SIZE
+                            ]
+                        },
+                    })
+
+            elif event.type in ("tool_stop", "tool_use") and event.tool_use:
                 tool = event.tool_use
                 
                 # Extract tool name safely (handle None/missing fields)
@@ -271,8 +365,57 @@ async def stream_kiro_to_openai_internal(
                             # Skip normal tool_use processing
                             continue
                 
-                # Collect tool calls from stream (normal tools, not web_search)
+                # Collect finalized calls for usage, truncation, and fallback
+                # deduplication. Legacy complete tool_use events are emitted here;
+                # incremental tool_stop events were already sent by start/input.
                 tool_calls_from_stream.append(event.tool_use)
+                tool_id, tool_name = _tool_identity(event.tool_use)
+                if tool_id not in streamed_tool_ids:
+                    if first_chunk:
+                        empty_preventer_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": EMPTY_CONTENT_PLACEHOLDER,
+                                },
+                                "finish_reason": None,
+                            }],
+                        }
+                        empty_preventer_text = (
+                            f"data: {json.dumps(empty_preventer_chunk, ensure_ascii=False)}\n\n"
+                        )
+                        if debug_logger:
+                            debug_logger.log_modified_chunk(
+                                empty_preventer_text.encode("utf-8")
+                            )
+                        yield empty_preventer_text
+                        first_chunk = False
+                        full_content = EMPTY_CONTENT_PLACEHOLDER
+
+                    function = event.tool_use.get("function") or {}
+                    tool_args = function.get("arguments") or "{}"
+                    yield _emit_tool_call_chunk({
+                        "index": next_tool_index,
+                        "id": tool_id,
+                        "type": event.tool_use.get("type", "function"),
+                        "function": {"name": tool_name, "arguments": ""},
+                    })
+                    for start in range(0, len(tool_args), TOOL_CALL_ARG_CHUNK_SIZE):
+                        yield _emit_tool_call_chunk({
+                            "index": next_tool_index,
+                            "function": {
+                                "arguments": tool_args[
+                                    start:start + TOOL_CALL_ARG_CHUNK_SIZE
+                                ]
+                            },
+                        })
+                    streamed_tool_ids.add(tool_id)
+                    next_tool_index += 1
             
             elif event.type == "usage" and event.usage:
                 metering_data = event.usage
@@ -287,7 +430,8 @@ async def stream_kiro_to_openai_internal(
         
         # Check bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
-        all_tool_calls = tool_calls_from_stream + bracket_tool_calls
+        xml_tool_calls = parse_xml_tool_calls(full_content)
+        all_tool_calls = tool_calls_from_stream + bracket_tool_calls + xml_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
         
         # Detect content truncation (missing completion signals)
@@ -334,91 +478,30 @@ async def stream_kiro_to_openai_internal(
             prompt_source = "tiktoken"
             total_source = "tiktoken"
         
-        # Send tool calls if present
-        if all_tool_calls:
-            logger.debug(f"Processing {len(all_tool_calls)} tool calls for streaming response")
-            
-            # If no content was sent yet, Cursor might render "(empty placeholder)".
-            # Inject a minimal placeholder as content to prevent this UI bug.
-            if first_chunk:
-                empty_preventer_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": EMPTY_CONTENT_PLACEHOLDER},
-                        "finish_reason": None
-                    }]
-                }
-                empty_preventer_text = f"data: {json.dumps(empty_preventer_chunk, ensure_ascii=False)}\n\n"
-                if debug_logger:
-                    debug_logger.log_modified_chunk(empty_preventer_text.encode('utf-8'))
-                yield empty_preventer_text
-                first_chunk = False
-                full_content = EMPTY_CONTENT_PLACEHOLDER
-            
-            from kiro.converters_core import get_original_tool_name
-            
-            def _emit_tool_call_chunk(delta_tool_call: dict) -> str:
-                """Wrap a single tool_call delta in an OpenAI chunk and log it."""
-                chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"tool_calls": [delta_tool_call]},
-                        "finish_reason": None
-                    }]
-                }
-                text = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                if debug_logger:
-                    debug_logger.log_modified_chunk(text.encode('utf-8'))
-                return text
-            
-            # Stream each tool call as incremental deltas per OpenAI spec:
-            # 1) An opening delta carrying index/id/type/name and empty arguments.
-            # 2) One or more deltas carrying successive slices of the arguments JSON.
-            # Splitting the (potentially very large) arguments string avoids a single
-            # oversized SSE line, which can be buffered/truncated by intermediaries
-            # (e.g. cloudflared) and makes clients like Cursor hang waiting for the
-            # stream to "finish" instead of seeing progressive tool_call deltas.
-            for idx, tc in enumerate(all_tool_calls):
-                # Extract function with None protection
-                func = tc.get("function") or {}
-                # Use "or" for protection against explicit None in values
-                tool_name = func.get("name") or ""
-                tool_args = func.get("arguments") or "{}"
-                
-                # Reverse-map truncated tool names back to originals
-                tool_name = get_original_tool_name(tool_name)
-                
-                logger.debug(f"Tool call [{idx}] '{tool_name}': id={tc.get('id')}, args_length={len(tool_args)}")
-                
-                # Opening delta: identity + empty arguments
+        # Structured calls were already emitted as their upstream lifecycle
+        # arrived. Only text-embedded fallback calls still need end-of-stream
+        # emission because they cannot be recognized safely before completion.
+        for tc in all_tool_calls:
+            tool_id, tool_name = _tool_identity(tc)
+            if tool_id in streamed_tool_ids:
+                continue
+            function = tc.get("function") or {}
+            tool_args = function.get("arguments") or "{}"
+            yield _emit_tool_call_chunk({
+                "index": next_tool_index,
+                "id": tool_id,
+                "type": tc.get("type", "function"),
+                "function": {"name": tool_name, "arguments": ""},
+            })
+            for start in range(0, len(tool_args), TOOL_CALL_ARG_CHUNK_SIZE):
                 yield _emit_tool_call_chunk({
-                    "index": idx,
-                    "id": tc.get("id"),
-                    "type": tc.get("type", "function"),
+                    "index": next_tool_index,
                     "function": {
-                        "name": tool_name,
-                        "arguments": ""
-                    }
+                        "arguments": tool_args[start:start + TOOL_CALL_ARG_CHUNK_SIZE]
+                    },
                 })
-                
-                # Argument deltas: slice the JSON string into bounded pieces.
-                # Empty arguments still need at least one delta so clients that
-                # only look at argument deltas see a complete "{}" (or "").
-                if tool_args:
-                    for start in range(0, len(tool_args), TOOL_CALL_ARG_CHUNK_SIZE):
-                        arg_slice = tool_args[start:start + TOOL_CALL_ARG_CHUNK_SIZE]
-                        yield _emit_tool_call_chunk({
-                            "index": idx,
-                            "function": {"arguments": arg_slice}
-                        })
+            streamed_tool_ids.add(tool_id)
+            next_tool_index += 1
         
         # Save truncation info for recovery (tracked by stable identifiers)
         from kiro.truncation_recovery import should_inject_recovery

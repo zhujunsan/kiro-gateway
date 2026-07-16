@@ -432,6 +432,118 @@ class TestStreamKiroToResponsesToolCalls:
         assert completed["usage"]["total_tokens"] >= completed["usage"]["output_tokens"]
         _assert_monotonic_sequence_numbers(events)
 
+    @pytest.mark.asyncio
+    async def test_upstream_tool_lifecycle_streams_before_completed(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """Responses function arguments follow upstream fragment timing."""
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_start",
+                tool_use={
+                    "id": "call_live",
+                    "type": "function",
+                    "function": {"name": "Write", "arguments": ""},
+                },
+            )
+            yield KiroEvent(
+                type="tool_input",
+                tool_call_id="call_live",
+                tool_input_delta='{"path":',
+            )
+            yield KiroEvent(
+                type="tool_input",
+                tool_call_id="call_live",
+                tool_input_delta='"live.txt"}',
+            )
+            yield KiroEvent(
+                type="tool_stop",
+                tool_use={
+                    "id": "call_live",
+                    "type": "function",
+                    "function": {
+                        "name": "Write",
+                        "arguments": '{"path":"live.txt"}',
+                    },
+                },
+            )
+            yield KiroEvent(type="usage", usage={"credits": 0.1})
+
+        chunks = []
+        with patch("kiro.streaming_responses.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_responses.parse_bracket_tool_calls", return_value=[]):
+                async for chunk in stream_kiro_to_responses(
+                    mock_http_client,
+                    mock_response,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                ):
+                    chunks.append(chunk)
+
+        events = _parse_sse_events(chunks)
+        types = _event_types(events)
+        arg_deltas = [
+            data["delta"]
+            for event_type, data in events
+            if event_type == "response.function_call_arguments.delta"
+        ]
+        assert arg_deltas == ['{"path":', '"live.txt"}']
+        assert types.index("response.output_item.added") < types.index(
+            "response.function_call_arguments.delta"
+        )
+        assert types.index("response.function_call_arguments.done") < types.index(
+            "response.completed"
+        )
+        completed = events[-1][1]["response"]
+        function_call = next(
+            item for item in completed["output"] if item["type"] == "function_call"
+        )
+        assert function_call["arguments"] == '{"path":"live.txt"}'
+        _assert_monotonic_sequence_numbers(events)
+
+    @pytest.mark.asyncio
+    async def test_xml_fallback_emits_function_call_events(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """Legacy XML invoke output is represented as a Responses function call."""
+        xml = (
+            '<invoke name="Shell">'
+            '<parameter name="command">pwd</parameter>'
+            '</invoke>'
+        )
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content=xml)
+            yield KiroEvent(type="usage", usage={"credits": 0.1})
+
+        chunks = []
+        with patch("kiro.streaming_responses.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_responses.parse_bracket_tool_calls", return_value=[]):
+                async for chunk in stream_kiro_to_responses(
+                    mock_http_client,
+                    mock_response,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                ):
+                    chunks.append(chunk)
+
+        events = _parse_sse_events(chunks)
+        function_added = next(
+            data["item"]
+            for event_type, data in events
+            if event_type == "response.output_item.added"
+            and data["item"].get("type") == "function_call"
+        )
+        argument_done = next(
+            data
+            for event_type, data in events
+            if event_type == "response.function_call_arguments.done"
+        )
+        assert function_added["name"] == "Shell"
+        assert json.loads(argument_done["arguments"]) == {"command": "pwd"}
+
 
 # ==================================================================================================
 # collect_stream_response

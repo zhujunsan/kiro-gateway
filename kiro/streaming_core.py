@@ -68,10 +68,12 @@ class KiroEvent:
     This format is API-agnostic and can be converted to both OpenAI and Anthropic formats.
     
     Attributes:
-        type: Event type (content, thinking, tool_use, usage, context_usage, error)
+        type: Event type (content, thinking, tool lifecycle, usage, context_usage, error)
         content: Text content (for content events)
         thinking_content: Thinking/reasoning content (for thinking events)
-        tool_use: Tool use data (for tool_use events)
+        tool_use: Tool identity or finalized data (for tool lifecycle events)
+        tool_call_id: Tool call identifier (for tool input events)
+        tool_input_delta: Incremental JSON argument fragment
         usage: Usage/metering data (for usage events)
         context_usage_percentage: Context usage percentage (for context_usage events)
         is_first_thinking_chunk: Whether this is the first thinking chunk
@@ -81,6 +83,8 @@ class KiroEvent:
     content: Optional[str] = None
     thinking_content: Optional[str] = None
     tool_use: Optional[Dict[str, Any]] = None
+    tool_call_id: Optional[str] = None
+    tool_input_delta: Optional[str] = None
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
     is_first_thinking_chunk: bool = False
@@ -207,13 +211,14 @@ async def parse_kiro_stream(
             if thinking_parser.found_thinking_block:
                 logger.debug("Thinking block processing completed")
         
-        # Check bracket-style tool calls in accumulated content
-        all_tool_calls = parser.get_tool_calls()
-        # Note: bracket tool calls are checked by the caller using full content
-        
-        # Yield tool calls if any
-        for tc in all_tool_calls:
-            yield KiroEvent(type="tool_use", tool_use=tc)
+        # Kiro can occasionally end without an explicit tool stop. Finalize the
+        # pending call here so truncation diagnostics and downstream block
+        # lifecycles still complete.
+        async for event in _process_parser_events(
+            parser.finalize_pending_tool_events(),
+            thinking_parser,
+        ):
+            yield event
             
     except FirstTokenTimeoutError:
         raise
@@ -243,8 +248,23 @@ async def _process_chunk(
     Yields:
         KiroEvent objects
     """
-    events = parser.feed(chunk)
-    
+    async for event in _process_parser_events(parser.feed(chunk), thinking_parser):
+        yield event
+
+
+async def _process_parser_events(
+    events: List[Dict[str, Any]],
+    thinking_parser: Optional[ThinkingParser],
+) -> AsyncGenerator[KiroEvent, None]:
+    """Convert low-level parser events into unified streaming events.
+
+    Args:
+        events: Events returned by ``AwsEventStreamParser``.
+        thinking_parser: Optional parser for fake reasoning blocks.
+
+    Yields:
+        Unified events, including incremental tool lifecycle events.
+    """
     for event in events:
         if event["type"] == "content":
             content = event["data"]
@@ -286,6 +306,20 @@ async def _process_chunk(
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
 
+        elif event["type"] == "tool_start":
+            yield KiroEvent(type="tool_start", tool_use=event["data"])
+
+        elif event["type"] == "tool_input":
+            data = event["data"]
+            yield KiroEvent(
+                type="tool_input",
+                tool_call_id=data.get("tool_call_id"),
+                tool_input_delta=data.get("arguments_delta", ""),
+            )
+
+        elif event["type"] == "tool_stop":
+            yield KiroEvent(type="tool_stop", tool_use=event["data"])
+
 
 # ==================================================================================================
 # Full Response Collection
@@ -320,7 +354,7 @@ async def collect_stream_to_result(
         elif event.type == "thinking" and event.thinking_content:
             result.thinking_content += event.thinking_content
             full_content_for_bracket_tools += event.thinking_content
-        elif event.type == "tool_use" and event.tool_use:
+        elif event.type in ("tool_stop", "tool_use") and event.tool_use:
             result.tool_calls.append(event.tool_use)
         elif event.type == "usage" and event.usage:
             result.usage = event.usage

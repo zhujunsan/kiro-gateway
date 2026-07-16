@@ -5,6 +5,8 @@ Unit tests for AwsEventStreamParser and auxiliary parsing functions.
 Tests the parsing logic for AWS SSE stream from Kiro API.
 """
 
+import json
+
 import pytest
 
 from kiro.parsers import (
@@ -832,7 +834,14 @@ class TestAwsEventStreamParserToolCalls:
         print(f"Result: {events}")
         print(f"current_tool_call: {aws_event_parser.current_tool_call}")
         
-        # tool_start doesn't return event, but creates current_tool_call
+        assert events == [{
+            "type": "tool_start",
+            "data": {
+                "id": "call_123",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": ""},
+            },
+        }]
         assert aws_event_parser.current_tool_call is not None
         assert aws_event_parser.current_tool_call["function"]["name"] == "get_weather"
     
@@ -845,9 +854,16 @@ class TestAwsEventStreamParserToolCalls:
         aws_event_parser.feed(b'{"name":"func","toolUseId":"call_1"}')
         
         print("Action: Parsing input...")
-        aws_event_parser.feed(b'{"input":"{\\"key\\": \\"value\\"}"}')
+        events = aws_event_parser.feed(b'{"input":"{\\"key\\": \\"value\\"}"}')
         
         print(f"current_tool_call: {aws_event_parser.current_tool_call}")
+        assert events == [{
+            "type": "tool_input",
+            "data": {
+                "tool_call_id": "call_1",
+                "arguments_delta": '{"key": "value"}',
+            },
+        }]
         assert '{"key": "value"}' in aws_event_parser.current_tool_call["function"]["arguments"]
     
     def test_parses_tool_stop_event(self, aws_event_parser):
@@ -860,11 +876,57 @@ class TestAwsEventStreamParserToolCalls:
         aws_event_parser.feed(b'{"input":"{}"}')
         
         print("Action: Parsing stop...")
-        aws_event_parser.feed(b'{"stop":true}')
+        events = aws_event_parser.feed(b'{"stop":true}')
         
         print(f"tool_calls: {aws_event_parser.tool_calls}")
+        assert events[0]["type"] == "tool_stop"
+        assert events[0]["data"]["id"] == "call_1"
         assert len(aws_event_parser.tool_calls) == 1
         assert aws_event_parser.current_tool_call is None
+
+    def test_dict_input_fragments_form_valid_incremental_json(self, aws_event_parser):
+        """
+        What it does: Streams multiple dict-shaped input fragments as JSON deltas.
+        Goal: Ensure concatenated deltas are valid and equal the finalized arguments.
+        """
+        events = []
+        events.extend(aws_event_parser.feed(
+            b'{"name":"func","toolUseId":"call_dict","input":{"a":1}}'
+        ))
+        events.extend(aws_event_parser.feed(b'{"input":{"b":"two"}}'))
+        events.extend(aws_event_parser.feed(b'{"stop":true}'))
+
+        deltas = [
+            event["data"]["arguments_delta"]
+            for event in events
+            if event["type"] == "tool_input"
+        ]
+        streamed_arguments = "".join(deltas)
+        stop_event = next(event for event in events if event["type"] == "tool_stop")
+
+        assert json.loads(streamed_arguments) == {"a": 1, "b": "two"}
+        assert streamed_arguments == stop_event["data"]["function"]["arguments"]
+
+    def test_empty_input_emits_complete_empty_object_delta(self, aws_event_parser):
+        """
+        What it does: Finalizes a tool that received no input events.
+        Goal: Ensure delta-only clients still reconstruct an empty JSON object.
+        """
+        events = []
+        events.extend(aws_event_parser.feed(
+            b'{"name":"no_args","toolUseId":"call_empty"}'
+        ))
+        events.extend(aws_event_parser.feed(b'{"stop":true}'))
+
+        deltas = [
+            event["data"]["arguments_delta"]
+            for event in events
+            if event["type"] == "tool_input"
+        ]
+        stop_event = next(event for event in events if event["type"] == "tool_stop")
+
+        assert deltas == ["{}"]
+        assert stop_event["data"]["function"]["arguments"] == "{}"
     
     def test_get_tool_calls_returns_all(self, aws_event_parser):
         """

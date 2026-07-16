@@ -45,7 +45,7 @@ optional list-shaped request_messages/request_tools for token fallback.
 import json
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import HTTPException
@@ -56,7 +56,7 @@ from kiro.config import (
     FIRST_TOKEN_MAX_RETRIES,
     FIRST_TOKEN_TIMEOUT,
 )
-from kiro.parsers import deduplicate_tool_calls, parse_bracket_tool_calls
+from kiro.parsers import deduplicate_tool_calls, parse_bracket_tool_calls, parse_xml_tool_calls
 from kiro.streaming_core import (
     FirstTokenTimeoutError,
     calculate_tokens_from_context_usage,
@@ -298,6 +298,9 @@ async def stream_kiro_to_responses_internal(
     full_content = ""
     full_thinking_content = ""
     tool_calls_from_stream: List[Dict[str, Any]] = []
+    tool_streams: Dict[str, Dict[str, Any]] = {}
+    streamed_tool_ids = set()
+    streamed_function_items: List[Tuple[int, Dict[str, Any]]] = []
     message_item_started = False
     reasoning_item_started = False
     reasoning_item_closed = False
@@ -563,7 +566,105 @@ async def stream_kiro_to_responses_internal(
                     )
                 # else (remove): keep full_thinking_content for token counting only
 
-            elif event.type == "tool_use" and event.tool_use:
+            elif event.type == "tool_start" and event.tool_use:
+                for close_evt in close_reasoning_item_events():
+                    yield close_evt
+
+                from kiro.converters_core import get_original_tool_name
+
+                tool = event.tool_use
+                function = tool.get("function") or {}
+                tool_id = tool.get("id") or generate_function_call_item_id()
+                tool_name = get_original_tool_name(
+                    function.get("name") or tool.get("name") or ""
+                )
+                suppress = tool_name == "web_search"
+                output_index = next_output_index
+                next_output_index += 1
+                item_id = generate_function_call_item_id()
+                tool_streams[tool_id] = {
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "name": tool_name,
+                    "suppress": suppress,
+                }
+                if suppress:
+                    # The emulated web search becomes message text, so it must
+                    # not reserve a function-call output slot.
+                    next_output_index -= 1
+                    continue
+
+                yield format_sse_event(
+                    "response.output_item.added",
+                    {
+                        "output_index": output_index,
+                        "item": _function_call_item(
+                            item_id,
+                            tool_id,
+                            tool_name,
+                            "",
+                            status="in_progress",
+                        ),
+                        "sequence_number": next_seq(),
+                    },
+                )
+                streamed_tool_ids.add(tool_id)
+
+            elif event.type == "tool_input":
+                state = tool_streams.get(event.tool_call_id or "")
+                if not state or state["suppress"] or not event.tool_input_delta:
+                    continue
+                for start in range(
+                    0, len(event.tool_input_delta), FUNCTION_CALL_ARG_CHUNK_SIZE
+                ):
+                    yield format_sse_event(
+                        "response.function_call_arguments.delta",
+                        {
+                            "item_id": state["item_id"],
+                            "output_index": state["output_index"],
+                            "delta": event.tool_input_delta[
+                                start:start + FUNCTION_CALL_ARG_CHUNK_SIZE
+                            ],
+                            "sequence_number": next_seq(),
+                        },
+                    )
+
+            elif event.type in ("tool_stop", "tool_use") and event.tool_use:
+                tool_id_from_event = event.tool_use.get("id")
+                stream_state = tool_streams.pop(tool_id_from_event, None)
+                if stream_state and not stream_state["suppress"]:
+                    tool_calls_from_stream.append(event.tool_use)
+                    normalized = _normalize_tool_call(event.tool_use)
+                    yield format_sse_event(
+                        "response.function_call_arguments.done",
+                        {
+                            "item_id": stream_state["item_id"],
+                            "output_index": stream_state["output_index"],
+                            "name": stream_state["name"],
+                            "arguments": normalized["arguments"],
+                            "sequence_number": next_seq(),
+                        },
+                    )
+                    done_item = _function_call_item(
+                        stream_state["item_id"],
+                        normalized["call_id"],
+                        stream_state["name"],
+                        normalized["arguments"],
+                        status="completed",
+                    )
+                    yield format_sse_event(
+                        "response.output_item.done",
+                        {
+                            "output_index": stream_state["output_index"],
+                            "item": done_item,
+                            "sequence_number": next_seq(),
+                        },
+                    )
+                    streamed_function_items.append(
+                        (stream_state["output_index"], done_item)
+                    )
+                    continue
+
                 for close_evt in close_reasoning_item_events():
                     yield close_evt
 
@@ -653,7 +754,10 @@ async def stream_kiro_to_responses_internal(
         stream_completed_normally = received_usage or received_context_usage
 
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
-        all_tool_calls = deduplicate_tool_calls(tool_calls_from_stream + bracket_tool_calls)
+        xml_tool_calls = parse_xml_tool_calls(full_content)
+        all_tool_calls = deduplicate_tool_calls(
+            tool_calls_from_stream + bracket_tool_calls + xml_tool_calls
+        )
 
         # Kiro has no hard max_output_tokens API. Abrupt stream end without
         # usage/context_usage (and with content, no tools) is treated as
@@ -796,15 +900,19 @@ async def stream_kiro_to_responses_internal(
             )
             output_items.append(msg_item)
 
-        # Emit function_call items (added → arg deltas → args done → item done)
-        # Use indices after message / reasoning already assigned during stream.
+        # Incrementally streamed function items have already completed on the
+        # wire; include them in the final response output in index order.
+        for _, item in sorted(streamed_function_items, key=lambda entry: entry[0]):
+            output_items.append(item)
+
+        # Text-embedded fallback and legacy complete events still arrive as full
+        # calls. Emit only those that did not have a live start/input lifecycle.
         fc_output_index = next_output_index
-        if message_item_started or (full_content and not all_tool_calls):
-            # message already consumed an index during stream (or just above)
-            fc_output_index = max(next_output_index, message_output_index + 1)
 
         for tc in all_tool_calls:
             normalized = _normalize_tool_call(tc)
+            if normalized["call_id"] in streamed_tool_ids:
+                continue
             fc_item_id = generate_function_call_item_id()
             added_item = _function_call_item(
                 fc_item_id,

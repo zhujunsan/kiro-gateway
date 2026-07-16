@@ -380,15 +380,13 @@ class AwsEventStreamParser:
             
             try:
                 data = json.loads(json_str)
-                event = self._process_event(data, earliest_type)
-                if event:
-                    events.append(event)
+                events.extend(self._process_event(data, earliest_type))
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse JSON: {json_str[:100]}")
         
         return events
     
-    def _process_event(self, data: dict, event_type: str) -> Optional[Dict[str, Any]]:
+    def _process_event(self, data: dict, event_type: str) -> List[Dict[str, Any]]:
         """
         Processes a parsed event.
         
@@ -397,10 +395,12 @@ class AwsEventStreamParser:
             event_type: Event type
         
         Returns:
-            Processed event or None
+            Processed events. A single upstream tool event can produce multiple
+            lifecycle events (for example start + input delta + stop).
         """
         if event_type == 'content':
-            return self._process_content_event(data)
+            event = self._process_content_event(data)
+            return [event] if event else []
         elif event_type == 'tool_start':
             return self._process_tool_start_event(data)
         elif event_type == 'tool_input':
@@ -408,11 +408,11 @@ class AwsEventStreamParser:
         elif event_type == 'tool_stop':
             return self._process_tool_stop_event(data)
         elif event_type == 'usage':
-            return {"type": "usage", "data": data.get('usage', 0)}
+            return [{"type": "usage", "data": data.get('usage', 0)}]
         elif event_type == 'context_usage':
-            return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
+            return [{"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}]
         
-        return None
+        return []
     
     def _process_content_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes content event."""
@@ -430,10 +430,11 @@ class AwsEventStreamParser:
         
         return {"type": "content", "data": content}
     
-    def _process_tool_start_event(self, data: dict) -> Optional[Dict[str, Any]]:
-        """Processes tool call start."""
+    def _process_tool_start_event(self, data: dict) -> List[Dict[str, Any]]:
+        """Process a tool call start and expose its lifecycle immediately."""
+        events: List[Dict[str, Any]] = []
         if self.current_tool_call:
-            self._finalize_tool_call()
+            events.extend(self.finalize_pending_tool_events())
 
         input_data = data.get('input', '')
 
@@ -444,47 +445,166 @@ class AwsEventStreamParser:
                 "name": data.get('name', ''),
                 "arguments": ''
             },
-            "_args_dict": input_data if isinstance(input_data, dict) else None
+            "_args_dict": {},
+            "_input_mode": None,
+            "_streamed_arguments": "",
+            "_dict_stream_started": False,
         }
-        # If input was a non-dict string, seed the string buffer
-        if not isinstance(input_data, dict):
-            self.current_tool_call['function']['arguments'] = str(input_data) if input_data else ''
+
+        events.append({
+            "type": "tool_start",
+            "data": self._tool_call_identity(self.current_tool_call),
+        })
+
+        input_delta = self._append_tool_input(input_data)
+        if input_delta:
+            events.append({
+                "type": "tool_input",
+                "data": {
+                    "tool_call_id": self.current_tool_call["id"],
+                    "arguments_delta": input_delta,
+                },
+            })
 
         if data.get('stop'):
-            self._finalize_tool_call()
+            events.extend(self.finalize_pending_tool_events())
 
-        return None
+        return events
 
-    def _process_tool_input_event(self, data: dict) -> Optional[Dict[str, Any]]:
-        """Processes input continuation for tool call."""
+    def _process_tool_input_event(self, data: dict) -> List[Dict[str, Any]]:
+        """Process and expose an input continuation for the current tool call."""
+        if not self.current_tool_call:
+            return []
+
+        input_delta = self._append_tool_input(data.get('input', ''))
+        if not input_delta:
+            return []
+
+        return [{
+            "type": "tool_input",
+            "data": {
+                "tool_call_id": self.current_tool_call["id"],
+                "arguments_delta": input_delta,
+            },
+        }]
+    
+    def _process_tool_stop_event(self, data: dict) -> List[Dict[str, Any]]:
+        """Process a tool call end and expose the finalized tool call."""
+        if self.current_tool_call and data.get('stop'):
+            return self.finalize_pending_tool_events()
+        return []
+
+    @staticmethod
+    def _tool_call_identity(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the public identity fields needed to start downstream streams."""
+        function = tool_call.get("function") or {}
+        return {
+            "id": tool_call.get("id"),
+            "type": tool_call.get("type", "function"),
+            "function": {
+                "name": function.get("name", ""),
+                "arguments": "",
+            },
+        }
+
+    def _append_tool_input(self, input_data: Any) -> str:
+        """Append upstream tool input and return a downstream-safe JSON delta.
+
+        String inputs are already JSON fragments and are passed through. Dict
+        inputs are encoded as one incrementally constructed JSON object so that
+        concatenating every returned delta always produces valid JSON.
+        """
+        if not self.current_tool_call or input_data in ("", None):
+            return ""
+
+        mode = self.current_tool_call.get("_input_mode")
+        if isinstance(input_data, dict):
+            if mode is None:
+                mode = "dict"
+                self.current_tool_call["_input_mode"] = mode
+            if mode != "dict":
+                logger.warning("Ignoring dict tool input after string fragments")
+                return ""
+            if not input_data:
+                return ""
+
+            args_dict = self.current_tool_call["_args_dict"]
+            args_dict.update(input_data)
+            encoded_items = [
+                f"{json.dumps(key, ensure_ascii=False)}:"
+                f"{json.dumps(value, ensure_ascii=False, separators=(',', ':'))}"
+                for key, value in input_data.items()
+            ]
+            prefix = "," if self.current_tool_call["_dict_stream_started"] else "{"
+            self.current_tool_call["_dict_stream_started"] = True
+            delta = prefix + ",".join(encoded_items)
+            self.current_tool_call["_streamed_arguments"] += delta
+            return delta
+
+        if mode is None:
+            mode = "string"
+            self.current_tool_call["_input_mode"] = mode
+        if mode != "string":
+            logger.warning("Ignoring string tool input after dict fragments")
+            return ""
+
+        input_delta = str(input_data)
+        self.current_tool_call["function"]["arguments"] += input_delta
+        self.current_tool_call["_streamed_arguments"] += input_delta
+        return input_delta
+
+    def finalize_pending_tool_events(self) -> List[Dict[str, Any]]:
+        """Finalize the current tool and return any closing delta plus stop event."""
+        if not self.current_tool_call:
+            return []
+
+        events: List[Dict[str, Any]] = []
+        tool_call_id = self.current_tool_call.get("id")
+        if self.current_tool_call.get("_input_mode") == "dict":
+            if self.current_tool_call.get("_dict_stream_started"):
+                closing_delta = "}"
+            else:
+                closing_delta = "{}"
+            self.current_tool_call["_streamed_arguments"] += closing_delta
+            events.append({
+                "type": "tool_input",
+                "data": {
+                    "tool_call_id": tool_call_id,
+                    "arguments_delta": closing_delta,
+                },
+            })
+        elif not self.current_tool_call.get("_streamed_arguments"):
+            # Empty-input tools still need a complete JSON argument stream for
+            # clients that only assemble input from delta events.
+            events.append({
+                "type": "tool_input",
+                "data": {
+                    "tool_call_id": tool_call_id,
+                    "arguments_delta": "{}",
+                },
+            })
+
+        finalized = self._finalize_tool_call()
+        if finalized:
+            events.append({"type": "tool_stop", "data": finalized})
+        return events
+    
+    def _finalize_tool_call(self) -> Optional[Dict[str, Any]]:
+        """Finalize the current tool call, store it, and return a public copy."""
         if not self.current_tool_call:
             return None
-        input_data = data.get('input', '')
-        if isinstance(input_data, dict) and input_data:
-            if self.current_tool_call['_args_dict'] is None:
-                self.current_tool_call['_args_dict'] = {}
-            self.current_tool_call['_args_dict'].update(input_data)
-        else:
-            input_str = str(input_data) if input_data else ''
-            if input_str:
-                self.current_tool_call['function']['arguments'] += input_str
-        return None
-    
-    def _process_tool_stop_event(self, data: dict) -> Optional[Dict[str, Any]]:
-        """Processes tool call end."""
-        if self.current_tool_call and data.get('stop'):
-            self._finalize_tool_call()
-        return None
-    
-    def _finalize_tool_call(self) -> None:
-        """Finalizes current tool call and adds to list."""
-        if not self.current_tool_call:
-            return
 
-        # Remove internal accumulator — serialize if populated
+        # Remove internal accumulators. Dict fragments were encoded as an open
+        # object plus property deltas and a closing brace by
+        # finalize_pending_tool_events().
         args_dict = self.current_tool_call.pop('_args_dict', None)
-        if args_dict:
-            self.current_tool_call['function']['arguments'] = json.dumps(args_dict)
+        input_mode = self.current_tool_call.pop('_input_mode', None)
+        streamed_arguments = self.current_tool_call.pop('_streamed_arguments', "")
+        self.current_tool_call.pop('_dict_stream_started', None)
+        if input_mode == "dict":
+            self.current_tool_call['function']['arguments'] = (
+                streamed_arguments or json.dumps(args_dict or {}, ensure_ascii=False)
+            )
 
         # Try to parse and normalize arguments as JSON
         args = self.current_tool_call['function']['arguments']
@@ -496,8 +616,6 @@ class AwsEventStreamParser:
             if args.strip():
                 try:
                     parsed = json.loads(args)
-                    # Ensure result is a JSON string
-                    self.current_tool_call['function']['arguments'] = json.dumps(parsed)
                     logger.debug(f"Tool '{tool_name}' arguments parsed successfully: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)}")
                 except json.JSONDecodeError as e:
                     # Analyze the failure to provide better diagnostics
@@ -539,8 +657,10 @@ class AwsEventStreamParser:
             logger.warning(f"Tool '{tool_name}' has unexpected arguments type: {type(args)}")
             self.current_tool_call['function']['arguments'] = "{}"
         
-        self.tool_calls.append(self.current_tool_call)
+        finalized_tool_call = self.current_tool_call
+        self.tool_calls.append(finalized_tool_call)
         self.current_tool_call = None
+        return finalized_tool_call
     
     def _diagnose_json_truncation(self, json_str: str) -> Dict[str, Any]:
         """
@@ -639,7 +759,7 @@ class AwsEventStreamParser:
             List of unique tool calls
         """
         if self.current_tool_call:
-            self._finalize_tool_call()
+            self.finalize_pending_tool_events()
         return deduplicate_tool_calls(self.tool_calls)
     
     def reset(self) -> None:

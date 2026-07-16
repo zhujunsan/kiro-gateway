@@ -187,3 +187,108 @@ async def test_multiple_tool_calls_keep_separate_indices(monkeypatch):
     assert [tc["id"] for tc in tool_calls] == ["toolu_a", "toolu_b"]
     assert json.loads(tool_calls[0]["function"]["arguments"]) == {"path": "a.txt"}
     assert json.loads(tool_calls[1]["function"]["arguments"]) == {"glob": "*.py"}
+
+
+@pytest.mark.asyncio
+async def test_upstream_tool_lifecycle_is_forwarded_before_stream_end(monkeypatch):
+    """Tool start and argument fragments must be emitted in arrival order."""
+    events = [
+        KiroEvent(
+            type="tool_start",
+            tool_use={
+                "id": "toolu_live",
+                "type": "function",
+                "function": {"name": "Write", "arguments": ""},
+            },
+        ),
+        KiroEvent(
+            type="tool_input",
+            tool_call_id="toolu_live",
+            tool_input_delta='{"path":',
+        ),
+        KiroEvent(
+            type="tool_input",
+            tool_call_id="toolu_live",
+            tool_input_delta='"live.txt"}',
+        ),
+        KiroEvent(
+            type="tool_stop",
+            tool_use={
+                "id": "toolu_live",
+                "type": "function",
+                "function": {
+                    "name": "Write",
+                    "arguments": '{"path":"live.txt"}',
+                },
+            },
+        ),
+        KiroEvent(type="usage", usage={"credits": 0.1}),
+    ]
+    _patch_stream(monkeypatch, events)
+
+    chunks = await _collect_sse(streaming_openai.stream_kiro_to_openai_internal(
+        client=None,
+        response=_FakeResponse(),
+        model="claude-sonnet-4",
+        model_cache=_FakeModelCache(),
+        auth_manager=None,
+    ))
+
+    tool_deltas = [
+        data["choices"][0]["delta"]["tool_calls"][0]
+        for _raw, data in chunks
+        if data is not None
+        and "tool_calls" in data["choices"][0]["delta"]
+    ]
+    assert tool_deltas[0]["function"]["name"] == "Write"
+    assert "".join(
+        delta["function"].get("arguments", "")
+        for delta in tool_deltas[1:]
+    ) == '{"path":"live.txt"}'
+
+    final_index = next(
+        index
+        for index, (_raw, data) in enumerate(chunks)
+        if data is not None and data["choices"][0]["finish_reason"] == "tool_calls"
+    )
+    last_tool_index = max(
+        index
+        for index, (_raw, data) in enumerate(chunks)
+        if data is not None and "tool_calls" in data["choices"][0]["delta"]
+    )
+    assert last_tool_index < final_index
+
+
+@pytest.mark.asyncio
+async def test_xml_fallback_is_returned_as_streamed_tool_call(monkeypatch):
+    """Legacy XML tool output must still become OpenAI tool_call SSE deltas."""
+    xml = (
+        '<invoke name="Shell">'
+        '<parameter name="command">pwd</parameter>'
+        '</invoke>'
+    )
+    _patch_stream(monkeypatch, [
+        KiroEvent(type="content", content=xml),
+        KiroEvent(type="usage", usage={"credits": 0.1}),
+    ])
+
+    chunks = await _collect_sse(streaming_openai.stream_kiro_to_openai_internal(
+        client=None,
+        response=_FakeResponse(),
+        model="claude-sonnet-4",
+        model_cache=_FakeModelCache(),
+        auth_manager=None,
+    ))
+    tool_deltas = [
+        data["choices"][0]["delta"]["tool_calls"][0]
+        for _raw, data in chunks
+        if data is not None
+        and "tool_calls" in data["choices"][0]["delta"]
+    ]
+
+    assert tool_deltas[0]["function"]["name"] == "Shell"
+    arguments = "".join(
+        delta["function"].get("arguments", "")
+        for delta in tool_deltas[1:]
+    )
+    assert json.loads(arguments) == {"command": "pwd"}

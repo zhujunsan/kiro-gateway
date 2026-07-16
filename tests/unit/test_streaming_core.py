@@ -440,16 +440,28 @@ class TestParseKiroStream:
         print("✓ Context usage events parsed correctly")
     
     @pytest.mark.asyncio
-    async def test_yields_tool_calls_at_end(self, mock_response, mock_parser):
+    async def test_yields_tool_lifecycle_incrementally(self, mock_response, mock_parser):
         """
-        What it does: Yields tool calls collected during parsing.
-        Goal: Verify tool calls are yielded as events.
+        What it does: Yields start, input, and stop events from the parser.
+        Goal: Verify tool calls are exposed without waiting for end collection.
         """
-        print("Setup: Mock parser with tool calls...")
-        mock_parser.feed.return_value = [{"type": "content", "data": "text"}]
-        mock_parser.get_tool_calls.return_value = [
-            {"id": "call_1", "function": {"name": "func1", "arguments": "{}"}}
+        tool = {"id": "call_1", "function": {"name": "func1", "arguments": "{}"}}
+        mock_parser.feed.return_value = [
+            {
+                "type": "tool_start",
+                "data": {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "func1", "arguments": ""},
+                },
+            },
+            {
+                "type": "tool_input",
+                "data": {"tool_call_id": "call_1", "arguments_delta": "{}"},
+            },
+            {"type": "tool_stop", "data": tool},
         ]
+        mock_parser.finalize_pending_tool_events.return_value = []
         
         async def mock_aiter_bytes():
             yield b'chunk1'
@@ -465,11 +477,12 @@ class TestParseKiroStream:
                     events.append(event)
         
         print(f"Received {len(events)} events")
-        tool_events = [e for e in events if e.type == "tool_use"]
-        
-        assert len(tool_events) == 1
-        assert tool_events[0].tool_use["id"] == "call_1"
-        print("✓ Tool calls yielded correctly")
+        assert [event.type for event in events] == [
+            "tool_start", "tool_input", "tool_stop"
+        ]
+        assert events[1].tool_input_delta == "{}"
+        assert events[2].tool_use["id"] == "call_1"
+        print("✓ Tool lifecycle yielded incrementally")
     
     @pytest.mark.asyncio
     async def test_raises_timeout_on_first_token(self, mock_response):
@@ -814,10 +827,29 @@ class TestCollectStreamToResult:
         Goal: Verify tool calls are accumulated correctly.
         """
         print("Setup: Mock parser with tool calls...")
-        mock_parser.feed.return_value = [{"type": "content", "data": "text"}]
-        mock_parser.get_tool_calls.return_value = [
-            {"id": "call_1", "function": {"name": "func1", "arguments": "{}"}}
+        mock_parser.feed.return_value = [
+            {"type": "content", "data": "text"},
+            {
+                "type": "tool_start",
+                "data": {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "func1", "arguments": ""},
+                },
+            },
+            {
+                "type": "tool_input",
+                "data": {"tool_call_id": "call_1", "arguments_delta": "{}"},
+            },
+            {
+                "type": "tool_stop",
+                "data": {
+                    "id": "call_1",
+                    "function": {"name": "func1", "arguments": "{}"},
+                },
+            },
         ]
+        mock_parser.finalize_pending_tool_events.return_value = []
         
         async def mock_aiter_bytes():
             yield b'chunk1'
