@@ -2541,3 +2541,49 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print("✅ max_tokens is NOT required for count_tokens")
+
+class TestInvalidModelExpectedResponse:
+    """Anthropic model entitlement errors are client-actionable in both modes."""
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_invalid_model_returns_invalid_request_not_service_failure(
+        self, test_client, valid_proxy_api_key, stream
+    ):
+        account = test_client.app.state.account_manager.get_first_account()
+        manager = test_client.app.state.account_manager
+        upstream = AsyncMock()
+        upstream.status_code = 400
+        upstream.aread = AsyncMock(return_value=(
+            b'{"message":"Invalid model ID.",'
+            b'"reason":"INVALID_MODEL_ID"}'
+        ))
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(return_value=upstream)
+        client.close = AsyncMock()
+        client.client = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = True
+        try:
+            with patch.object(
+                manager, "get_next_account", new=AsyncMock(return_value=account)
+            ), patch.object(
+                manager, "report_failure", new=AsyncMock()
+            ), patch("kiro.routes_anthropic.KiroHttpClient", return_value=client):
+                response = test_client.post(
+                    "/v1/messages",
+                    headers={"x-api-key": valid_proxy_api_key},
+                    json={
+                        "model": "future-model-from-client",
+                        "max_tokens": 32,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": stream,
+                    },
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert "GET /v1/models" in error["message"]
+        assert client.request_with_retry.await_count == 1

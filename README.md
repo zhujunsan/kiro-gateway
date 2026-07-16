@@ -339,6 +339,10 @@ For a single account, failover doesn't work — you get the original error from 
 
 For complete configuration examples (including per-account region settings), see [`credentials.json.example`](credentials.json.example).
 
+### Dynamic Model Discovery Cache
+
+Generation requests continue to use `runtime.{region}.kiro.dev`, while model discovery uses the separate `q.{region}.amazonaws.com/ListAvailableModels` endpoint. Discovery happens only when a client requests `GET /v1/models` or `GET /v1/responses/models`, never during startup, chat, Messages, Responses generation, or a background task. Each account makes at most one discovery attempt per four-hour window. A first failure serves `FALLBACK_MODELS`; a failed refresh preserves the stale dynamic list. Both failure paths start a new four-hour window. Set `MODEL_DISCOVERY_CACHE_TTL_SECONDS` (default `14400`) only if you need a different interval.
+
 ---
 
 ## 🐳 Docker Deployment

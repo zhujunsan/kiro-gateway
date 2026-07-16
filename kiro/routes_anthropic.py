@@ -55,6 +55,11 @@ from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
+from kiro.kiro_errors import (
+    build_anthropic_error_response,
+    get_kiro_incident_classification,
+    is_expected_upstream_rejection,
+)
 
 # Import debug_logger
 try:
@@ -325,6 +330,7 @@ async def messages(
         
         last_error_message = None
         last_error_status = None
+        last_error_info = None
         tried_accounts = set()  # Track tried accounts in current failover loop
         
         for attempt in range(MAX_ATTEMPTS):
@@ -335,7 +341,26 @@ async def messages(
             )
             
             if account is None:
-                # All accounts unavailable
+                # Preserve expected model/account feedback as HTTP 400 instead
+                # of converting exhausted failover into a service-level 503.
+                if (
+                    last_error_info is not None
+                    and last_error_status is not None
+                    and is_expected_upstream_rejection(last_error_info, last_error_status)
+                ):
+                    if debug_logger:
+                        src, code, phase = get_kiro_incident_classification(
+                            last_error_info, last_error_status
+                        )
+                        debug_logger.flush_on_error(
+                            last_error_status, last_error_message, source=src,
+                            code=code, phase=phase,
+                            upstream_status=last_error_status,
+                        )
+                    status, body = build_anthropic_error_response(
+                        last_error_info, last_error_status
+                    )
+                    return JSONResponse(status_code=status, content=body)
                 if len(all_accounts) == 1:
                     # Single account - return original error with original status code
                     return JSONResponse(
@@ -535,11 +560,13 @@ async def messages(
                     # Extract error reason and save for final return
                     error_reason = None
                     error_info = None
+                    last_error_info = None
                     try:
                         error_json = json.loads(error_text)
                         from kiro.kiro_errors import enhance_kiro_error
                         error_info = enhance_kiro_error(error_json)
                         error_reason = error_info.reason
+                        last_error_info = error_info
                         last_error_message = error_info.user_message
                         last_error_status = response.status_code
                         logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
@@ -560,18 +587,25 @@ async def messages(
                         logger.warning(f"HTTP {response.status_code} - POST /v1/messages - {last_error_message[:100]}")
                         
                         if debug_logger:
+                            if error_info is not None:
+                                src, code, phase = get_kiro_incident_classification(
+                                    error_info, response.status_code
+                                )
+                            else:
+                                src, code, phase = (
+                                    "kiro_upstream",
+                                    error_reason or f"http_{response.status_code}",
+                                    "response_parse",
+                                )
                             debug_logger.flush_on_error(
-                            response.status_code, last_error_message,
-                            source="kiro_upstream",
-                            code=(error_reason or f"http_{response.status_code}"),
-                            phase="response_parse",
-                            upstream_status=response.status_code,
-                        )
+                                response.status_code, last_error_message, source=src,
+                                code=code, phase=phase,
+                                upstream_status=response.status_code,
+                            )
                         
                         # Normalize context-length errors to the canonical
                         # invalid_request_error shape so clients can react.
                         if error_info is not None:
-                            from kiro.kiro_errors import build_anthropic_error_response
                             resp_status, resp_body = build_anthropic_error_response(
                                 error_info, response.status_code
                             )
@@ -655,7 +689,24 @@ async def messages(
                     }
                 )
         
-        # All attempts exhausted
+        # All attempts exhausted. Return expected model rejection unchanged.
+        if (
+            last_error_info is not None
+            and last_error_status is not None
+            and is_expected_upstream_rejection(last_error_info, last_error_status)
+        ):
+            if debug_logger:
+                src, code, phase = get_kiro_incident_classification(
+                    last_error_info, last_error_status
+                )
+                debug_logger.flush_on_error(
+                    last_error_status, last_error_message, source=src, code=code,
+                    phase=phase, upstream_status=last_error_status,
+                )
+            status, body = build_anthropic_error_response(
+                last_error_info, last_error_status
+            )
+            return JSONResponse(status_code=status, content=body)
         if len(all_accounts) == 1:
             # Single account - return its original error
             # last_error_status and last_error_message are guaranteed to be set
@@ -810,18 +861,23 @@ async def messages(
             
             # Flush debug logs on error
             if debug_logger:
+                if error_info is not None:
+                    src, code, phase = get_kiro_incident_classification(
+                        error_info, response.status_code
+                    )
+                else:
+                    src, code, phase = (
+                        "kiro_upstream", f"http_{response.status_code}",
+                        "response_parse",
+                    )
                 debug_logger.flush_on_error(
-                response.status_code, error_message,
-                source="kiro_upstream",
-                code=f"http_{response.status_code}",
-                phase="response_parse",
-                upstream_status=response.status_code,
-            )
+                    response.status_code, error_message, source=src, code=code,
+                    phase=phase, upstream_status=response.status_code,
+                )
             
             # Return error in Anthropic format. Context-length errors are
             # normalized to invalid_request_error so clients can react.
             if error_info is not None:
-                from kiro.kiro_errors import build_anthropic_error_response
                 resp_status, resp_body = build_anthropic_error_response(
                     error_info, response.status_code
                 )

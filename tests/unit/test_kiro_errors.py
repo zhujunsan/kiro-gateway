@@ -14,7 +14,11 @@ from kiro.kiro_errors import (
     build_openai_error_response,
     build_anthropic_error_response,
     OPENAI_CONTEXT_LENGTH_CODE,
+    OPENAI_MODEL_NOT_AVAILABLE_CODE,
+    OPENAI_CAPACITY_CODE,
     CONTEXT_LENGTH_REASON,
+    get_kiro_incident_classification,
+    is_expected_upstream_rejection,
 )
 
 
@@ -155,8 +159,13 @@ class TestEnhanceKiroErrorInvalidModelId:
         error_info = enhance_kiro_error(error_json)
         
         print("Verification: User message is enhanced...")
-        print(f"Comparing user_message: Expected 'Invalid model ID or insufficient subscription level to use it.', Got '{error_info.user_message}'")
-        assert error_info.user_message == "Invalid model ID or insufficient subscription level to use it."
+        print(f"Enhanced user_message: {error_info.user_message}")
+        assert error_info.user_message == (
+            "The requested model is unavailable for this account. Check the model "
+            "ID against GET /v1/models, verify its spelling, or use an account with "
+            "the required subscription. Unknown models are still passed to Kiro for "
+            "final validation."
+        )
         assert error_info.reason == "INVALID_MODEL_ID"
         assert error_info.original_message == "Invalid model ID. Please select a different model to continue."
     
@@ -250,7 +259,12 @@ class TestEnhanceKiroErrorInvalidModelId:
         error_info = enhance_kiro_error(error_json)
         
         print("Verification: Same enhanced message regardless of original...")
-        assert error_info.user_message == "Invalid model ID or insufficient subscription level to use it."
+        assert error_info.user_message == (
+            "The requested model is unavailable for this account. Check the model "
+            "ID against GET /v1/models, verify its spelling, or use an account with "
+            "the required subscription. Unknown models are still passed to Kiro for "
+            "final validation."
+        )
         assert error_info.original_message == "Model not found."
 
 
@@ -683,9 +697,9 @@ class TestBuildOpenAIErrorResponse:
         status, body = build_openai_error_response(info, status_code=400)
         assert status == 400
         err = body["error"]
-        assert err["type"] == "kiro_api_error"
-        assert err["code"] == 400
-        assert "param" not in err
+        assert err["type"] == "invalid_request_error"
+        assert err["code"] == OPENAI_MODEL_NOT_AVAILABLE_CODE
+        assert err["param"] == "model"
 
     def test_non_context_error_preserves_status(self):
         info = enhance_kiro_error({"message": "server boom"})
@@ -722,3 +736,57 @@ class TestBuildAnthropicErrorResponse:
         assert body["type"] == "error"
         assert body["error"]["type"] == "api_error"
         assert body["error"]["message"] == info.user_message
+
+
+class TestModelAvailabilityAndCapacityErrors:
+    """Tests for expected availability errors and temporary capacity errors."""
+
+    def test_invalid_model_is_actionable_expected_rejection(self):
+        info = enhance_kiro_error(
+            {"message": "Invalid model ID.", "reason": "INVALID_MODEL_ID"}
+        )
+
+        assert "GET /v1/models" in info.user_message
+        assert "subscription" in info.user_message
+        assert "final validation" in info.user_message
+        assert is_expected_upstream_rejection(info, 400) is True
+        assert get_kiro_incident_classification(info, 400) == (
+            "expected_upstream", "INVALID_MODEL_ID", "model_validation"
+        )
+
+    def test_invalid_model_does_not_hide_unexpected_status(self):
+        info = enhance_kiro_error(
+            {"message": "Invalid model ID.", "reason": "INVALID_MODEL_ID"}
+        )
+
+        assert is_expected_upstream_rejection(info, 500) is False
+        assert get_kiro_incident_classification(info, 500) == (
+            "kiro_upstream", "INVALID_MODEL_ID", "response_parse"
+        )
+
+    def test_capacity_error_has_retryable_protocol_shapes(self):
+        info = enhance_kiro_error({
+            "message": "Insufficient model capacity.",
+            "reason": "INSUFFICIENT_MODEL_CAPACITY",
+        })
+
+        openai_status, openai_body = build_openai_error_response(info, 429)
+        anthropic_status, anthropic_body = build_anthropic_error_response(info, 429)
+
+        assert openai_status == 429
+        assert openai_body["error"]["type"] == "server_error"
+        assert openai_body["error"]["code"] == OPENAI_CAPACITY_CODE
+        assert openai_body["error"]["param"] == "model"
+        assert anthropic_status == 429
+        assert anthropic_body["error"]["type"] == "overloaded_error"
+        assert "temporarily at capacity" in info.user_message
+
+    def test_anthropic_invalid_model_is_invalid_request(self):
+        info = enhance_kiro_error(
+            {"message": "Invalid model ID.", "reason": "INVALID_MODEL_ID"}
+        )
+
+        status, body = build_anthropic_error_response(info, 400)
+
+        assert status == 400
+        assert body["error"]["type"] == "invalid_request_error"

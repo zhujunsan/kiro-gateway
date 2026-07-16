@@ -42,7 +42,8 @@ class AuthType(Enum):
 # --- Configuration ---
 # API region - CodeWhisperer API is only available in us-east-1
 API_REGION = "us-east-1"
-KIRO_API_HOST = f"https://q.{API_REGION}.amazonaws.com"
+KIRO_API_HOST = f"https://runtime.{API_REGION}.kiro.dev"
+KIRO_Q_HOST = f"https://q.{API_REGION}.amazonaws.com"
 KIRO_DESKTOP_TOKEN_URL = f"https://prod.{API_REGION}.auth.desktop.kiro.dev/refreshToken"
 
 # SSO region - may differ from API region (e.g., ap-southeast-1 for Singapore users)
@@ -339,7 +340,7 @@ def get_profile_arn():
     """Gets the profile ARN from ListAvailableProfiles endpoint."""
     global PROFILE_ARN
     logger.info("Getting profile ARN from /ListAvailableProfiles...")
-    url = f"{KIRO_API_HOST}/ListAvailableProfiles"
+    url = f"{KIRO_Q_HOST}/ListAvailableProfiles"
     
     try:
         response = httpx.get(url, headers=HEADERS)
@@ -365,7 +366,7 @@ def get_profile_arn():
 def test_get_models():
     """Tests the ListAvailableModels endpoint."""
     logger.info("Testing /ListAvailableModels...")
-    url = f"{KIRO_API_HOST}/ListAvailableModels"
+    url = f"{KIRO_Q_HOST}/ListAvailableModels"
     params = {
         "origin": "AI_EDITOR",
         "profileArn": PROFILE_ARN
@@ -439,7 +440,8 @@ if __name__ == "__main__":
     logger.info(f"  Auth type: {AUTH_TYPE.value}")
     logger.info(f"  API Region: {API_REGION}")
     logger.info(f"  SSO Region: {SSO_REGION or 'not set (using API region)'}")
-    logger.info(f"  API Host: {KIRO_API_HOST}")
+    logger.info(f"  Generation API Host: {KIRO_API_HOST}")
+    logger.info(f"  Model Discovery Host: {KIRO_Q_HOST}")
 
     # Check if we already have a valid token from the database
     if AUTH_TOKEN:

@@ -12,6 +12,8 @@ Covers:
 
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from kiro.config import PROXY_API_KEY
 
 
@@ -351,3 +353,78 @@ class TestResponsesStreaming:
         mock_kiro_http_client_class.assert_called()
         call_kwargs = mock_kiro_http_client_class.call_args[1]
         assert call_kwargs.get("shared_client") is None
+
+
+class TestResponsesModelsCompatibility:
+    """Responses model listing shares OpenAI's async discovery service."""
+
+    def test_openai_and_responses_model_routes_share_async_source(
+        self, test_client, valid_proxy_api_key
+    ):
+        manager = test_client.app.state.account_manager
+        model_ids = ["auto", "gpt-5.6-sol", "kiro-s-4.6"]
+        headers = {"Authorization": f"Bearer {valid_proxy_api_key}"}
+
+        with patch.object(
+            manager,
+            "get_all_available_models",
+            new=AsyncMock(return_value=model_ids),
+        ) as get_models:
+            openai_response = test_client.get("/v1/models", headers=headers)
+            responses_response = test_client.get(
+                "/v1/responses/models", headers=headers
+            )
+
+        assert openai_response.status_code == 200
+        assert responses_response.status_code == 200
+        assert [item["id"] for item in openai_response.json()["data"]] == model_ids
+        assert [item["slug"] for item in responses_response.json()["models"]] == model_ids
+        assert get_models.await_count == 2
+
+
+class TestInvalidModelExpectedResponse:
+    """Responses API keeps model availability errors actionable in both modes."""
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_invalid_model_returns_protocol_400_not_service_failure(
+        self, test_client, valid_proxy_api_key, stream
+    ):
+        account = test_client.app.state.account_manager.get_first_account()
+        manager = test_client.app.state.account_manager
+        upstream = AsyncMock()
+        upstream.status_code = 400
+        upstream.aread = AsyncMock(return_value=(
+            b'{"message":"Invalid model ID.",'
+            b'"reason":"INVALID_MODEL_ID"}'
+        ))
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(return_value=upstream)
+        client.close = AsyncMock()
+        client.client = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = True
+        try:
+            with patch.object(
+                manager, "get_next_account", new=AsyncMock(return_value=account)
+            ), patch.object(
+                manager, "report_failure", new=AsyncMock()
+            ), patch("kiro.routes_responses.KiroHttpClient", return_value=client):
+                response = test_client.post(
+                    "/v1/responses",
+                    headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                    json={
+                        "model": "future-model-from-client",
+                        "input": "hello",
+                        "stream": stream,
+                    },
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert error["code"] == "model_not_available"
+        assert error["param"] == "model"
+        assert "GET /v1/models" in error["message"]
+        assert client.request_with_retry.await_count == 1

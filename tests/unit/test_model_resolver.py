@@ -1307,11 +1307,11 @@ class TestModelAliasSystemBasics:
         Purpose: Basic alias functionality.
         """
         print("Setup: Creating resolver with alias...")
-        aliases = {"auto-kiro": "auto"}
+        aliases = {"my-auto": "auto"}
         resolver = ModelResolver(cache=mock_model_cache, aliases=aliases)
         
-        print("Action: Resolving 'auto-kiro'...")
-        result = resolver.resolve("auto-kiro")
+        print("Action: Resolving 'my-auto'...")
+        result = resolver.resolve("my-auto")
         
         print(f"Comparing internal_id: Expected 'auto', Got '{result.internal_id}'")
         assert result.internal_id == "auto"
@@ -1319,8 +1319,8 @@ class TestModelAliasSystemBasics:
         print(f"Comparing source: Expected 'cache', Got '{result.source}'")
         assert result.source == "cache"
         
-        print(f"Comparing original_request: Expected 'auto-kiro', Got '{result.original_request}'")
-        assert result.original_request == "auto-kiro"
+        print(f"Comparing original_request: Expected 'my-auto', Got '{result.original_request}'")
+        assert result.original_request == "my-auto"
     
     def test_non_aliased_models_work_normally(self, mock_model_cache):
         """
@@ -1328,7 +1328,7 @@ class TestModelAliasSystemBasics:
         Purpose: Ensure aliases don't break existing functionality.
         """
         print("Setup: Creating resolver with alias...")
-        aliases = {"auto-kiro": "auto"}
+        aliases = {"my-auto": "auto"}
         resolver = ModelResolver(cache=mock_model_cache, aliases=aliases)
         
         print("Action: Resolving 'claude-haiku-4.5' (not aliased)...")
@@ -1365,18 +1365,18 @@ class TestModelAliasSystemBasics:
         """
         print("Setup: Creating resolver with multiple aliases...")
         aliases = {
-            "auto-kiro": "auto",
+            "my-auto": "auto",
             "my-opus": "claude-opus-4.5",
             "fast": "claude-haiku-4.5"
         }
         resolver = ModelResolver(cache=mock_model_cache, aliases=aliases)
         
         print("Action: Resolving all aliases...")
-        result1 = resolver.resolve("auto-kiro")
+        result1 = resolver.resolve("my-auto")
         result2 = resolver.resolve("my-opus")
         result3 = resolver.resolve("fast")
         
-        print(f"Comparing: auto-kiro → {result1.internal_id}")
+        print(f"Comparing: my-auto → {result1.internal_id}")
         assert result1.internal_id == "auto"
         
         print(f"Comparing: my-opus → {result2.internal_id}")
@@ -1478,15 +1478,15 @@ class TestModelAliasSystemEdgeCases:
         Purpose: Ensure case sensitivity is preserved.
         """
         print("Setup: Creating resolver with lowercase alias...")
-        aliases = {"auto-kiro": "auto"}
+        aliases = {"my-auto": "auto"}
         resolver = ModelResolver(cache=mock_model_cache, aliases=aliases)
 
-        print("Action: Resolving 'AUTO-KIRO' (uppercase)...")
-        result = resolver.resolve("AUTO-KIRO")
+        print("Action: Resolving 'MY-AUTO' (uppercase)...")
+        result = resolver.resolve("MY-AUTO")
 
-        print(f"Comparing internal_id: Expected 'AUTO-KIRO' (pass-through, no alias match), Got '{result.internal_id}'")
+        print(f"Comparing internal_id: Expected 'MY-AUTO' (pass-through, no alias match), Got '{result.internal_id}'")
         # Should NOT match alias (case-sensitive), goes through passthrough as-is
-        assert result.internal_id == "AUTO-KIRO"
+        assert result.internal_id == "MY-AUTO"
         assert result.source == "passthrough"
 
 
@@ -1539,7 +1539,7 @@ class TestHiddenFromListFunctionality:
         Purpose: This is the main use case - show alias, hide original.
         """
         print("Setup: Creating resolver with alias and hidden original...")
-        aliases = {"auto-kiro": "auto"}
+        aliases = {"my-auto": "auto"}
         hidden_from_list = ["auto"]
         resolver = ModelResolver(cache=mock_model_cache, aliases=aliases, hidden_from_list=hidden_from_list)
         
@@ -1547,8 +1547,8 @@ class TestHiddenFromListFunctionality:
         models = resolver.get_available_models()
         
         print(f"Received models: {models}")
-        print("Check: 'auto-kiro' (alias) IS in list...")
-        assert "auto-kiro" in models
+        print("Check: 'my-auto' (alias) IS in list...")
+        assert "my-auto" in models
         
         print("Check: 'auto' (original) NOT in list...")
         assert "auto" not in models
@@ -1612,7 +1612,7 @@ class TestAliasSystemIntegration:
         Purpose: This is the MAIN use case from issue #59!
         """
         print("Setup: Simulating Cursor conflict solution...")
-        aliases = {"auto-kiro": "auto"}
+        aliases = {"my-auto": "auto"}
         hidden_from_list = ["auto"]
         resolver = ModelResolver(cache=mock_model_cache, aliases=aliases, hidden_from_list=hidden_from_list)
         
@@ -1623,13 +1623,13 @@ class TestAliasSystemIntegration:
         print("Check: 'auto' NOT visible (no conflict)...")
         assert "auto" not in models
         
-        print("Check: 'auto-kiro' IS visible...")
-        assert "auto-kiro" in models
+        print("Check: 'my-auto' IS visible...")
+        assert "my-auto" in models
         
-        print("Action: User requests 'auto-kiro' in Cursor...")
-        result = resolver.resolve("auto-kiro")
+        print("Action: User requests 'my-auto' in Cursor...")
+        result = resolver.resolve("my-auto")
         
-        print(f"Comparing: 'auto-kiro' resolves to '{result.internal_id}'")
+        print(f"Comparing: 'my-auto' resolves to '{result.internal_id}'")
         assert result.internal_id == "auto"
         
         print("Action: Old code with 'auto' still works...")
@@ -1667,7 +1667,7 @@ class TestAliasSystemIntegration:
         """
         print("Setup: Creating resolver with all features...")
         hidden_models = {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0"}
-        aliases = {"auto-kiro": "auto", "legacy": "claude-3.7-sonnet"}
+        aliases = {"my-auto": "auto", "legacy": "claude-3.7-sonnet"}
         hidden_from_list = ["auto"]
         
         resolver = ModelResolver(
@@ -1682,8 +1682,8 @@ class TestAliasSystemIntegration:
         
         print(f"Received models: {models}")
         
-        print("Check: Alias 'auto-kiro' present...")
-        assert "auto-kiro" in models
+        print("Check: Alias 'my-auto' present...")
+        assert "my-auto" in models
         
         print("Check: Original 'auto' hidden...")
         assert "auto" not in models

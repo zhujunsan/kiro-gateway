@@ -58,6 +58,11 @@ from kiro.response_store import (
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.routes_openai import verify_api_key
+from kiro.kiro_errors import (
+    build_openai_error_response,
+    get_kiro_incident_classification,
+    is_expected_upstream_rejection,
+)
 
 try:
     from kiro.debug_logger import debug_logger
@@ -363,6 +368,7 @@ async def create_response(request: Request, request_data: ResponsesRequest):
 
         last_error_message = None
         last_error_status = None
+        last_error_info = None
         tried_accounts = set()
 
         for _attempt in range(max_attempts):
@@ -372,6 +378,23 @@ async def create_response(request: Request, request_data: ResponsesRequest):
             )
 
             if account is None:
+                if (
+                    last_error_info is not None
+                    and last_error_status is not None
+                    and is_expected_upstream_rejection(last_error_info, last_error_status)
+                ):
+                    if debug_logger:
+                        src, code, phase = get_kiro_incident_classification(
+                            last_error_info, last_error_status
+                        )
+                        debug_logger.flush_on_error(
+                            last_error_status, last_error_message, source=src,
+                            code=code, phase=phase,
+                            upstream_status=last_error_status,
+                        )
+                    return _error_json_response(
+                        last_error_status, last_error_message, last_error_info
+                    )
                 if len(all_accounts) == 1:
                     raise HTTPException(
                         status_code=last_error_status or 503,
@@ -440,12 +463,14 @@ async def create_response(request: Request, request_data: ResponsesRequest):
 
                 error_reason = None
                 error_info = None
+                last_error_info = None
                 try:
                     error_json = json.loads(error_text)
                     from kiro.kiro_errors import enhance_kiro_error
 
                     error_info = enhance_kiro_error(error_json)
                     error_reason = error_info.reason
+                    last_error_info = error_info
                     last_error_message = error_info.user_message
                     last_error_status = response.status_code
                 except (json.JSONDecodeError, KeyError):
@@ -464,11 +489,19 @@ async def create_response(request: Request, request_data: ResponsesRequest):
                         f"{(last_error_message or '')[:100]}"
                     )
                     if debug_logger:
+                        if error_info is not None:
+                            src, code, phase = get_kiro_incident_classification(
+                                error_info, response.status_code
+                            )
+                        else:
+                            src, code, phase = (
+                                "kiro_upstream",
+                                error_reason or f"http_{response.status_code}",
+                                "response_parse",
+                            )
                         debug_logger.flush_on_error(
-                            response.status_code, last_error_message,
-                            source="kiro_upstream",
-                            code=(error_reason or f"http_{response.status_code}"),
-                            phase="response_parse",
+                            response.status_code, last_error_message, source=src,
+                            code=code, phase=phase,
                             upstream_status=response.status_code,
                         )
                     return _error_json_response(
@@ -524,6 +557,22 @@ async def create_response(request: Request, request_data: ResponsesRequest):
                     )
                 raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
+        if (
+            last_error_info is not None
+            and last_error_status is not None
+            and is_expected_upstream_rejection(last_error_info, last_error_status)
+        ):
+            if debug_logger:
+                src, code, phase = get_kiro_incident_classification(
+                    last_error_info, last_error_status
+                )
+                debug_logger.flush_on_error(
+                    last_error_status, last_error_message, source=src, code=code,
+                    phase=phase, upstream_status=last_error_status,
+                )
+            return _error_json_response(
+                last_error_status, last_error_message, last_error_info
+            )
         if len(all_accounts) == 1:
             raise HTTPException(status_code=last_error_status, detail=last_error_message)
         detail = "All accounts failed after full circle."
@@ -594,12 +643,18 @@ async def create_response(request: Request, request_data: ResponsesRequest):
                 f"HTTP {response.status_code} - POST /v1/responses - {error_message[:100]}"
             )
             if debug_logger:
+                if error_info is not None:
+                    src, code, phase = get_kiro_incident_classification(
+                        error_info, response.status_code
+                    )
+                else:
+                    src, code, phase = (
+                        "kiro_upstream", f"http_{response.status_code}",
+                        "response_parse",
+                    )
                 debug_logger.flush_on_error(
-                    response.status_code, error_message,
-                    source="kiro_upstream",
-                    code=f"http_{response.status_code}",
-                    phase="response_parse",
-                    upstream_status=response.status_code,
+                    response.status_code, error_message, source=src, code=code,
+                    phase=phase, upstream_status=response.status_code,
                 )
             return _error_json_response(response.status_code, error_message, error_info)
 

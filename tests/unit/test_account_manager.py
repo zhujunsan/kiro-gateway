@@ -7,7 +7,7 @@ Tests the AccountManager class that manages multiple Kiro accounts with:
 - Lazy initialization
 - Sticky behavior (prefer successful account)
 - Circuit breaker with exponential backoff
-- TTL-based model cache refresh
+- On-demand model discovery cache
 - State persistence
 """
 
@@ -23,6 +23,7 @@ from kiro.account_manager import (
     AccountStats,
     ModelAccountList,
     AccountManager,
+    ModelDiscoveryError,
     _format_duration
 )
 from kiro.account_errors import ErrorType
@@ -723,103 +724,37 @@ class TestAccountManagerInitializeAccount:
     """
     
     @pytest.mark.asyncio
-    async def test_initialize_account_json_success(self, tmp_path, mock_list_models_response):
-        """
-        Test successful account initialization with type=json.
-        
-        What it does: Initializes account with JSON credentials
-        Purpose: Verify complete initialization flow
-        """
-        print("\n=== Test: initialize_account with JSON ===")
-        
-        # Arrange
+    async def test_initialize_account_uses_fallback_without_discovery(self, tmp_path):
+        """Initialization prepares runtime metadata but never calls model discovery."""
         test_json = tmp_path / "test.json"
         test_json.write_text(json.dumps({
             "refreshToken": "test_token",
             "accessToken": "test_access",
             "expiresAt": "2099-01-01T00:00:00.000Z",
-            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789:profile/test",
-            "region": "us-east-1"
+            "region": "us-east-1",
         }))
-        
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([
             {"type": "json", "path": str(test_json), "enabled": True}
         ]))
-        
-        manager = AccountManager(
-            credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
-        )
-        
+        manager = AccountManager(str(creds_file), str(tmp_path / "state.json"))
         await manager.load_credentials()
         account_id = str(test_json.resolve())
-        
-        # Mock HTTP client for ListAvailableModels
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
-            mock_client = AsyncMock()
-            mock_response = Mock()  # Response is not async
-            mock_response.status_code = 200
-            mock_response.json.return_value = mock_list_models_response
-            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-            mock_http_class.return_value = mock_client
-            
-            # Act
+
+        with patch("kiro.account_manager.KiroHttpClient") as http_client:
             success = await manager._initialize_account(account_id)
-        
-        # Assert
-        print(f"Initialization success: {success}")
+
+        account = manager._accounts[account_id]
         assert success is True
-        assert manager._accounts[account_id].auth_manager is not None
-        assert manager._accounts[account_id].model_cache is not None
-        assert manager._accounts[account_id].model_resolver is not None
-    
-    @pytest.mark.asyncio
-    async def test_initialize_account_fetch_models_fallback(self, tmp_path):
-        """
-        Test fallback to FALLBACK_MODELS when API fails.
-        
-        What it does: Initializes account when ListAvailableModels fails
-        Purpose: Verify fallback mechanism
-        """
-        print("\n=== Test: initialize_account with fallback models ===")
-        
-        # Arrange
-        test_json = tmp_path / "test.json"
-        test_json.write_text(json.dumps({
-            "refreshToken": "test_token",
-            "accessToken": "test_access",
-            "expiresAt": "2099-01-01T00:00:00.000Z"
-        }))
-        
-        creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps([
-            {"type": "json", "path": str(test_json), "enabled": True}
-        ]))
-        
-        manager = AccountManager(
-            credentials_file=str(creds_file),
-            state_file=str(tmp_path / "state.json")
-        )
-        
-        await manager.load_credentials()
-        account_id = str(test_json.resolve())
-        
-        # Mock HTTP client to fail
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
-            mock_client = AsyncMock()
-            mock_client.request_with_retry = AsyncMock(side_effect=Exception("Network error"))
-            mock_client.close = AsyncMock()
-            mock_http_class.return_value = mock_client
-            
-            # Act
-            success = await manager._initialize_account(account_id)
-        
-        # Assert
-        print(f"Initialization success: {success}")
-        assert success is True  # Should succeed with fallback
-        assert manager._accounts[account_id].model_cache is not None
+        http_client.assert_not_called()
+        assert account.model_cache is not None
+        assert account.model_resolver is not None
+        assert account.model_discovery_attempted_at == 0.0
+        assert account.model_discovery_succeeded is False
+        assert "gpt-5.6-sol" in account.model_cache.get_all_model_ids()
+        assert "kiro-s-4.6" in account.model_resolver.get_available_models()
+        assert "auto-kiro" not in account.model_resolver.get_available_models()
+
 
 
 class TestAccountManagerGetNextAccount:
@@ -1265,7 +1200,7 @@ class TestAccountManagerGetAllAvailableModels:
             await manager._initialize_account(account_id)
         
         # Act
-        models = manager.get_all_available_models()
+        models = await manager.get_all_available_models()
         
         # Assert
         print(f"Available models: {len(models)}")
@@ -1300,3 +1235,163 @@ class TestFormatDuration:
         """Test formatting days."""
         assert _format_duration(86400) == "1d"
         assert _format_duration(172800) == "2d"
+
+
+class TestAccountManagerOnDemandModelDiscovery:
+    """Tests for list-request-only model discovery and four-hour throttling."""
+
+    @staticmethod
+    async def _manager(tmp_path):
+        test_json = tmp_path / "discovery.json"
+        test_json.write_text(json.dumps({
+            "refreshToken": "test_token",
+            "accessToken": "test_access",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123:profile/test",
+            "region": "us-east-1",
+        }))
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "json", "path": str(test_json), "enabled": True}
+        ]))
+        manager = AccountManager(str(creds_file), str(tmp_path / "state.json"))
+        await manager.load_credentials()
+        account_id = str(test_json.resolve())
+        assert await manager._initialize_account(account_id)
+        return manager, account_id
+
+    @staticmethod
+    def _response(model_ids):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "models": [{"modelId": model_id} for model_id in model_ids]
+        }
+        return response
+
+    @pytest.mark.asyncio
+    async def test_chat_selection_never_triggers_discovery(self, tmp_path):
+        manager, _ = await self._manager(tmp_path)
+        with patch.object(manager, "_fetch_available_models", new=AsyncMock()) as fetch:
+            account = await manager.get_next_account("unknown-future-model")
+        assert account is not None
+        fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_first_list_request_discovers_then_cache_skips_four_hours(self, tmp_path):
+        manager, account_id = await self._manager(tmp_path)
+        dynamic_ids = ["auto", "gpt-5.6-sol", "claude-sonnet-4.6", "claude-sonnet-4.5"]
+        with patch.object(
+            manager, "_fetch_available_models",
+            new=AsyncMock(return_value=[{"modelId": item} for item in dynamic_ids]),
+        ) as fetch:
+            first = await manager.get_all_available_models()
+            second = await manager.get_all_available_models()
+
+        assert fetch.await_count == 1
+        assert first == second
+        assert "auto" in first
+        assert "gpt-5.6-sol" in first
+        assert "kiro-s-4.6" in first
+        assert "auto-kiro" not in first
+        assert "kiro-5.6-sol" not in first
+        assert "claude-sonnet-4.5" not in first
+        cache_ids = manager._accounts[account_id].model_cache.get_all_model_ids()
+        assert set(cache_ids) == set(dynamic_ids)
+        assert "kiro-s-4.6" not in cache_ids
+
+    @pytest.mark.asyncio
+    async def test_expired_dynamic_cache_refreshes_once_and_replaces(self, tmp_path):
+        manager, account_id = await self._manager(tmp_path)
+        fetch = AsyncMock(side_effect=[
+            [{"modelId": "claude-sonnet-4.6"}],
+            [{"modelId": "claude-opus-4.8"}],
+        ])
+        with patch.object(manager, "_fetch_available_models", new=fetch):
+            first = await manager.get_all_available_models()
+            manager._accounts[account_id].model_discovery_attempted_at -= 4 * 60 * 60 + 1
+            refreshed = await manager.get_all_available_models()
+            repeated = await manager.get_all_available_models()
+
+        assert fetch.await_count == 2
+        assert "kiro-s-4.6" in first
+        assert "kiro-o-4.8" in refreshed
+        assert "claude-sonnet-4.6" not in refreshed
+        assert refreshed == repeated
+
+    @pytest.mark.asyncio
+    async def test_initial_failure_caches_fallback_with_aliases(self, tmp_path):
+        manager, account_id = await self._manager(tmp_path)
+        fetch = AsyncMock(side_effect=ModelDiscoveryError("offline"))
+        with patch.object(manager, "_fetch_available_models", new=fetch):
+            first = await manager.get_all_available_models()
+            second = await manager.get_all_available_models()
+
+        assert fetch.await_count == 1
+        assert first == second
+        assert "gpt-5.6-sol" in first
+        assert "auto" in first
+        assert "kiro-s-4.6" in first
+        assert "auto-kiro" not in first
+        assert manager._accounts[account_id].model_discovery_succeeded is False
+
+    @pytest.mark.asyncio
+    async def test_failed_expired_refresh_keeps_stale_and_throttles(self, tmp_path):
+        manager, account_id = await self._manager(tmp_path)
+        fetch = AsyncMock(side_effect=[
+            [{"modelId": "claude-sonnet-4.6"}, {"modelId": "gpt-5.6-sol"}],
+            ModelDiscoveryError("offline"),
+        ])
+        with patch.object(manager, "_fetch_available_models", new=fetch):
+            dynamic = await manager.get_all_available_models()
+            manager._accounts[account_id].model_discovery_attempted_at -= 4 * 60 * 60 + 1
+            stale = await manager.get_all_available_models()
+            repeated = await manager.get_all_available_models()
+
+        assert fetch.await_count == 2
+        assert dynamic == stale == repeated
+        assert "kiro-s-4.6" in stale
+        assert manager._accounts[account_id].model_discovery_succeeded is True
+
+    @pytest.mark.asyncio
+    async def test_concurrent_list_requests_are_single_flight(self, tmp_path):
+        manager, _ = await self._manager(tmp_path)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def fetch(_auth_manager):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return [{"modelId": "claude-sonnet-4.6"}]
+
+        with patch.object(manager, "_fetch_available_models", side_effect=fetch):
+            first_task = asyncio.create_task(manager.get_all_available_models())
+            await started.wait()
+            second_task = asyncio.create_task(manager.get_all_available_models())
+            release.set()
+            first, second = await asyncio.gather(first_task, second_task)
+
+        assert calls == 1
+        assert first == second
+
+    @pytest.mark.asyncio
+    async def test_fetch_uses_q_host_profile_rule_and_not_runtime(self, tmp_path):
+        manager, account_id = await self._manager(tmp_path)
+        account = manager._accounts[account_id]
+        response = self._response(["claude-sonnet-4.6"])
+        mock_client = AsyncMock()
+        mock_client.request_with_retry = AsyncMock(return_value=response)
+        mock_client.close = AsyncMock()
+
+        with patch("kiro.account_manager.KiroHttpClient", return_value=mock_client):
+            models = await manager._fetch_available_models(account.auth_manager)
+
+        kwargs = mock_client.request_with_retry.await_args.kwargs
+        assert kwargs["url"] == "https://q.us-east-1.amazonaws.com/ListAvailableModels"
+        assert kwargs["params"]["origin"] == "AI_EDITOR"
+        assert "profileArn" in kwargs["params"]
+        assert account.auth_manager.api_host == "https://runtime.us-east-1.kiro.dev"
+        assert models == [{"modelId": "claude-sonnet-4.6"}]

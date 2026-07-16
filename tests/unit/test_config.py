@@ -610,6 +610,22 @@ class TestFallbackModelsConfig:
         assert retired_aliases.isdisjoint(MODEL_ALIASES.keys())
         assert retired.issubset(set(HIDDEN_FROM_LIST))
         assert not any(target in retired for target in MODEL_ALIASES.values())
+
+    def test_native_auto_and_gpt_models_have_no_aliases(self):
+        """Verify native auto/GPT IDs are exposed without synthetic aliases."""
+        from kiro.config import FALLBACK_MODELS, HIDDEN_FROM_LIST, MODEL_ALIASES
+
+        fallback_ids = {model["modelId"] for model in FALLBACK_MODELS}
+        expected_gpt_ids = {
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        }
+
+        assert "auto-kiro" not in MODEL_ALIASES
+        assert "auto" not in HIDDEN_FROM_LIST
+        assert not any(target.startswith("gpt-") for target in MODEL_ALIASES.values())
+        assert expected_gpt_ids.issubset(fallback_ids)
     
     def test_fallback_models_use_dot_format(self):
         """
@@ -981,6 +997,25 @@ class TestAccountSystemConfig:
         print(f"Comparing ACCOUNT_CACHE_TTL: Expected 43200, Got {config_module.ACCOUNT_CACHE_TTL}")
         assert config_module.ACCOUNT_CACHE_TTL == 43200
     
+
+    def test_model_discovery_cache_ttl_default(self, monkeypatch):
+        """Model discovery attempts default to one per four-hour window."""
+        monkeypatch.delenv("MODEL_DISCOVERY_CACHE_TTL_SECONDS", raising=False)
+        from importlib import reload
+        import kiro.config as config_module
+
+        reload(config_module)
+        assert config_module.MODEL_DISCOVERY_CACHE_TTL_SECONDS == 4 * 60 * 60
+
+    def test_model_discovery_cache_ttl_from_environment(self, monkeypatch):
+        """The dedicated model discovery interval supports env override."""
+        monkeypatch.setenv("MODEL_DISCOVERY_CACHE_TTL_SECONDS", "7200")
+        from importlib import reload
+        import kiro.config as config_module
+
+        reload(config_module)
+        assert config_module.MODEL_DISCOVERY_CACHE_TTL_SECONDS == 7200
+
     def test_state_save_interval_seconds_default(self, monkeypatch):
         """
         What it does: Verifies STATE_SAVE_INTERVAL_SECONDS defaults to 10 seconds.

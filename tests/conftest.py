@@ -422,7 +422,7 @@ def block_all_network_calls():
     mock_token_response.raise_for_status = Mock()
 
     # Mock response for ListAvailableModels
-    # Used by AccountManager._initialize_account()
+    # Used by on-demand AccountManager model discovery
     mock_models_response = AsyncMock(spec=httpx.Response)
     mock_models_response.status_code = 200
     mock_models_response.json.return_value = {
@@ -1732,7 +1732,7 @@ def mock_list_models_response():
     """
     Mock response from Kiro API /ListAvailableModels endpoint.
     
-    Returns list of models for account initialization.
+    Returns a list of models for on-demand discovery tests.
     """
     return {
         "models": [

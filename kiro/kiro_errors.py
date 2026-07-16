@@ -49,6 +49,10 @@ CONTEXT_LENGTH_REASON = "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
 # match on this string to trigger their own context-compaction / summarization
 # retry, so we surface Kiro's context error in this canonical shape.
 OPENAI_CONTEXT_LENGTH_CODE = "context_length_exceeded"
+INVALID_MODEL_REASON = "INVALID_MODEL_ID"
+INSUFFICIENT_MODEL_CAPACITY_REASON = "INSUFFICIENT_MODEL_CAPACITY"
+OPENAI_MODEL_NOT_AVAILABLE_CODE = "model_not_available"
+OPENAI_CAPACITY_CODE = "insufficient_model_capacity"
 
 
 @dataclass
@@ -118,9 +122,20 @@ def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
         # Monthly request limit exceeded - account quota exhausted
         user_message = "Monthly request limit exceeded. Account has reached its monthly quota."
     
-    elif reason == "INVALID_MODEL_ID":
-        # Invalid model name or subscription tier insufficient
-        user_message = "Invalid model ID or insufficient subscription level to use it."
+    elif reason == INVALID_MODEL_REASON:
+        # Kiro intentionally combines an unknown model and missing entitlement.
+        user_message = (
+            "The requested model is unavailable for this account. Check the model "
+            "ID against GET /v1/models, verify its spelling, or use an account with "
+            "the required subscription. Unknown models are still passed to Kiro for "
+            "final validation."
+        )
+
+    elif reason == INSUFFICIENT_MODEL_CAPACITY_REASON:
+        user_message = (
+            "The requested model is temporarily at capacity. Retry after a short "
+            "delay or choose another available model."
+        )
 
     elif original_message == "Improperly formed request." and reason in (None, "UNKNOWN", "null"):
         # Generic 400 error
@@ -163,6 +178,33 @@ def is_context_length_error(error_info: KiroErrorInfo) -> bool:
     return error_info.reason == CONTEXT_LENGTH_REASON
 
 
+def get_kiro_incident_classification(
+    error_info: KiroErrorInfo,
+    status_code: int,
+) -> Tuple[str, str, str]:
+    """Return source, code, and phase for incident observability.
+
+    Expected model availability rejections remain observable but use a distinct
+    source so dashboards and alerts do not count them as gateway or upstream
+    service failures.
+
+    Args:
+        error_info: Enhanced Kiro error information.
+        status_code: Upstream HTTP status code.
+
+    Returns:
+        A ``(source, code, phase)`` tuple for ``DebugLogger.flush_on_error``.
+    """
+    if status_code == 400 and error_info.reason == INVALID_MODEL_REASON:
+        return "expected_upstream", INVALID_MODEL_REASON, "model_validation"
+    return "kiro_upstream", error_info.reason or f"http_{status_code}", "response_parse"
+
+
+def is_expected_upstream_rejection(error_info: KiroErrorInfo, status_code: int) -> bool:
+    """Return whether an upstream rejection is expected client/account feedback."""
+    return status_code == 400 and error_info.reason == INVALID_MODEL_REASON
+
+
 def build_openai_error_response(
     error_info: KiroErrorInfo,
     status_code: int,
@@ -198,6 +240,26 @@ def build_openai_error_response(
             }
         }
 
+    if error_info.reason == INVALID_MODEL_REASON:
+        return 400, {
+            "error": {
+                "message": error_info.user_message,
+                "type": "invalid_request_error",
+                "param": "model",
+                "code": OPENAI_MODEL_NOT_AVAILABLE_CODE,
+            }
+        }
+
+    if error_info.reason == INSUFFICIENT_MODEL_CAPACITY_REASON:
+        return status_code, {
+            "error": {
+                "message": error_info.user_message,
+                "type": "server_error",
+                "param": "model",
+                "code": OPENAI_CAPACITY_CODE,
+            }
+        }
+
     return status_code, {
         "error": {
             "message": error_info.user_message,
@@ -230,6 +292,24 @@ def build_anthropic_error_response(
             "type": "error",
             "error": {
                 "type": "invalid_request_error",
+                "message": error_info.user_message,
+            },
+        }
+
+    if error_info.reason == INVALID_MODEL_REASON:
+        return 400, {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": error_info.user_message,
+            },
+        }
+
+    if error_info.reason == INSUFFICIENT_MODEL_CAPACITY_REASON:
+        return status_code, {
+            "type": "error",
+            "error": {
+                "type": "overloaded_error",
                 "message": error_info.user_message,
             },
         }

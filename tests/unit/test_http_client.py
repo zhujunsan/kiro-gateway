@@ -280,6 +280,76 @@ class TestKiroHttpClientRequestWithRetry:
         assert response.status_code == 200
     
     @pytest.mark.asyncio
+    async def test_capacity_429_uses_bounded_exponential_backoff_with_jitter(
+        self, mock_auth_manager_for_http
+    ):
+        """Capacity retries use bounded exponential backoff with controlled jitter."""
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        def capacity_response():
+            response = AsyncMock()
+            response.status_code = 429
+            response.aread = AsyncMock(return_value=(
+                b'{"message":"Insufficient capacity",'
+                b'"reason":"INSUFFICIENT_MODEL_CAPACITY"}'
+            ))
+            response.aclose = AsyncMock()
+            return response
+
+        success = AsyncMock()
+        success.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(side_effect=[
+            capacity_response(), capacity_response(), success
+        ])
+
+        with patch.object(http_client, "_get_client", return_value=mock_client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}), \
+             patch("kiro.http_client.random.uniform", side_effect=[1.25, 0.75]), \
+             patch("kiro.http_client.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            response = await http_client.request_with_retry(
+                "POST", "https://api.example.com/test", {"data": "value"}
+            )
+
+        assert response.status_code == 200
+        assert sleep.call_args_list == [((1.25,),), ((1.5,),)]
+        assert mock_client.request.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_capacity_429_retry_exhaustion_returns_original_response(
+        self, mock_auth_manager_for_http
+    ):
+        """Capacity retry exhaustion preserves the upstream 429 and reason body."""
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        responses = []
+        for _ in range(MAX_RETRIES):
+            response = AsyncMock()
+            response.status_code = 429
+            response.aread = AsyncMock(return_value=(
+                b'{"message":"Insufficient capacity",'
+                b'"reason":"INSUFFICIENT_MODEL_CAPACITY"}'
+            ))
+            response.aclose = AsyncMock()
+            responses.append(response)
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(side_effect=responses)
+
+        with patch.object(http_client, "_get_client", return_value=mock_client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}), \
+             patch("kiro.http_client.random.uniform", return_value=1.0), \
+             patch("kiro.http_client.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            result = await http_client.request_with_retry(
+                "POST", "https://api.example.com/test", {"data": "value"}
+            )
+
+        assert result is responses[-1]
+        assert result.status_code == 429
+        assert mock_client.request.call_count == MAX_RETRIES
+        assert sleep.await_count == MAX_RETRIES - 1
+
+    @pytest.mark.asyncio
     async def test_5xx_triggers_backoff(self, mock_auth_manager_for_http):
         """
         What it does: Verifies exponential backoff on 5xx.

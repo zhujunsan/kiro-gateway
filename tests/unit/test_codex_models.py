@@ -151,14 +151,10 @@ def test_canonical_model_capabilities(
         ("kiro-s-5", "claude-sonnet-5"),
         ("kiro-s-4.6", "claude-sonnet-4.6"),
         ("kiro-h-4.5", "claude-haiku-4.5"),
-        ("kiro-5.6-sol", "gpt-5.6-sol"),
-        ("kiro-5.6-terra", "gpt-5.6-terra"),
-        ("kiro-5.6-luna", "gpt-5.6-luna"),
         ("kiro-deepseek-3.2", "deepseek-3.2"),
         ("kiro-glm-5", "glm-5"),
         ("kiro-minimax-m2.5", "minimax-m2.5"),
         ("kiro-qwen3-coder-next", "qwen3-coder-next"),
-        ("auto-kiro", "auto"),
     ],
 )
 def test_alias_inherits_canonical_capabilities(alias, canonical):
@@ -198,14 +194,6 @@ def test_kiro_glm_5_is_text_only():
     assert info["supports_image_detail_original"] is False
     assert info["context_window"] == 200_000
     assert info["supported_reasoning_levels"] == []
-
-
-def test_kiro_56_sol_has_image():
-    info = build_codex_model_info("kiro-5.6-sol")
-    assert info["input_modalities"] == ["text", "image"]
-    assert info["supports_image_detail_original"] is True
-    assert info["default_reasoning_level"] == "low"
-    assert "ultra" not in _efforts(info)
 
 
 # ---------------------------------------------------------------------------

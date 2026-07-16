@@ -803,6 +803,14 @@ class TestDebugSessionIsolation:
         src, code, phase, st = classify_streaming_exception(TimeoutError("read timeout"))
         assert src == "network" and st == 504
 
+        src, code, phase, st = classify_streaming_exception(
+            RuntimeError("peer closed connection without sending complete message body "
+                         "(incomplete chunked read)")
+        )
+        assert (src, code, phase, st) == (
+            "network", "incomplete_upstream_response", "streaming", 502
+        )
+
         src, code, phase, st = classify_streaming_exception(RuntimeError("boom"))
         assert src == "gateway" and code == "streaming_error"
 

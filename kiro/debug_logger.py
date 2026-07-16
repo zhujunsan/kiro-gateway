@@ -85,6 +85,16 @@ def classify_streaming_exception(exc: BaseException) -> tuple[str, str, str, int
         return "network", "first_token_timeout", "first_token", 504
     if "Timeout" in name or "timeout" in msg:
         return "network", "timeout", "streaming", 504
+    if (
+        "RemoteProtocolError" in name
+        or "incomplete chunked read" in msg
+        or "incomplete message body" in msg
+        or "peer closed connection" in msg
+    ):
+        # A response that breaks after streaming starts must not be replayed: the
+        # client may already have consumed output. Classify it as an upstream
+        # transport failure and let the route terminate the stream.
+        return "network", "incomplete_upstream_response", "streaming", 502
     if "RequestError" in name or "ConnectError" in name or "connection" in msg:
         return "network", "connection_error", "connect", 502
     if "JSON" in name or "parse" in msg:

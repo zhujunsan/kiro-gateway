@@ -267,8 +267,8 @@ class ModelResolver:
         hidden_from_list: Set of model IDs to hide from /v1/models endpoint
     
     Example:
-        >>> resolver = ModelResolver(cache, hidden_models, aliases={"auto-kiro": "auto"})
-        >>> resolution = resolver.resolve("auto-kiro")
+        >>> resolver = ModelResolver(cache, hidden_models, aliases={"my-auto": "auto"})
+        >>> resolution = resolver.resolve("my-auto")
         >>> resolution.internal_id
         'auto'
         >>> resolution.source
@@ -290,7 +290,7 @@ class ModelResolver:
             hidden_models: Dict mapping display names to internal Kiro IDs.
                           Display names should use dot format (e.g., "claude-3.7-sonnet")
             aliases: Dict mapping alias names to real model IDs.
-                    Example: {"auto-kiro": "auto", "my-opus": "claude-opus-4.5"}
+                    Example: {"my-auto": "auto", "my-opus": "claude-opus-4.5"}
             hidden_from_list: List of model IDs to hide from /v1/models endpoint.
                              These models still work but are not shown in the list.
         """
@@ -378,7 +378,7 @@ class ModelResolver:
         - Alias names (custom mappings)
         
         Excludes:
-        - Models in hidden_from_list (e.g., "auto" when showing "auto-kiro")
+        - Models in hidden_from_list (e.g., "auto" when showing "my-auto")
         
         Returns:
             List of model IDs in consistent format (with dots)

@@ -33,16 +33,10 @@ from loguru import logger
 
 from kiro.codex_models import build_codex_models_list
 from kiro.converters_compact import CompactRequest, build_compacted_response
-from kiro.routes_openai import verify_api_key
+from kiro.routes_openai import get_available_model_ids, verify_api_key
 
 router = APIRouter(tags=["OpenAI Responses Compat"])
 
-
-def _available_model_ids(request: Request) -> list:
-    if request.app.state.account_system:
-        return request.app.state.account_manager.get_all_available_models()
-    account = request.app.state.account_manager.get_first_account()
-    return account.model_resolver.get_available_models()
 
 
 @router.post("/v1/responses/compact", dependencies=[Depends(verify_api_key)])
@@ -94,5 +88,5 @@ async def get_responses_models(request: Request):
     path exists for clients that probe Responses-specific discovery.
     """
     logger.info("Request to /v1/responses/models")
-    model_ids = _available_model_ids(request)
+    model_ids = await get_available_model_ids(request)
     return JSONResponse(content={"models": build_codex_models_list(model_ids)})

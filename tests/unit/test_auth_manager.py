@@ -487,6 +487,10 @@ class TestKiroAuthManagerProperties:
         print(f"api_host: {manager.api_host}")
         assert "runtime.us-east-1.kiro.dev" in manager.api_host
         assert "us-east-1" in manager.api_host
+
+        print("Verification: q_host uses the independent AWS Q endpoint...")
+        assert manager.q_host == "https://q.us-east-1.amazonaws.com"
+        assert manager.api_host != manager.q_host
     
     def test_fingerprint_property(self):
         """

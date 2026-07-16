@@ -53,6 +53,11 @@ from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
+from kiro.kiro_errors import (
+    build_openai_error_response,
+    get_kiro_incident_classification,
+    is_expected_upstream_rejection,
+)
 
 # Import debug_logger
 try:
@@ -119,13 +124,28 @@ async def health():
         "version": APP_VERSION
     }
 
+async def get_available_model_ids(request: Request) -> list[str]:
+    """Return the shared on-demand model list for all API compatibility routes.
+
+    This delegates discovery and its per-account four-hour throttle to the
+    account manager. It is intentionally called only by model-list routes.
+
+    Args:
+        request: FastAPI request used to access application state.
+
+    Returns:
+        Sorted model IDs after aliases and hiding rules are applied.
+    """
+    return await request.app.state.account_manager.get_all_available_models()
+
+
 @router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_api_key)])
 async def get_models(request: Request):
     """
     Return list of available models.
     
-    Models are loaded at startup (blocking) and cached.
-    This endpoint returns the cached list.
+    Model discovery is performed on demand and cached per account for four
+    hours. Generation endpoints never trigger this upstream request.
 
     Dual-compatible payload:
     - OpenAI / Cursor / tray: ``object`` + ``data`` (unchanged)
@@ -139,14 +159,7 @@ async def get_models(request: Request):
     """
     logger.info("Request to /v1/models")
     
-    # Get available models based on mode
-    if request.app.state.account_system:
-        # Account system: collect models from all initialized accounts
-        available_model_ids = request.app.state.account_manager.get_all_available_models()
-    else:
-        # Legacy: use resolver from first account
-        account = request.app.state.account_manager.get_first_account()
-        available_model_ids = account.model_resolver.get_available_models()
+    available_model_ids = await get_available_model_ids(request)
     
     # Build OpenAI-compatible model list
     openai_models = [
@@ -296,6 +309,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         
         last_error_message = None
         last_error_status = None
+        last_error_info = None
         tried_accounts = set()  # Track tried accounts in current failover loop
         
         for attempt in range(MAX_ATTEMPTS):
@@ -306,7 +320,26 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             )
             
             if account is None:
-                # All accounts unavailable
+                # All accounts unavailable. Preserve an expected model rejection
+                # as actionable HTTP 400 instead of converting it to service 503.
+                if (
+                    last_error_info is not None
+                    and last_error_status is not None
+                    and is_expected_upstream_rejection(last_error_info, last_error_status)
+                ):
+                    if debug_logger:
+                        src, code, phase = get_kiro_incident_classification(
+                            last_error_info, last_error_status
+                        )
+                        debug_logger.flush_on_error(
+                            last_error_status, last_error_message, source=src,
+                            code=code, phase=phase,
+                            upstream_status=last_error_status,
+                        )
+                    status, body = build_openai_error_response(
+                        last_error_info, last_error_status
+                    )
+                    return JSONResponse(status_code=status, content=body)
                 if len(all_accounts) == 1:
                     # Single account - return original error with original status code
                     raise HTTPException(
@@ -469,11 +502,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     # Extract error reason and save for final return
                     error_reason = None
                     error_info = None
+                    last_error_info = None
                     try:
                         error_json = json.loads(error_text)
                         from kiro.kiro_errors import enhance_kiro_error
                         error_info = enhance_kiro_error(error_json)
                         error_reason = error_info.reason
+                        last_error_info = error_info
                         last_error_message = error_info.user_message
                         last_error_status = response.status_code
                         logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
@@ -494,18 +529,25 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         logger.warning(f"HTTP {response.status_code} - POST /v1/chat/completions - {last_error_message[:100]}")
                         
                         if debug_logger:
+                            if error_info is not None:
+                                src, code, phase = get_kiro_incident_classification(
+                                    error_info, response.status_code
+                                )
+                            else:
+                                src, code, phase = (
+                                    "kiro_upstream",
+                                    error_reason or f"http_{response.status_code}",
+                                    "response_parse",
+                                )
                             debug_logger.flush_on_error(
-                            response.status_code, last_error_message,
-                            source="kiro_upstream",
-                            code=(error_reason or f"http_{response.status_code}"),
-                            phase="response_parse",
-                            upstream_status=response.status_code,
-                        )
+                                response.status_code, last_error_message, source=src,
+                                code=code, phase=phase,
+                                upstream_status=response.status_code,
+                            )
                         
                         # Normalize context-length errors to OpenAI's canonical
                         # shape so clients can trigger their own context handling.
                         if error_info is not None:
-                            from kiro.kiro_errors import build_openai_error_response
                             resp_status, resp_body = build_openai_error_response(
                                 error_info, response.status_code
                             )
@@ -579,7 +621,25 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 )
                 raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
         
-        # All attempts exhausted
+        # All attempts exhausted. Model availability is expected client/account
+        # feedback, not a gateway outage, and keeps its original HTTP 400.
+        if (
+            last_error_info is not None
+            and last_error_status is not None
+            and is_expected_upstream_rejection(last_error_info, last_error_status)
+        ):
+            if debug_logger:
+                src, code, phase = get_kiro_incident_classification(
+                    last_error_info, last_error_status
+                )
+                debug_logger.flush_on_error(
+                    last_error_status, last_error_message, source=src, code=code,
+                    phase=phase, upstream_status=last_error_status,
+                )
+            status, body = build_openai_error_response(
+                last_error_info, last_error_status
+            )
+            return JSONResponse(status_code=status, content=body)
         if len(all_accounts) == 1:
             # Single account - return its original error
             # last_error_status and last_error_message are guaranteed to be set
@@ -685,18 +745,23 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             
             # Flush debug logs on error ("errors" mode)
             if debug_logger:
+                if error_info is not None:
+                    src, code, phase = get_kiro_incident_classification(
+                        error_info, response.status_code
+                    )
+                else:
+                    src, code, phase = (
+                        "kiro_upstream", f"http_{response.status_code}",
+                        "response_parse",
+                    )
                 debug_logger.flush_on_error(
-                response.status_code, error_message,
-                source="kiro_upstream",
-                code=f"http_{response.status_code}",
-                phase="response_parse",
-                upstream_status=response.status_code,
-            )
+                    response.status_code, error_message, source=src, code=code,
+                    phase=phase, upstream_status=response.status_code,
+                )
             
             # Return error in OpenAI API format. Context-length errors are
             # normalized to OpenAI's canonical context_length_exceeded shape.
             if error_info is not None:
-                from kiro.kiro_errors import build_openai_error_response
                 resp_status, resp_body = build_openai_error_response(
                     error_info, response.status_code
                 )

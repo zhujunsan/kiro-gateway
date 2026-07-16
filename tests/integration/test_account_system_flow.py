@@ -428,70 +428,36 @@ class TestAccountSystemFullFlow:
         print("✓ State was persisted and restored correctly")
     
     @pytest.mark.asyncio
-    async def test_ttl_refresh_on_usage(
+    async def test_chat_usage_does_not_refresh_model_discovery(
         self,
         tmp_path,
         temp_account_credentials_files,
-        mock_list_models_response
+        mock_list_models_response,
     ):
-        """
-        Test 142: TTL обновляется только при использовании аккаунта
-        
-        What it does: Verifies model cache is refreshed when TTL expires during usage
-        Purpose: Ensure cache stays fresh without background tasks
-        """
-        print("\n=== Test 142: TTL refresh on usage ===")
-        
-        # Arrange
+        """Chat account selection never invokes ListAvailableModels refresh."""
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
-        
-        account1_path = temp_account_credentials_files["account1"]
-        
-        credentials = [
-            {"type": "json", "path": account1_path, "enabled": True}
-        ]
-        creds_file.write_text(json.dumps(credentials))
-        
+        account_path = temp_account_credentials_files["account1"]
+        creds_file.write_text(json.dumps([
+            {"type": "json", "path": account_path, "enabled": True}
+        ]))
+
         manager = AccountManager(str(creds_file), str(state_file))
         await manager.load_credentials()
-        await manager.load_state()
-        
-        # Initialize account
         account_id = list(manager._accounts.keys())[0]
         account = manager._accounts[account_id]
         account.auth_manager = MagicMock()
         account.model_cache = MagicMock()
         account.model_resolver = MagicMock()
-        account.model_resolver.get_available_models.return_value = ["claude-opus-4.5"]
-        
-        # Set old cache timestamp (expired TTL)
-        from kiro.config import ACCOUNT_CACHE_TTL
-        account.models_cached_at = time.time() - ACCOUNT_CACHE_TTL - 1
-        print(f"Cache age: {time.time() - account.models_cached_at}s (TTL: {ACCOUNT_CACHE_TTL}s)")
-        
-        from kiro.account_manager import ModelAccountList
-        manager._model_to_accounts["claude-opus-4.5"] = ModelAccountList()
-        manager._model_to_accounts["claude-opus-4.5"].accounts.append(account_id)
-        
-        # Mock refresh method
-        refresh_called = False
-        original_cached_at = account.models_cached_at
-        
-        async def mock_refresh(acc_id):
-            nonlocal refresh_called
-            refresh_called = True
-            manager._accounts[acc_id].models_cached_at = time.time()
-        
-        with patch.object(manager, '_refresh_account_models', side_effect=mock_refresh):
-            # Act: Get account (should trigger TTL refresh)
-            next_account = await manager.get_next_account("claude-opus-4.5")
-        
-        # Assert: Refresh was called and timestamp updated
-        print(f"Refresh called: {refresh_called}")
-        print(f"Old timestamp: {original_cached_at}")
-        print(f"New timestamp: {account.models_cached_at}")
-        
-        assert refresh_called is True
-        assert account.models_cached_at > original_cached_at
-        print("✓ Cache was refreshed on usage when TTL expired")
+        account.model_resolver.get_available_models.return_value = [
+            "claude-opus-4.5"
+        ]
+        account.model_discovery_attempted_at = 0.0
+
+        with patch.object(
+            manager, "_fetch_available_models", new=AsyncMock()
+        ) as fetch_models:
+            selected = await manager.get_next_account("claude-opus-4.5")
+
+        assert selected is account
+        fetch_models.assert_not_awaited()

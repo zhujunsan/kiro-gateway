@@ -181,8 +181,9 @@ AWS_SSO_OIDC_URL_TEMPLATE: str = "https://oidc.{region}.amazonaws.com/token"
 # Fixed in issue #58 - codewhisperer.{region}.amazonaws.com doesn't exist for non-us-east-1 regions
 KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
-# Host for Q API (ListAvailableModels)
-KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+# Host for model discovery (ListAvailableModels). This remains separate from
+# the runtime generation endpoint and uses the same resolved API region.
+KIRO_Q_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
 
 # ==================================================================================================
 # Token Settings
@@ -236,28 +237,27 @@ HIDDEN_MODELS: Dict[str, str] = {
 # ==================================================================================================
 
 # Model aliases - custom names that map to real model IDs.
-# This feature allows creating alternative names for models to avoid namespace conflicts
-# with IDE-specific model names (e.g., Cursor's "auto" model).
+# This feature allows creating alternative names for models when clients route
+# provider-branded model names outside the configured OpenAI-compatible endpoint.
 #
 # Format: {"alias_name": "real_model_id"}
 # - alias_name: The name that will appear in /v1/models and can be used in requests
 # - real_model_id: The actual model ID that will be sent to Kiro API
 #
 # Use cases:
-# - Avoid conflicts with IDE-specific model names (e.g., Cursor's "auto")
+# - Route provider-branded Claude names through custom OpenAI-compatible endpoints
 # - Create user-friendly shortcuts (e.g., "my-opus" → "claude-opus-4.5")
 # - Support legacy model names from other providers
 #
 # Example:
 #   MODEL_ALIASES = {
-#       "auto-kiro": "auto",
 #       "my-opus": "claude-opus-4.5",
-#       "gpt-5": "claude-sonnet-4.5"
+#       "legacy-sonnet": "claude-sonnet-4.6"
 #   }
 #
-# Default: {"auto-kiro": "auto"} to avoid Cursor IDE conflict
+# Native ``auto`` and GPT model IDs intentionally have no aliases. GPT models use
+# their real IDs and remain in ``FALLBACK_MODELS`` for deployments without discovery.
 MODEL_ALIASES: Dict[str, str] = {
-    "auto-kiro": "auto",  # Default alias to avoid Cursor's "auto" model conflict
     # Claude Opus (use -o- code so the alias does not contain "opus", which
     # IDEs like Cursor sniff out and treat as a native Anthropic model)
     "kiro-o-4.8": "claude-opus-4.8",
@@ -268,11 +268,6 @@ MODEL_ALIASES: Dict[str, str] = {
     "kiro-s-4.6": "claude-sonnet-4.6",
     # Claude Haiku (use -h- code, see note above)
     "kiro-h-4.5": "claude-haiku-4.5",
-    # GPT 5.6 (omit "gpt" in the alias so Cursor does not sniff it as a
-    # native OpenAI model and bypass the custom base URL)
-    "kiro-5.6-sol": "gpt-5.6-sol",
-    "kiro-5.6-terra": "gpt-5.6-terra",
-    "kiro-5.6-luna": "gpt-5.6-luna",
     # Non-Claude models
     "kiro-deepseek-3.2": "deepseek-3.2",
     "kiro-glm-5": "glm-5",
@@ -284,16 +279,12 @@ MODEL_ALIASES: Dict[str, str] = {
 # These models still work when requested directly, but are not shown in the model list.
 # This is useful when you want to show only aliases instead of original model names.
 #
-# Use case: Hide "auto" from list to show only "auto-kiro" alias, avoiding confusion.
-#
 # Example:
-#   HIDDEN_FROM_LIST = ["auto", "claude-old-model"]
+#   HIDDEN_FROM_LIST = ["claude-old-model"]
 #
-# Default: ["auto"] to show only "auto-kiro" alias
-# Also hide retired model IDs that Kiro ListAvailableModels may still return
+# Hide retired model IDs that Kiro ListAvailableModels may still return
 # but no longer accept (timeout / INVALID_MODEL_ID).
 HIDDEN_FROM_LIST: List[str] = [
-    "auto",
     "claude-opus-4.5",
     "claude-sonnet-4",
     "claude-sonnet-4.5",
@@ -332,8 +323,16 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
 # Model Cache Settings
 # ==================================================================================================
 
-# Model cache TTL in seconds (1 hour)
+# In-memory model metadata cache TTL in seconds (1 hour). This controls the
+# cache object's staleness helper, not upstream model discovery scheduling.
 MODEL_CACHE_TTL: int = 3600
+
+# Minimum interval between ListAvailableModels attempts for each account.
+# Discovery runs only for explicit model-list requests. Failed attempts also
+# advance this timer so repeated list requests cannot hammer upstream.
+MODEL_DISCOVERY_CACHE_TTL_SECONDS: int = int(
+    os.getenv("MODEL_DISCOVERY_CACHE_TTL_SECONDS", str(4 * 60 * 60))
+)
 
 # Default maximum number of input tokens
 DEFAULT_MAX_INPUT_TOKENS: int = 200000
@@ -592,8 +591,9 @@ ACCOUNT_PROBABILISTIC_RETRY_CHANCE: float = float(os.getenv("ACCOUNT_PROBABILIST
 # Account Cache Settings
 # ==================================================================================================
 
-# Model cache TTL in seconds (12 hours)
-# Cache is refreshed only when account is used (not in background)
+# Legacy account cache setting retained for configuration compatibility.
+# Model discovery uses MODEL_DISCOVERY_CACHE_TTL_SECONDS, so this setting does not
+# accidentally affect account selection or circuit-breaker behavior.
 ACCOUNT_CACHE_TTL: int = int(os.getenv("ACCOUNT_CACHE_TTL", "43200"))
 
 # ==================================================================================================

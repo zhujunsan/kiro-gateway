@@ -33,6 +33,7 @@ with connection pooling for better resource management.
 
 import asyncio
 import json
+import random
 from typing import Optional, Tuple
 
 import httpx
@@ -51,15 +52,39 @@ from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
 from kiro.proxy import resolve_proxy
+from kiro.kiro_errors import INSUFFICIENT_MODEL_CAPACITY_REASON
+
+
+_CAPACITY_JITTER_RATIO = 0.25
+_MAX_RETRY_DELAY = 30.0
+
+
+def _http_retry_delay(attempt: int, reason: Optional[str] = None) -> float:
+    """Calculate bounded exponential backoff, adding jitter for capacity errors.
+
+    Args:
+        attempt: Zero-based retry attempt index.
+        reason: Optional Kiro reason code parsed from the response.
+
+    Returns:
+        Delay in seconds, capped to avoid unbounded waits.
+    """
+    base_delay = min(BASE_RETRY_DELAY * (2 ** attempt), _MAX_RETRY_DELAY)
+    if reason != INSUFFICIENT_MODEL_CAPACITY_REASON:
+        return base_delay
+    factor = random.uniform(1.0 - _CAPACITY_JITTER_RATIO, 1.0 + _CAPACITY_JITTER_RATIO)
+    return min(base_delay * factor, _MAX_RETRY_DELAY)
 
 
 async def _read_response_body(response: httpx.Response) -> bytes:
     """Read response body once; safe for stream and non-stream responses."""
     try:
-        return await response.aread()
+        body = await response.aread()
+        return bytes(body) if isinstance(body, (bytes, bytearray)) else b""
     except Exception:
         try:
-            return response.content or b""
+            body = response.content
+            return bytes(body) if isinstance(body, (bytes, bytearray)) else b""
         except Exception:
             return b""
 
@@ -310,13 +335,19 @@ class KiroHttpClient:
                     await self.auth_manager.force_refresh()
                     continue
                 
-                # 429 - rate limit, wait and retry
+                # 429 - bounded exponential backoff. Capacity errors add jitter
+                # to prevent synchronized retries across gateway instances.
                 if response.status_code == 429:
-                    last_response = response  # Сохраняем для возврата после exhaustion
+                    response, _body, reason = await _drain_error_response(response, stream)
+                    last_response = response
                     if attempt >= max_retries - 1:
                         break
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
+                    delay = _http_retry_delay(attempt, reason)
+                    reason_suffix = f" ({reason})" if reason else ""
+                    logger.warning(
+                        f"Received 429{reason_suffix}, waiting {delay:.3f}s "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
                     await asyncio.sleep(delay)
                     continue
                 
@@ -325,7 +356,7 @@ class KiroHttpClient:
                     last_response = response  # Сохраняем для возврата после exhaustion
                     if attempt >= max_retries - 1:
                         break
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    delay = _http_retry_delay(attempt)
                     logger.warning(f"Received {response.status_code}, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                     continue
@@ -362,7 +393,7 @@ class KiroHttpClient:
                 short_msg = get_short_error_message(error_info)
                 
                 if error_info.is_retryable and attempt < max_retries - 1:
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    delay = _http_retry_delay(attempt)
                     logger.warning(f"{short_msg} - waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                 else:
@@ -380,7 +411,7 @@ class KiroHttpClient:
                 short_msg = get_short_error_message(error_info)
                 
                 if error_info.is_retryable and attempt < max_retries - 1:
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    delay = _http_retry_delay(attempt)
                     logger.warning(f"{short_msg} - waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                 else:
