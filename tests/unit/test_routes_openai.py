@@ -380,6 +380,42 @@ class TestModelsEndpoint:
         for model in response.json()["data"]:
             assert model["owned_by"] == "anthropic"
 
+    def test_models_codex_array_omits_aliases(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies dual-compat models array excludes MODEL_ALIASES.
+        Purpose: Codex picker should only see canonical IDs; aliases stay in data.
+        """
+        from kiro.config import MODEL_ALIASES
+
+        manager = test_client.app.state.account_manager
+        model_ids = [
+            "auto",
+            "kiro-o-4.8",
+            "claude-opus-4.8",
+            "kiro-glm-5",
+            "glm-5",
+        ]
+        with patch.object(
+            manager,
+            "get_all_available_models",
+            new=AsyncMock(return_value=model_ids),
+        ):
+            response = test_client.get(
+                "/v1/models",
+                headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        data_ids = [m["id"] for m in body["data"]]
+        codex_slugs = [m["slug"] for m in body["models"]]
+
+        assert data_ids == model_ids
+        assert "kiro-o-4.8" not in codex_slugs
+        assert "kiro-glm-5" not in codex_slugs
+        assert codex_slugs == ["auto", "claude-opus-4.8", "glm-5"]
+        assert set(MODEL_ALIASES.keys()).isdisjoint(codex_slugs)
+
 
 # =============================================================================
 # Tests for chat completions endpoint (/v1/chat/completions)

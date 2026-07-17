@@ -54,8 +54,8 @@ class ModelList(BaseModel):
     Response of GET /v1/models endpoint.
 
     ``models`` is an optional Codex-shaped array (ModelInfo stubs). Present
-    for dual compatibility: Cursor/tray keep using ``data``; Codex reads
-    ``models``. Omitted when not populated.
+    for dual compatibility: Cursor/tray keep using ``data`` (with aliases);
+    Codex reads ``models`` (aliases omitted). Omitted when not populated.
     """
     object: str = "list"
     data: List[OpenAIModel]

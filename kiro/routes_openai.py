@@ -148,8 +148,9 @@ async def get_models(request: Request):
     hours. Generation endpoints never trigger this upstream request.
 
     Dual-compatible payload:
-    - OpenAI / Cursor / tray: ``object`` + ``data`` (unchanged)
-    - Codex: also ``models`` (ModelInfo stubs) so decode finds the field
+    - OpenAI / Cursor / tray: ``object`` + ``data`` (includes aliases)
+    - Codex: also ``models`` (ModelInfo stubs, aliases omitted) so decode
+      finds the field without gateway-only shortcut names
     
     Args:
         request: FastAPI Request for accessing app.state
@@ -161,7 +162,7 @@ async def get_models(request: Request):
     
     available_model_ids = await get_available_model_ids(request)
     
-    # Build OpenAI-compatible model list
+    # Build OpenAI-compatible model list (aliases stay here for Cursor)
     openai_models = [
         OpenAIModel(
             id=model_id,

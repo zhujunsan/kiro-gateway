@@ -362,7 +362,7 @@ class TestResponsesModelsCompatibility:
         self, test_client, valid_proxy_api_key
     ):
         manager = test_client.app.state.account_manager
-        model_ids = ["auto", "gpt-5.6-sol", "kiro-s-4.6"]
+        model_ids = ["auto", "gpt-5.6-sol", "kiro-s-4.6", "claude-sonnet-4.6"]
         headers = {"Authorization": f"Bearer {valid_proxy_api_key}"}
 
         with patch.object(
@@ -377,8 +377,11 @@ class TestResponsesModelsCompatibility:
 
         assert openai_response.status_code == 200
         assert responses_response.status_code == 200
+        # OpenAI data keeps aliases for Cursor; Codex models omit them
         assert [item["id"] for item in openai_response.json()["data"]] == model_ids
-        assert [item["slug"] for item in responses_response.json()["models"]] == model_ids
+        codex_slugs = ["auto", "gpt-5.6-sol", "claude-sonnet-4.6"]
+        assert [item["slug"] for item in openai_response.json()["models"]] == codex_slugs
+        assert [item["slug"] for item in responses_response.json()["models"]] == codex_slugs
         assert get_models.await_count == 2
 
 

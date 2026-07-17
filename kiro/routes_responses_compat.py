@@ -86,6 +86,7 @@ async def get_responses_models(request: Request):
 
     Prefer dual-compat ``GET /v1/models`` (also includes ``models``). This
     path exists for clients that probe Responses-specific discovery.
+    Alias slugs are omitted (canonical IDs only).
     """
     logger.info("Request to /v1/responses/models")
     model_ids = await get_available_model_ids(request)

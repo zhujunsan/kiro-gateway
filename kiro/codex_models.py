@@ -28,6 +28,10 @@ list. Stub fields below are the minimum required for decode success
 Capability fields (``input_modalities``, context windows, reasoning levels,
 image detail) are filled per canonical model id after alias resolution via
 ``MODEL_ALIASES``.
+
+Codex list endpoints omit ``MODEL_ALIASES`` keys: aliases exist for Cursor /
+OpenAI ``data`` (e.g. ``kiro-o-*`` to avoid IDE Anthropic sniffing). Codex
+should only see canonical model IDs.
 """
 
 from __future__ import annotations
@@ -288,9 +292,32 @@ def build_codex_model_info(
     }
 
 
+def filter_codex_model_ids(model_ids: Sequence[str]) -> List[str]:
+    """
+    Drop ``MODEL_ALIASES`` keys from a model id list.
+
+    Aliases remain in OpenAI ``data`` for Cursor/tray. Codex ``models`` lists
+    expose only canonical IDs so the picker does not duplicate or prefer
+    gateway-only shortcut names.
+
+    Args:
+        model_ids: Full available-model list (may include aliases).
+
+    Returns:
+        IDs that are not keys of ``MODEL_ALIASES``, order preserved.
+    """
+    return [model_id for model_id in model_ids if model_id not in MODEL_ALIASES]
+
+
 def build_codex_models_list(model_ids: Sequence[str]) -> List[Dict[str, Any]]:
-    """Build Codex ``models`` array; earlier ids get higher priority (lower number)."""
+    """
+    Build Codex ``models`` array without alias slugs.
+
+    Alias keys are filtered out first. Remaining earlier ids get higher
+    priority (lower number).
+    """
+    codex_ids = filter_codex_model_ids(model_ids)
     return [
         build_codex_model_info(model_id, priority=index)
-        for index, model_id in enumerate(model_ids)
+        for index, model_id in enumerate(codex_ids)
     ]

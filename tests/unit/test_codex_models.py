@@ -10,6 +10,7 @@ from kiro.codex_models import (
     MODEL_CAPABILITIES,
     build_codex_model_info,
     build_codex_models_list,
+    filter_codex_model_ids,
     lookup_model_capabilities,
     resolve_canonical_model_id,
 )
@@ -230,9 +231,24 @@ def test_lookup_returns_canonical_and_caps():
 
 
 def test_build_codex_models_list_preserves_order_and_priority():
-    models = build_codex_models_list(["kiro-glm-5", "claude-opus-4.8"])
-    assert [m["slug"] for m in models] == ["kiro-glm-5", "claude-opus-4.8"]
+    models = build_codex_models_list(["glm-5", "claude-opus-4.8"])
+    assert [m["slug"] for m in models] == ["glm-5", "claude-opus-4.8"]
     assert models[0]["priority"] == 0
     assert models[1]["priority"] == 1
     assert models[0]["input_modalities"] == ["text"]
     assert "image" in models[1]["input_modalities"]
+
+
+def test_filter_codex_model_ids_drops_aliases_keeps_canonical():
+    ids = ["auto", "kiro-s-4.6", "claude-sonnet-4.6", "kiro-glm-5", "glm-5"]
+    assert filter_codex_model_ids(ids) == ["auto", "claude-sonnet-4.6", "glm-5"]
+
+
+def test_build_codex_models_list_omits_alias_slugs():
+    models = build_codex_models_list(
+        ["kiro-glm-5", "claude-opus-4.8", "kiro-o-4.8", "auto"]
+    )
+    assert [m["slug"] for m in models] == ["claude-opus-4.8", "auto"]
+    assert models[0]["priority"] == 0
+    assert models[1]["priority"] == 1
+    assert "image" in models[0]["input_modalities"]
