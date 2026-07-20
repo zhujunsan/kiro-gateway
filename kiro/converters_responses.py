@@ -51,6 +51,7 @@ from kiro.converters_core import (
     extract_images_from_content,
     prepare_tool_name_for_kiro,
     sanitize_tool_use_id,
+    tool_arguments_score,
 )
 from kiro.converters_openai import reasoning_effort_to_budget
 
@@ -462,25 +463,6 @@ def _flush_pending_tool_results(
     pending_results.clear()
 
 
-def _tool_arguments_score(arguments: Any) -> int:
-    """Score function-call arguments when choosing between duplicate calls.
-
-    Args:
-        arguments: Raw Responses function-call arguments.
-
-    Returns:
-        Zero for empty arguments, otherwise the serialized argument length.
-    """
-    if arguments is None:
-        return 0
-    if isinstance(arguments, str):
-        stripped = arguments.strip()
-        return 0 if stripped in ("", "{}") else len(stripped)
-    if isinstance(arguments, dict):
-        return 0 if not arguments else len(json.dumps(arguments, sort_keys=True))
-    return len(str(arguments))
-
-
 def _deduplicate_responses_tool_items(items: List[Any]) -> List[Any]:
     """Remove duplicate Responses calls and outputs by sanitized call ID.
 
@@ -528,7 +510,7 @@ def _deduplicate_responses_tool_items(items: List[Any]) -> List[Any]:
 
             duplicate_calls += 1
             existing = result[existing_position]
-            if _tool_arguments_score(item.get("arguments")) > _tool_arguments_score(
+            if tool_arguments_score(item.get("arguments")) > tool_arguments_score(
                 existing.get("arguments")
             ):
                 result[existing_position] = item

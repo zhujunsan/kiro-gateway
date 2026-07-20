@@ -798,6 +798,117 @@ def sanitize_tool_use_id(tool_id: Any) -> str:
     return cleaned
 
 
+def tool_arguments_score(arguments: Any) -> int:
+    """
+    Score tool-call arguments when choosing between duplicate IDs.
+
+    Empty / ``{}`` arguments score as zero so a later replay with real
+    parameters wins. Non-empty values use serialized length as a proxy for
+    completeness (same policy as Responses ``function_call`` dedupe).
+
+    Args:
+        arguments: OpenAI JSON string, Anthropic/Kiro dict, or other raw value.
+
+    Returns:
+        Zero for empty arguments, otherwise the serialized argument length.
+    """
+    if arguments is None:
+        return 0
+    if isinstance(arguments, str):
+        stripped = arguments.strip()
+        return 0 if stripped in ("", "{}") else len(stripped)
+    if isinstance(arguments, dict):
+        return 0 if not arguments else len(json.dumps(arguments, sort_keys=True))
+    return len(str(arguments))
+
+
+def deduplicate_kiro_tool_uses(tool_uses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Collapse duplicate Kiro ``toolUses`` that share a non-empty ``toolUseId``.
+
+    Bedrock rejects a single assistant message whose ``toolUse`` blocks repeat
+    an ID (``TOOL_DUPLICATE``). Some clients (Cursor chat history, Codex
+    Responses replay) emit the same id twice — often one real call plus an
+    empty ``{}`` ghost. Keep the copy with richer ``input``; leave blank IDs
+    alone so we do not accidentally merge unrelated empty entries.
+
+    Args:
+        tool_uses: Tool uses already in Kiro format
+            (``name`` / ``input`` / ``toolUseId``).
+
+    Returns:
+        Deduplicated list preserving first-seen order for unique IDs.
+    """
+    result: List[Dict[str, Any]] = []
+    positions: Dict[str, int] = {}
+    duplicates = 0
+
+    for tool_use in tool_uses:
+        tool_use_id = tool_use.get("toolUseId") or ""
+        if not tool_use_id:
+            result.append(tool_use)
+            continue
+
+        existing_position = positions.get(tool_use_id)
+        if existing_position is None:
+            positions[tool_use_id] = len(result)
+            result.append(tool_use)
+            continue
+
+        duplicates += 1
+        existing = result[existing_position]
+        if tool_arguments_score(tool_use.get("input")) > tool_arguments_score(
+            existing.get("input")
+        ):
+            result[existing_position] = tool_use
+
+    if duplicates:
+        logger.warning(
+            f"Deduplicated {duplicates} duplicate toolUse(s) by toolUseId "
+            f"({len(tool_uses)} -> {len(result)})"
+        )
+    return result
+
+
+def deduplicate_kiro_tool_results(
+    tool_results: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Collapse duplicate Kiro ``toolResults`` that share a non-empty ``toolUseId``.
+
+    After duplicate tool uses are collapsed, clients may still replay multiple
+    results for the same id. Keep the first result; blank IDs are preserved.
+
+    Args:
+        tool_results: Tool results already in Kiro format
+            (``content`` / ``status`` / ``toolUseId``).
+
+    Returns:
+        Deduplicated list preserving first-seen order for unique IDs.
+    """
+    result: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    duplicates = 0
+
+    for tool_result in tool_results:
+        tool_use_id = tool_result.get("toolUseId") or ""
+        if not tool_use_id:
+            result.append(tool_result)
+            continue
+        if tool_use_id in seen_ids:
+            duplicates += 1
+            continue
+        seen_ids.add(tool_use_id)
+        result.append(tool_result)
+
+    if duplicates:
+        logger.warning(
+            f"Deduplicated {duplicates} duplicate toolResult(s) by toolUseId "
+            f"({len(tool_results)} -> {len(result)})"
+        )
+    return result
+
+
 def convert_tool_results_to_kiro_format(tool_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Converts unified tool results to Kiro API format.
@@ -829,7 +940,7 @@ def convert_tool_results_to_kiro_format(tool_results: List[Dict[str, Any]]) -> L
             "toolUseId": sanitize_tool_use_id(tr.get("tool_use_id", "")),
         })
     
-    return kiro_results
+    return deduplicate_kiro_tool_results(kiro_results)
 
 
 def extract_tool_results_from_content(content: Any) -> List[Dict[str, Any]]:
@@ -856,7 +967,7 @@ def extract_tool_results_from_content(content: Any) -> List[Dict[str, Any]]:
                     "toolUseId": sanitize_tool_use_id(item.get("tool_use_id", "")),
                 })
     
-    return tool_results
+    return deduplicate_kiro_tool_results(tool_results)
 
 
 def extract_tool_uses_from_message(
@@ -906,7 +1017,7 @@ def extract_tool_uses_from_message(
                     "toolUseId": sanitize_tool_use_id(item.get("id", "")),
                 })
     
-    return tool_uses
+    return deduplicate_kiro_tool_uses(tool_uses)
 
 
 # ==================================================================================================

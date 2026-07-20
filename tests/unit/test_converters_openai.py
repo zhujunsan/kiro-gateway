@@ -1399,6 +1399,89 @@ class TestBuildKiroPayloadToolCallsIntegration:
         print(f"ToolResult IDs: {tool_result_ids}")
         assert "tooluse_first" in tool_result_ids
         assert "tooluse_second" in tool_result_ids
+
+    def test_duplicate_tool_call_ids_in_one_assistant_are_collapsed(self):
+        """
+        What it does: Collapses Cursor-style duplicate tool_call ids before Kiro.
+        Purpose: Prevent Bedrock TOOL_DUPLICATE 400 when one assistant emits
+        the same id twice (real Grep + empty {} ghost) with matching tool results.
+        """
+        dup_id = "toolu_bdrk_01XBvVDVxMsYyyx59mYXRbLe"
+        request = ChatCompletionRequest(
+            model="kiro-o-4.6",
+            messages=[
+                ChatMessage(role="user", content="find qa pilot"),
+                ChatMessage(
+                    role="assistant",
+                    content=" ",
+                    tool_calls=[
+                        {
+                            "id": dup_id,
+                            "type": "function",
+                            "function": {
+                                "name": "Grep",
+                                "arguments": (
+                                    '{"pattern":"qa.?pilot","path":"/Users/x","head_limit":40}'
+                                ),
+                            },
+                        },
+                        {
+                            "id": dup_id,
+                            "type": "function",
+                            "function": {"name": "Grep", "arguments": "{}"},
+                        },
+                    ],
+                ),
+                ChatMessage(
+                    role="tool",
+                    content="Error: Grep was interrupted by the user",
+                    tool_call_id=dup_id,
+                ),
+                ChatMessage(
+                    role="tool",
+                    content="Error: Grep was interrupted by the user",
+                    tool_call_id=dup_id,
+                ),
+                ChatMessage(role="user", content="continue"),
+            ],
+            tools=[
+                Tool(
+                    type="function",
+                    function=ToolFunction(
+                        name="Grep",
+                        description="Search files",
+                        parameters={
+                            "type": "object",
+                            "properties": {"pattern": {"type": "string"}},
+                        },
+                    ),
+                )
+            ],
+        )
+
+        result = build_kiro_payload(request, "conv-dup", "arn:aws:test")
+        history = result["conversationState"]["history"]
+        assistant_msgs = [h for h in history if "assistantResponseMessage" in h]
+        assert assistant_msgs
+        tool_uses = assistant_msgs[0]["assistantResponseMessage"]["toolUses"]
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["toolUseId"] == dup_id
+        assert tool_uses[0]["input"]["pattern"] == "qa.?pilot"
+
+        # Tool results may land in history or currentMessage after adjacent-user merge.
+        tool_results: list = []
+        for h in history:
+            ctx = h.get("userInputMessage", {}).get("userInputMessageContext") or {}
+            tool_results.extend(ctx.get("toolResults") or [])
+        current_ctx = (
+            result["conversationState"]["currentMessage"]["userInputMessage"].get(
+                "userInputMessageContext"
+            )
+            or {}
+        )
+        tool_results.extend(current_ctx.get("toolResults") or [])
+        assert len(tool_results) == 1
+        assert tool_results[0]["toolUseId"] == dup_id
     
     def test_long_tool_description_added_to_system_prompt(self):
         """

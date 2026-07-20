@@ -38,6 +38,9 @@ from kiro.converters_core import (
     TOOL_USE_ID_MAX_LENGTH,
     convert_tools_to_kiro_format,
     convert_tool_results_to_kiro_format,
+    deduplicate_kiro_tool_results,
+    deduplicate_kiro_tool_uses,
+    tool_arguments_score,
     tool_calls_to_text,
     tool_results_to_text,
     UnifiedMessage,
@@ -2843,6 +2846,204 @@ class TestSanitizeToolUseId:
             "content": "ok",
         }])
         assert result[0]["toolUseId"] == "call_xfc_y"
+
+
+# ==================================================================================================
+# Tests for duplicate toolUseId / toolResult collapse (Bedrock TOOL_DUPLICATE)
+# ==================================================================================================
+
+class TestDeduplicateKiroToolIds:
+    """Collapse repeated toolUseId values before they reach Bedrock."""
+
+    def test_arguments_score_treats_empty_as_zero(self):
+        """Empty / {} arguments must lose to any real payload."""
+        assert tool_arguments_score(None) == 0
+        assert tool_arguments_score("") == 0
+        assert tool_arguments_score("{}") == 0
+        assert tool_arguments_score({}) == 0
+        assert tool_arguments_score('{"pattern":"x"}') > 0
+        assert tool_arguments_score({"pattern": "x"}) > 0
+
+    def test_dedupe_tool_uses_prefers_richer_input(self):
+        """
+        What it does: Keeps the non-empty Grep when the same id appears twice.
+        Purpose: Cursor sometimes replays a real call plus an empty {} ghost.
+        """
+        uses = [
+            {
+                "name": "Grep",
+                "input": {},
+                "toolUseId": "toolu_bdrk_dup",
+            },
+            {
+                "name": "Grep",
+                "input": {"pattern": "qa.?pilot", "path": "/tmp", "head_limit": 40},
+                "toolUseId": "toolu_bdrk_dup",
+            },
+        ]
+        result = deduplicate_kiro_tool_uses(uses)
+        assert len(result) == 1
+        assert result[0]["toolUseId"] == "toolu_bdrk_dup"
+        assert result[0]["input"]["pattern"] == "qa.?pilot"
+
+    def test_dedupe_tool_uses_keeps_first_when_scores_equal(self):
+        """Equal-richness duplicates keep the first occurrence (stable)."""
+        uses = [
+            {"name": "A", "input": {"x": 1}, "toolUseId": "same"},
+            {"name": "B", "input": {"y": 2}, "toolUseId": "same"},
+        ]
+        result = deduplicate_kiro_tool_uses(uses)
+        assert len(result) == 1
+        assert result[0]["name"] == "A"
+
+    def test_dedupe_tool_uses_leaves_unique_and_blank_ids(self):
+        """Unique IDs and blank IDs must not be collapsed together."""
+        uses = [
+            {"name": "a", "input": {"q": 1}, "toolUseId": "id1"},
+            {"name": "b", "input": {"q": 2}, "toolUseId": "id2"},
+            {"name": "c", "input": {}, "toolUseId": ""},
+            {"name": "d", "input": {}, "toolUseId": ""},
+        ]
+        result = deduplicate_kiro_tool_uses(uses)
+        assert len(result) == 4
+        assert [u["toolUseId"] for u in result] == ["id1", "id2", "", ""]
+
+    def test_dedupe_tool_results_keeps_first(self):
+        """Duplicate toolResults for one id keep the first content only."""
+        results = [
+            {
+                "content": [{"text": "first"}],
+                "status": "success",
+                "toolUseId": "toolu_bdrk_dup",
+            },
+            {
+                "content": [{"text": "second"}],
+                "status": "success",
+                "toolUseId": "toolu_bdrk_dup",
+            },
+        ]
+        out = deduplicate_kiro_tool_results(results)
+        assert len(out) == 1
+        assert out[0]["content"][0]["text"] == "first"
+
+    def test_extract_tool_uses_collapses_openai_duplicates(self):
+        """extract_tool_uses_from_message must apply dedupe on OpenAI tool_calls."""
+        tool_calls = [
+            {
+                "id": "toolu_bdrk_01XBvVDVxMsYyyx59mYXRbLe",
+                "function": {
+                    "name": "Grep",
+                    "arguments": (
+                        '{"pattern":"qa.?pilot","path":"/Users/x/Cursor","head_limit":40}'
+                    ),
+                },
+            },
+            {
+                "id": "toolu_bdrk_01XBvVDVxMsYyyx59mYXRbLe",
+                "function": {"name": "Grep", "arguments": "{}"},
+            },
+        ]
+        result = extract_tool_uses_from_message("", tool_calls)
+        assert len(result) == 1
+        assert result[0]["input"]["pattern"] == "qa.?pilot"
+
+    def test_extract_tool_uses_collapses_anthropic_content_duplicates(self):
+        """Anthropic content tool_use blocks with the same id also collapse."""
+        content = [
+            {
+                "type": "tool_use",
+                "id": "toolu_same",
+                "name": "Bash",
+                "input": {},
+            },
+            {
+                "type": "tool_use",
+                "id": "toolu_same",
+                "name": "Bash",
+                "input": {"command": "ls"},
+            },
+        ]
+        result = extract_tool_uses_from_message(content, None)
+        assert len(result) == 1
+        assert result[0]["input"] == {"command": "ls"}
+
+    def test_convert_tool_results_collapses_duplicate_ids(self):
+        """convert_tool_results_to_kiro_format drops later results for same id."""
+        result = convert_tool_results_to_kiro_format([
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_bdrk_dup",
+                "content": "Error: Grep was interrupted",
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_bdrk_dup",
+                "content": "Error: Grep was interrupted again",
+            },
+        ])
+        assert len(result) == 1
+        assert result[0]["content"][0]["text"] == "Error: Grep was interrupted"
+
+    def test_build_kiro_history_incident_duplicate_tool_use_id(self):
+        """
+        What it does: Replays the Cursor TOOL_DUPLICATE incident shape end-to-end.
+        Purpose: history assistant toolUses and following toolResults must be unique.
+        """
+        dup_id = "toolu_bdrk_01XBvVDVxMsYyyx59mYXRbLe"
+        messages = [
+            UnifiedMessage(role="user", content="find qa pilot"),
+            UnifiedMessage(
+                role="assistant",
+                content=" ",
+                tool_calls=[
+                    {
+                        "id": dup_id,
+                        "type": "function",
+                        "function": {
+                            "name": "Grep",
+                            "arguments": (
+                                '{"pattern":"qa.?pilot|qaPilot","path":"/Users/x",'
+                                '"head_limit":40,"-i":true}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": dup_id,
+                        "type": "function",
+                        "function": {"name": "Grep", "arguments": "{}"},
+                    },
+                ],
+            ),
+            UnifiedMessage(
+                role="user",
+                content="",
+                tool_results=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": dup_id,
+                        "content": "Error: Grep was interrupted by the user",
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": dup_id,
+                        "content": "Error: Grep was interrupted by the user",
+                    },
+                ],
+            ),
+            UnifiedMessage(role="user", content="continue"),
+        ]
+        history = build_kiro_history(messages, "claude-opus-4.6")
+        assistant = history[1]["assistantResponseMessage"]
+        tool_uses = assistant["toolUses"]
+        assert len(tool_uses) == 1
+        assert tool_uses[0]["toolUseId"] == dup_id
+        assert "pattern" in tool_uses[0]["input"]
+
+        tool_results = history[2]["userInputMessage"]["userInputMessageContext"][
+            "toolResults"
+        ]
+        assert len(tool_results) == 1
+        assert tool_results[0]["toolUseId"] == dup_id
 
 
 # ==================================================================================================
