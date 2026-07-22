@@ -52,6 +52,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from loguru import logger
 
 from kiro.config import (
@@ -85,6 +86,11 @@ from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.account_manager import AccountManager
 from kiro.proxy import resolve_proxy
+from kiro.usage_upstream import (
+    build_usage_account_unavailable_response,
+    build_usage_network_error_response,
+    fetch_usage_limits,
+)
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.routes_responses import router as responses_router
@@ -661,9 +667,15 @@ def _usage_summary(data: dict) -> dict:
     }
 
 
+
 @app.get("/usage", dependencies=[Depends(verify_api_key)])
 async def kiro_usage(request: Request, raw: bool = False):
-    """Account quota via Amazon Q getUsageLimits. Auth: Bearer PROXY_API_KEY."""
+    """Account quota via Amazon Q getUsageLimits. Auth: Bearer PROXY_API_KEY.
+
+    Transport blips are retried with backoff inside ``fetch_usage_limits``. Soft
+    503 JSON is returned to callers (tray treats non-200 as a miss). Sentry is
+    only notified after a sustained failure streak, not on isolated errors.
+    """
     auth, am = _usage_pick_auth()
     if auth is None:
         if am is not None:
@@ -676,7 +688,7 @@ async def kiro_usage(request: Request, raw: bool = False):
                 _acc = am._accounts.get(_ids[0])
                 auth = _acc.auth_manager if _acc else None
     if auth is None:
-        raise HTTPException(status_code=503, detail="No initialized Kiro account available")
+        return build_usage_account_unavailable_response()
 
     token = await auth.get_access_token()
     profile_arn = auth.profile_arn
@@ -708,21 +720,27 @@ async def kiro_usage(request: Request, raw: bool = False):
         "Authorization": "Bearer {}".format(token),
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=60, proxy=resolve_proxy()) as client:
-            resp = await client.get(url, headers=headers)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail="Upstream request failed: {}".format(e))
+    result = await fetch_usage_limits(
+        url=url,
+        headers=headers,
+        proxy=resolve_proxy(),
+    )
+    if result.response is None:
+        assert result.error is not None
+        return build_usage_network_error_response(result.error)
 
+    resp = result.response
     if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        # Non-retryable upstream body (auth/validation): soft JSON, no raise.
+        return JSONResponse(status_code=resp.status_code, content={"detail": resp.text})
 
     data = resp.json()
     if raw:
         return data
-    result = _usage_summary(data)
-    result["region"] = region
-    return result
+    summary = _usage_summary(data)
+    summary["region"] = region
+    return summary
+
 
 
 # --- Uvicorn log config ---
