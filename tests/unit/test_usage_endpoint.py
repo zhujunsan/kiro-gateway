@@ -1,7 +1,7 @@
 """Unit tests for /usage upstream retry and outage reporting."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -13,6 +13,8 @@ from kiro.usage_upstream import (
     UsageUpstreamMonitor,
     build_usage_network_error_response,
     fetch_usage_limits,
+    finalize_usage_transport_failure,
+    obtain_usage_access_token,
     report_usage_outage,
 )
 
@@ -24,6 +26,81 @@ class TestBuildUsageNetworkErrorResponse:
         response = build_usage_network_error_response(httpx.ConnectError("proxy tls failed"))
         assert response.status_code == 503
         assert b"usage_upstream_unreachable" in response.body
+
+
+@pytest.mark.asyncio
+class TestObtainUsageAccessToken:
+    """Token refresh transport errors must soft-fail like getUsageLimits."""
+
+    async def test_success_returns_token(self) -> None:
+        auth = MagicMock()
+        auth.get_access_token = AsyncMock(return_value="tok-ok")
+        token, error = await obtain_usage_access_token(
+            auth,
+            monitor=UsageUpstreamMonitor(),
+        )
+        assert token == "tok-ok"
+        assert error is None
+
+    async def test_connect_error_returns_soft_503_and_notes_monitor(self) -> None:
+        auth = MagicMock()
+        auth.get_access_token = AsyncMock(
+            side_effect=httpx.ConnectError("oidc unreachable")
+        )
+        monitor = UsageUpstreamMonitor()
+        token, error = await obtain_usage_access_token(auth, monitor=monitor)
+        assert token is None
+        assert error is not None
+        assert error.status_code == 503
+        assert b"usage_upstream_unreachable" in error.body
+        assert monitor.consecutive_failures == 1
+
+    async def test_read_timeout_returns_soft_503(self) -> None:
+        auth = MagicMock()
+        auth.get_access_token = AsyncMock(
+            side_effect=httpx.ReadTimeout("oidc timed out")
+        )
+        token, error = await obtain_usage_access_token(
+            auth,
+            monitor=UsageUpstreamMonitor(),
+        )
+        assert token is None
+        assert error is not None
+        assert error.status_code == 503
+        assert b"usage_upstream_unreachable" in error.body
+
+    async def test_value_error_propagates(self) -> None:
+        auth = MagicMock()
+        auth.get_access_token = AsyncMock(
+            side_effect=ValueError("Token expired and refresh failed")
+        )
+        with pytest.raises(ValueError, match="Token expired"):
+            await obtain_usage_access_token(auth, monitor=UsageUpstreamMonitor())
+
+
+@pytest.mark.asyncio
+async def test_finalize_usage_transport_failure_escalates_after_streak() -> None:
+    """Shared soft-fail path gates Sentry like getUsageLimits exhaustion."""
+    monitor = UsageUpstreamMonitor()
+    fake_sdk = MagicMock()
+    scope = MagicMock()
+    fake_sdk.new_scope.return_value.__enter__.return_value = scope
+    with patch.dict("sys.modules", {"sentry_sdk": fake_sdk}):
+        for _ in range(USAGE_OUTAGE_CONSECUTIVE_THRESHOLD - 1):
+            resp = await finalize_usage_transport_failure(
+                httpx.ConnectError("blip"),
+                attempts=1,
+                monitor=monitor,
+            )
+            assert resp.status_code == 503
+            fake_sdk.capture_message.assert_not_called()
+        resp = await finalize_usage_transport_failure(
+            httpx.ConnectError("sustained"),
+            attempts=1,
+            monitor=monitor,
+        )
+        assert resp.status_code == 503
+        fake_sdk.capture_message.assert_called_once()
 
 
 @pytest.mark.asyncio

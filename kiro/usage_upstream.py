@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Amazon Q getUsageLimits probe with retry and rate-limited outage reporting.
+"""Amazon Q usage probe helpers with retry and rate-limited outage reporting.
 
 ``GET /usage`` is polled by the tray menu and credit sampler. Occasional proxy
-or upstream ConnectError must not spam Sentry or surface as hard failures.
-Callers already treat non-200 as a soft miss; this module adds bounded retries
+or upstream ConnectError — including AWS SSO OIDC token refresh — must not spam
+Sentry or surface as hard 500s. Callers already treat non-200 as a soft miss;
+this module soft-fails transport errors, retries getUsageLimits with backoff,
 and only escalates when failures look sustained (outage-like).
 """
 from __future__ import annotations
@@ -139,6 +140,71 @@ def build_usage_account_unavailable_response() -> JSONResponse:
             }
         },
     )
+
+
+async def finalize_usage_transport_failure(
+    exc: BaseException,
+    *,
+    attempts: int = 1,
+    monitor: Optional[UsageUpstreamMonitor] = None,
+) -> JSONResponse:
+    """Record a transport soft-failure and return the shared 503 JSON.
+
+    Used for both AWS SSO token refresh failures and getUsageLimits transport
+    exhaustion so /usage never bubbles ConnectError/ReadTimeout as HTTP 500.
+
+    Args:
+        exc: Transport or HTTP error that ended the attempt.
+        attempts: How many tries were made for this request (token path is 1).
+        monitor: Failure-streak monitor; defaults to the process singleton.
+
+    Returns:
+        Soft 503 JSONResponse with ``usage_upstream_unreachable``.
+    """
+    mon = monitor if monitor is not None else usage_upstream_monitor
+    should_report = await mon.note_failure()
+    if should_report:
+        report_usage_outage(
+            exc,
+            consecutive=mon.consecutive_failures,
+            attempts=attempts,
+        )
+    return build_usage_network_error_response(exc)
+
+
+async def obtain_usage_access_token(
+    auth: Any,
+    *,
+    monitor: Optional[UsageUpstreamMonitor] = None,
+) -> tuple[Optional[str], Optional[JSONResponse]]:
+    """Resolve a bearer token for GET /usage without raising transport errors.
+
+    ``auth.get_access_token()`` may refresh via AWS SSO OIDC. Proxy/IdP blips
+    raise ``httpx.ConnectError`` / ``httpx.ReadTimeout`` (subclasses of
+    ``httpx.HTTPError``). Those must soft-fail like getUsageLimits, not 500.
+
+    Args:
+        auth: Initialized ``KiroAuthManager`` (duck-typed: ``get_access_token``).
+        monitor: Optional outage monitor override for tests.
+
+    Returns:
+        ``(token, None)`` on success, or ``(None, soft_503_response)`` on
+        ``httpx.HTTPError``. Non-HTTP errors (e.g. ``ValueError``) propagate.
+    """
+    try:
+        token = await auth.get_access_token()
+    except httpx.HTTPError as exc:
+        logger.debug(
+            "GET /usage token refresh transport error: {}: {}",
+            type(exc).__name__,
+            exc,
+        )
+        return None, await finalize_usage_transport_failure(
+            exc,
+            attempts=1,
+            monitor=monitor,
+        )
+    return token, None
 
 
 def _retry_delay_seconds(attempt_index: int) -> float:

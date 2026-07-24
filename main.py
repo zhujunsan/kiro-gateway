@@ -90,6 +90,7 @@ from kiro.usage_upstream import (
     build_usage_account_unavailable_response,
     build_usage_network_error_response,
     fetch_usage_limits,
+    obtain_usage_access_token,
 )
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
@@ -672,9 +673,9 @@ def _usage_summary(data: dict) -> dict:
 async def kiro_usage(request: Request, raw: bool = False):
     """Account quota via Amazon Q getUsageLimits. Auth: Bearer PROXY_API_KEY.
 
-    Transport blips are retried with backoff inside ``fetch_usage_limits``. Soft
-    503 JSON is returned to callers (tray treats non-200 as a miss). Sentry is
-    only notified after a sustained failure streak, not on isolated errors.
+    Token refresh (AWS SSO OIDC) and getUsageLimits transport blips soft-fail
+    as 503 JSON (tray treats non-200 as a miss). getUsageLimits retries with
+    backoff; Sentry is only notified after a sustained failure streak.
     """
     auth, am = _usage_pick_auth()
     if auth is None:
@@ -690,7 +691,9 @@ async def kiro_usage(request: Request, raw: bool = False):
     if auth is None:
         return build_usage_account_unavailable_response()
 
-    token = await auth.get_access_token()
+    token, token_error = await obtain_usage_access_token(auth)
+    if token_error is not None:
+        return token_error
     profile_arn = auth.profile_arn
 
     region = None
