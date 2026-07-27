@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
+from kiro.model_aliases import generate_model_alias
+
 # Load environment variables
 load_dotenv()
 
@@ -233,47 +235,53 @@ HIDDEN_MODELS: Dict[str, str] = {
 }
 
 # ==================================================================================================
+# Fallback Models Configuration (DNS Failure Recovery)
+# ==================================================================================================
+
+# Fallback model list - used when /ListAvailableModels API is unreachable.
+# This ensures basic functionality even with DNS/network issues.
+#
+# IMPORTANT: This list represents known models at the time of this gateway version.
+# - Some models may not be available on your Kiro plan (e.g., Opus on free tier)
+# - New models released after this version won't appear here
+# - Update gateway regularly to get the latest model list
+# Defined before MODEL_ALIASES so the static alias table can be derived from it.
+FALLBACK_MODELS: List[Dict[str, str]] = [
+    {"modelId": "auto"},
+    {"modelId": "claude-sonnet-5"},
+    {"modelId": "claude-haiku-4.5"},
+    {"modelId": "claude-opus-4.6"},
+    {"modelId": "claude-opus-5"},
+    {"modelId": "gpt-5.6-sol"},
+    {"modelId": "gpt-5.6-terra"},
+    {"modelId": "gpt-5.6-luna"},
+    {"modelId": "deepseek-3.2"},
+    {"modelId": "glm-5"},
+    {"modelId": "minimax-m2.5"},
+    {"modelId": "qwen3-coder-next"},
+]
+
+# ==================================================================================================
 # Model Aliases Configuration
 # ==================================================================================================
 
-# Model aliases - custom names that map to real model IDs.
-# This feature allows creating alternative names for models when clients route
-# provider-branded model names outside the configured OpenAI-compatible endpoint.
+# Model aliases - Cursor-safe names that map to real model IDs.
+# Built from FALLBACK_MODELS via generate_model_alias so DNS-failure offline
+# lists stay in sync with the same rules used at runtime for discovered models.
 #
 # Format: {"alias_name": "real_model_id"}
 # - alias_name: The name that will appear in /v1/models and can be used in requests
 # - real_model_id: The actual model ID that will be sent to Kiro API
 #
-# Use cases:
-# - Route provider-branded Claude names through custom OpenAI-compatible endpoints
-# - Create user-friendly shortcuts (e.g., "my-opus" → "claude-opus-4.5")
-# - Support legacy model names from other providers
-#
-# Example:
-#   MODEL_ALIASES = {
-#       "my-opus": "claude-opus-4.5",
-#       "legacy-sonnet": "claude-sonnet-4.6"
-#   }
-#
-# Native ``auto`` and GPT model IDs intentionally have no aliases. GPT models use
-# their real IDs and remain in ``FALLBACK_MODELS`` for deployments without discovery.
-MODEL_ALIASES: Dict[str, str] = {
-    # Claude Opus (use -o- code so the alias does not contain "opus", which
-    # IDEs like Cursor sniff out and treat as a native Anthropic model)
-    "kiro-o-4.8": "claude-opus-4.8",
-    "kiro-o-4.7": "claude-opus-4.7",
-    "kiro-o-4.6": "claude-opus-4.6",
-    # Claude Sonnet (use -s- code, see note above)
-    "kiro-s-5": "claude-sonnet-5",
-    "kiro-s-4.6": "claude-sonnet-4.6",
-    # Claude Haiku (use -h- code, see note above)
-    "kiro-h-4.5": "claude-haiku-4.5",
-    # Non-Claude models
-    "kiro-deepseek-3.2": "deepseek-3.2",
-    "kiro-glm-5": "glm-5",
-    "kiro-minimax-m2.5": "minimax-m2.5",
-    "kiro-qwen3-coder-next": "qwen3-coder-next",
-}
+# Native ``auto`` and GPT model IDs intentionally have no aliases.
+# Runtime /v1/models only lists aliases whose targets are currently available
+# (see ModelResolver.get_available_models); stale entries are not shown.
+MODEL_ALIASES: Dict[str, str] = {}
+for _fallback_entry in FALLBACK_MODELS:
+    _fallback_id = _fallback_entry["modelId"]
+    _generated_alias = generate_model_alias(_fallback_id)
+    if _generated_alias:
+        MODEL_ALIASES[_generated_alias] = _fallback_id
 
 # Models to hide from /v1/models endpoint.
 # These models still work when requested directly, but are not shown in the model list.
@@ -286,37 +294,12 @@ MODEL_ALIASES: Dict[str, str] = {
 # but no longer accept (timeout / INVALID_MODEL_ID).
 HIDDEN_FROM_LIST: List[str] = [
     "claude-opus-4.5",
+    "claude-opus-4.7",
+    "claude-opus-4.8",
     "claude-sonnet-4",
     "claude-sonnet-4.5",
+    "claude-sonnet-4.6",
     "minimax-m2.1",
-]
-
-# ==================================================================================================
-# Fallback Models Configuration (DNS Failure Recovery)
-# ==================================================================================================
-
-# Fallback model list - used when /ListAvailableModels API is unreachable.
-# This ensures basic functionality even with DNS/network issues.
-#
-# IMPORTANT: This list represents known models at the time of this gateway version.
-# - Some models may not be available on your Kiro plan (e.g., Opus on free tier)
-# - New models released after this version won't appear here
-# - Update gateway regularly to get the latest model list
-FALLBACK_MODELS: List[Dict[str, str]] = [
-    {"modelId": "auto"},
-    {"modelId": "claude-sonnet-5"},
-    {"modelId": "claude-sonnet-4.6"},
-    {"modelId": "claude-haiku-4.5"},
-    {"modelId": "claude-opus-4.6"},
-    {"modelId": "claude-opus-4.7"},
-    {"modelId": "claude-opus-4.8"},
-    {"modelId": "gpt-5.6-sol"},
-    {"modelId": "gpt-5.6-terra"},
-    {"modelId": "gpt-5.6-luna"},
-    {"modelId": "deepseek-3.2"},
-    {"modelId": "glm-5"},
-    {"modelId": "minimax-m2.5"},
-    {"modelId": "qwen3-coder-next"},
 ]
 
 # ==================================================================================================

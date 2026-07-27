@@ -594,14 +594,20 @@ class TestFallbackModelsConfig:
 
         retired = {
             "claude-opus-4.5",
+            "claude-opus-4.7",
+            "claude-opus-4.8",
             "claude-sonnet-4",
             "claude-sonnet-4.5",
+            "claude-sonnet-4.6",
             "minimax-m2.1",
         }
         retired_aliases = {
             "kiro-o-4.5",
+            "kiro-o-4.7",
+            "kiro-o-4.8",
             "kiro-s-4",
             "kiro-s-4.5",
+            "kiro-s-4.6",
             "kiro-minimax-m2.1",
         }
 
@@ -610,6 +616,8 @@ class TestFallbackModelsConfig:
         assert retired_aliases.isdisjoint(MODEL_ALIASES.keys())
         assert retired.issubset(set(HIDDEN_FROM_LIST))
         assert not any(target in retired for target in MODEL_ALIASES.values())
+        assert "claude-opus-5" in fallback_ids
+        assert MODEL_ALIASES.get("kiro-o-5") == "claude-opus-5"
 
     def test_native_auto_and_gpt_models_have_no_aliases(self):
         """Verify native auto/GPT IDs are exposed without synthetic aliases."""
@@ -678,7 +686,8 @@ class TestFallbackModelsIntegration:
         # Test that dash format is normalized and found in current FALLBACK_MODELS
         test_cases = [
             ("claude-opus-4-6", "claude-opus-4.6"),  # Dash → Dot
-            ("claude-sonnet-4-6", "claude-sonnet-4.6"),  # Dash → Dot
+            ("claude-opus-5", "claude-opus-5"),
+            ("claude-sonnet-5", "claude-sonnet-5"),
             ("claude-haiku-4-5", "claude-haiku-4.5"),  # Dash → Dot
         ]
         
@@ -722,15 +731,22 @@ class TestFallbackModelsIntegration:
         available = resolver.get_available_models()
         
         print(f"Available models: {available}")
-        print(f"Comparing length: Expected {len(FALLBACK_MODELS)}, Got {len(available)}")
-        assert len(available) == len(FALLBACK_MODELS)
         
-        # Verify all fallback models are present
+        # Verify all fallback models are present (aliases may also be listed)
+        from kiro.model_aliases import generate_model_alias
+
         fallback_ids = {m["modelId"] for m in FALLBACK_MODELS}
         available_set = set(available)
         
-        print(f"Comparing sets: Expected {fallback_ids}, Got {available_set}")
-        assert fallback_ids == available_set
+        print(f"Comparing fallback subset: Expected {fallback_ids} ⊆ {available_set}")
+        assert fallback_ids.issubset(available_set)
+
+        for model_id in fallback_ids:
+            alias = generate_model_alias(model_id)
+            if alias:
+                assert alias in available_set, f"Missing generated alias {alias} for {model_id}"
+            else:
+                assert model_id in ("auto",) or model_id.startswith("gpt-")
 
 
 # ==================================================================================================

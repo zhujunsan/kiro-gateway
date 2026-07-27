@@ -39,6 +39,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Sequence, Tuple
 
 from kiro.config import MODEL_ALIASES
+from kiro.model_aliases import resolve_model_alias
 
 # Codex ReasoningLevelInfo shape: {"effort": str, "description": str}
 _REASONING_DESCRIPTIONS: Dict[str, str] = {
@@ -77,6 +78,14 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "default_reasoning_level": None,
         "context_window": None,
         "max_context_window": None,
+    },
+    "claude-opus-5": {
+        "input_modalities": list(_TEXT_IMAGE),
+        "supports_image_detail_original": True,
+        "supported_reasoning_levels": list(_LEVELS_OPUS_NEW),
+        "default_reasoning_level": "medium",
+        "context_window": 1_000_000,
+        "max_context_window": 1_000_000,
     },
     "claude-opus-4.8": {
         "input_modalities": list(_TEXT_IMAGE),
@@ -208,7 +217,7 @@ _FALLBACK_CLAUDE_HEURISTIC: Dict[str, Any] = {
 
 def resolve_canonical_model_id(model_id: str) -> str:
     """Map list slug / alias to the real modelId used for capability lookup."""
-    return MODEL_ALIASES.get(model_id, model_id)
+    return resolve_model_alias(model_id, MODEL_ALIASES)
 
 
 def lookup_model_capabilities(model_id: str) -> Tuple[str, Dict[str, Any]]:
@@ -294,19 +303,29 @@ def build_codex_model_info(
 
 def filter_codex_model_ids(model_ids: Sequence[str]) -> List[str]:
     """
-    Drop ``MODEL_ALIASES`` keys from a model id list.
+    Drop Cursor-safe alias slugs from a model id list.
 
     Aliases remain in OpenAI ``data`` for Cursor/tray. Codex ``models`` lists
     expose only canonical IDs so the picker does not duplicate or prefer
     gateway-only shortcut names.
 
+    A slug is treated as an alias when it is a key of ``MODEL_ALIASES`` or when
+    ``resolve_model_alias`` rewrites it (syntactic ``kiro-o|s|h-*`` / ``kiro-*``).
+
     Args:
         model_ids: Full available-model list (may include aliases).
 
     Returns:
-        IDs that are not keys of ``MODEL_ALIASES``, order preserved.
+        Canonical model IDs only, order preserved.
     """
-    return [model_id for model_id in model_ids if model_id not in MODEL_ALIASES]
+    filtered: List[str] = []
+    for model_id in model_ids:
+        if model_id in MODEL_ALIASES:
+            continue
+        if resolve_model_alias(model_id, MODEL_ALIASES) != model_id:
+            continue
+        filtered.append(model_id)
+    return filtered
 
 
 def build_codex_models_list(model_ids: Sequence[str]) -> List[Dict[str, Any]]:

@@ -752,7 +752,8 @@ class TestAccountManagerInitializeAccount:
         assert account.model_discovery_attempted_at == 0.0
         assert account.model_discovery_succeeded is False
         assert "gpt-5.6-sol" in account.model_cache.get_all_model_ids()
-        assert "kiro-s-4.6" in account.model_resolver.get_available_models()
+        assert "kiro-s-5" in account.model_resolver.get_available_models()
+        assert "kiro-o-5" in account.model_resolver.get_available_models()
         assert "auto-kiro" not in account.model_resolver.get_available_models()
 
 
@@ -1280,7 +1281,7 @@ class TestAccountManagerOnDemandModelDiscovery:
     @pytest.mark.asyncio
     async def test_first_list_request_discovers_then_cache_skips_four_hours(self, tmp_path):
         manager, account_id = await self._manager(tmp_path)
-        dynamic_ids = ["auto", "gpt-5.6-sol", "claude-sonnet-4.6", "claude-sonnet-4.5"]
+        dynamic_ids = ["auto", "gpt-5.6-sol", "claude-sonnet-5", "claude-sonnet-4.5"]
         with patch.object(
             manager, "_fetch_available_models",
             new=AsyncMock(return_value=[{"modelId": item} for item in dynamic_ids]),
@@ -1292,20 +1293,20 @@ class TestAccountManagerOnDemandModelDiscovery:
         assert first == second
         assert "auto" in first
         assert "gpt-5.6-sol" in first
-        assert "kiro-s-4.6" in first
+        assert "kiro-s-5" in first
         assert "auto-kiro" not in first
         assert "kiro-5.6-sol" not in first
         assert "claude-sonnet-4.5" not in first
         cache_ids = manager._accounts[account_id].model_cache.get_all_model_ids()
         assert set(cache_ids) == set(dynamic_ids)
-        assert "kiro-s-4.6" not in cache_ids
+        assert "kiro-s-5" not in cache_ids
 
     @pytest.mark.asyncio
     async def test_expired_dynamic_cache_refreshes_once_and_replaces(self, tmp_path):
         manager, account_id = await self._manager(tmp_path)
         fetch = AsyncMock(side_effect=[
-            [{"modelId": "claude-sonnet-4.6"}],
-            [{"modelId": "claude-opus-4.8"}],
+            [{"modelId": "claude-sonnet-5"}],
+            [{"modelId": "claude-opus-5"}],
         ])
         with patch.object(manager, "_fetch_available_models", new=fetch):
             first = await manager.get_all_available_models()
@@ -1314,9 +1315,9 @@ class TestAccountManagerOnDemandModelDiscovery:
             repeated = await manager.get_all_available_models()
 
         assert fetch.await_count == 2
-        assert "kiro-s-4.6" in first
-        assert "kiro-o-4.8" in refreshed
-        assert "claude-sonnet-4.6" not in refreshed
+        assert "kiro-s-5" in first
+        assert "kiro-o-5" in refreshed
+        assert "claude-sonnet-5" not in refreshed
         assert refreshed == repeated
 
     @pytest.mark.asyncio
@@ -1331,7 +1332,8 @@ class TestAccountManagerOnDemandModelDiscovery:
         assert first == second
         assert "gpt-5.6-sol" in first
         assert "auto" in first
-        assert "kiro-s-4.6" in first
+        assert "kiro-s-5" in first
+        assert "kiro-o-5" in first
         assert "auto-kiro" not in first
         assert manager._accounts[account_id].model_discovery_succeeded is False
 
@@ -1339,7 +1341,7 @@ class TestAccountManagerOnDemandModelDiscovery:
     async def test_failed_expired_refresh_keeps_stale_and_throttles(self, tmp_path):
         manager, account_id = await self._manager(tmp_path)
         fetch = AsyncMock(side_effect=[
-            [{"modelId": "claude-sonnet-4.6"}, {"modelId": "gpt-5.6-sol"}],
+            [{"modelId": "claude-sonnet-5"}, {"modelId": "gpt-5.6-sol"}],
             ModelDiscoveryError("offline"),
         ])
         with patch.object(manager, "_fetch_available_models", new=fetch):
@@ -1350,7 +1352,7 @@ class TestAccountManagerOnDemandModelDiscovery:
 
         assert fetch.await_count == 2
         assert dynamic == stale == repeated
-        assert "kiro-s-4.6" in stale
+        assert "kiro-s-5" in stale
         assert manager._accounts[account_id].model_discovery_succeeded is True
 
     @pytest.mark.asyncio
@@ -1365,7 +1367,7 @@ class TestAccountManagerOnDemandModelDiscovery:
             calls += 1
             started.set()
             await release.wait()
-            return [{"modelId": "claude-sonnet-4.6"}]
+            return [{"modelId": "claude-sonnet-5"}]
 
         with patch.object(manager, "_fetch_available_models", side_effect=fetch):
             first_task = asyncio.create_task(manager.get_all_available_models())
@@ -1381,7 +1383,7 @@ class TestAccountManagerOnDemandModelDiscovery:
     async def test_fetch_uses_q_host_profile_rule_and_not_runtime(self, tmp_path):
         manager, account_id = await self._manager(tmp_path)
         account = manager._accounts[account_id]
-        response = self._response(["claude-sonnet-4.6"])
+        response = self._response(["claude-sonnet-5"])
         mock_client = AsyncMock()
         mock_client.request_with_retry = AsyncMock(return_value=response)
         mock_client.close = AsyncMock()
@@ -1394,4 +1396,4 @@ class TestAccountManagerOnDemandModelDiscovery:
         assert kwargs["params"]["origin"] == "AI_EDITOR"
         assert "profileArn" in kwargs["params"]
         assert account.auth_manager.api_host == "https://runtime.us-east-1.kiro.dev"
-        assert models == [{"modelId": "claude-sonnet-4.6"}]
+        assert models == [{"modelId": "claude-sonnet-5"}]

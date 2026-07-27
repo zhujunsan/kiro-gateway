@@ -189,16 +189,16 @@ def mock_kiro_models_response():
     return {
         "models": [
             {
-                "modelId": "claude-sonnet-4.5",
-                "displayName": "Claude Sonnet 4.5",
+                "modelId": "claude-sonnet-5",
+                "displayName": "Claude Sonnet 5",
                 "tokenLimits": {
                     "maxInputTokens": 200000,
                     "maxOutputTokens": 8192
                 }
             },
             {
-                "modelId": "claude-opus-4.5",
-                "displayName": "Claude Opus 4.5",
+                "modelId": "claude-opus-5",
+                "displayName": "Claude Opus 5",
                 "tokenLimits": {
                     "maxInputTokens": 200000,
                     "maxOutputTokens": 8192
@@ -428,16 +428,16 @@ def block_all_network_calls():
     mock_models_response.json.return_value = {
         "models": [
             {
-                "modelId": "claude-sonnet-4.5",
-                "displayName": "Claude Sonnet 4.5",
+                "modelId": "claude-sonnet-5",
+                "displayName": "Claude Sonnet 5",
                 "tokenLimits": {
                     "maxInputTokens": 200000,
                     "maxOutputTokens": 8192
                 }
             },
             {
-                "modelId": "claude-opus-4.5",
-                "displayName": "Claude Opus 4.5",
+                "modelId": "claude-opus-5",
+                "displayName": "Claude Opus 5",
                 "tokenLimits": {
                     "maxInputTokens": 200000,
                     "maxOutputTokens": 8192
@@ -1737,16 +1737,16 @@ def mock_list_models_response():
     return {
         "models": [
             {
-                "modelId": "claude-opus-4.5",
-                "displayName": "Claude Opus 4.5",
+                "modelId": "claude-opus-5",
+                "displayName": "Claude Opus 5",
                 "tokenLimits": {
                     "maxInputTokens": 200000,
                     "maxOutputTokens": 8192
                 }
             },
             {
-                "modelId": "claude-sonnet-4.5",
-                "displayName": "Claude Sonnet 4.5",
+                "modelId": "claude-sonnet-5",
+                "displayName": "Claude Sonnet 5",
                 "tokenLimits": {
                     "maxInputTokens": 200000,
                     "maxOutputTokens": 8192

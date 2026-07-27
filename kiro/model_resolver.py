@@ -37,6 +37,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 from loguru import logger
 
+from kiro.model_aliases import generate_model_alias, resolve_model_alias
+
 if TYPE_CHECKING:
     from kiro.cache import ModelInfoCache
 
@@ -214,7 +216,7 @@ def get_model_id_for_kiro(model_name: str, hidden_models: Dict[str, str]) -> str
         >>> get_model_id_for_kiro("claude-3-7-sonnet", {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0"})
         'CLAUDE_3_7_SONNET_20250219_V1_0'
     """
-    model_name = MODEL_ALIASES.get(model_name, model_name)
+    model_name = resolve_model_alias(model_name, MODEL_ALIASES)
     normalized = normalize_model_name(model_name)
     internal = hidden_models.get(normalized, normalized)
     return to_runtime_model_id(internal)
@@ -313,8 +315,8 @@ class ModelResolver:
         Returns:
             ModelResolution with internal ID and metadata
         """
-        # Layer 0: Resolve alias (if exists)
-        resolved_model = self.aliases.get(external_model, external_model)
+        # Layer 0: Resolve alias (explicit table + syntactic kiro-* reverse)
+        resolved_model = resolve_model_alias(external_model, self.aliases)
         if resolved_model != external_model:
             logger.debug(
                 f"Alias resolved: '{external_model}' → '{resolved_model}'"
@@ -375,25 +377,44 @@ class ModelResolver:
         Combines:
         - Models from dynamic cache (Kiro API)
         - Hidden models (manual config)
-        - Alias names (custom mappings)
+        - Auto-generated Cursor-safe aliases for currently visible models
+        - Explicit aliases whose targets still exist in cache/hidden
         
         Excludes:
-        - Models in hidden_from_list (e.g., "auto" when showing "my-auto")
+        - Models in hidden_from_list (e.g., retired IDs still returned by Kiro)
+        - Auto-generated aliases for hidden_from_list targets (no stale kiro-o-*)
+        
+        Explicit custom aliases may still appear when their target exists but is
+        hidden from the list (hide-original / show-alias pattern).
         
         Returns:
             List of model IDs in consistent format (with dots)
         """
-        # Start with cache models
-        models = set(self.cache.get_all_model_ids())
+        known = set(self.cache.get_all_model_ids())
+        known.update(self.hidden_models.keys())
         
-        # Add hidden model display names (they use dot format)
-        models.update(self.hidden_models.keys())
+        # Visible canonical IDs (what /v1/models shows as real names)
+        visible = known - self.hidden_from_list
         
-        # Remove models that should be hidden from list
-        models -= self.hidden_from_list
+        models = set(visible)
         
-        # Add alias keys (these are the names users will see and use)
-        models.update(self.aliases.keys())
+        # Generate aliases only for models that are currently listable
+        for model_id in visible:
+            alias = generate_model_alias(model_id)
+            if alias:
+                models.add(alias)
+        
+        # Explicit custom aliases: include when the target still exists
+        # (even if hidden_from_list — supports show-alias / hide-original).
+        for alias, target in self.aliases.items():
+            resolved_target = resolve_model_alias(target, self.aliases)
+            normalized_target = normalize_model_name(resolved_target)
+            if (
+                target in known
+                or resolved_target in known
+                or normalized_target in known
+            ):
+                models.add(alias)
         
         return sorted(models)
     

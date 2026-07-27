@@ -30,6 +30,14 @@ def _efforts(info: dict) -> list[str]:
     [
         ("auto", ["text"], False, [], None, None),
         (
+            "claude-opus-5",
+            ["text", "image"],
+            True,
+            ["low", "medium", "high", "xhigh", "max"],
+            "medium",
+            1_000_000,
+        ),
+        (
             "claude-opus-4.8",
             ["text", "image"],
             True,
@@ -146,11 +154,9 @@ def test_canonical_model_capabilities(
 @pytest.mark.parametrize(
     "alias,canonical",
     [
-        ("kiro-o-4.8", "claude-opus-4.8"),
-        ("kiro-o-4.7", "claude-opus-4.7"),
+        ("kiro-o-5", "claude-opus-5"),
         ("kiro-o-4.6", "claude-opus-4.6"),
         ("kiro-s-5", "claude-sonnet-5"),
-        ("kiro-s-4.6", "claude-sonnet-4.6"),
         ("kiro-h-4.5", "claude-haiku-4.5"),
         ("kiro-deepseek-3.2", "deepseek-3.2"),
         ("kiro-glm-5", "glm-5"),
@@ -181,8 +187,19 @@ def test_alias_inherits_canonical_capabilities(alias, canonical):
         assert alias_info[key] == canon_info[key], f"{alias} vs {canonical}: {key}"
 
 
-def test_kiro_o_48_matches_opus_vision_and_reasoning():
+def test_syntactic_retired_alias_still_resolves_capabilities():
+    """Retired aliases remain resolvable for capability lookup via syntax."""
+    assert "kiro-o-4.8" not in MODEL_ALIASES
+    assert resolve_canonical_model_id("kiro-o-4.8") == "claude-opus-4.8"
     info = build_codex_model_info("kiro-o-4.8")
+    assert "image" in info["input_modalities"]
+    assert info["supports_image_detail_original"] is True
+    assert info["context_window"] == 1_000_000
+    assert _efforts(info) == ["low", "medium", "high", "xhigh", "max"]
+
+
+def test_kiro_o_5_matches_opus_vision_and_reasoning():
+    info = build_codex_model_info("kiro-o-5")
     assert "image" in info["input_modalities"]
     assert info["supports_image_detail_original"] is True
     assert info["context_window"] == 1_000_000
@@ -225,14 +242,14 @@ def test_gpt_levels_exclude_ultra():
 
 
 def test_lookup_returns_canonical_and_caps():
-    canonical, caps = lookup_model_capabilities("kiro-o-4.8")
-    assert canonical == "claude-opus-4.8"
-    assert caps is MODEL_CAPABILITIES["claude-opus-4.8"]
+    canonical, caps = lookup_model_capabilities("kiro-o-5")
+    assert canonical == "claude-opus-5"
+    assert caps is MODEL_CAPABILITIES["claude-opus-5"]
 
 
 def test_build_codex_models_list_preserves_order_and_priority():
-    models = build_codex_models_list(["glm-5", "claude-opus-4.8"])
-    assert [m["slug"] for m in models] == ["glm-5", "claude-opus-4.8"]
+    models = build_codex_models_list(["glm-5", "claude-opus-5"])
+    assert [m["slug"] for m in models] == ["glm-5", "claude-opus-5"]
     assert models[0]["priority"] == 0
     assert models[1]["priority"] == 1
     assert models[0]["input_modalities"] == ["text"]
@@ -240,15 +257,15 @@ def test_build_codex_models_list_preserves_order_and_priority():
 
 
 def test_filter_codex_model_ids_drops_aliases_keeps_canonical():
-    ids = ["auto", "kiro-s-4.6", "claude-sonnet-4.6", "kiro-glm-5", "glm-5"]
-    assert filter_codex_model_ids(ids) == ["auto", "claude-sonnet-4.6", "glm-5"]
+    ids = ["auto", "kiro-s-5", "claude-sonnet-5", "kiro-glm-5", "glm-5"]
+    assert filter_codex_model_ids(ids) == ["auto", "claude-sonnet-5", "glm-5"]
 
 
 def test_build_codex_models_list_omits_alias_slugs():
     models = build_codex_models_list(
-        ["kiro-glm-5", "claude-opus-4.8", "kiro-o-4.8", "auto"]
+        ["kiro-glm-5", "claude-opus-5", "kiro-o-5", "auto"]
     )
-    assert [m["slug"] for m in models] == ["claude-opus-4.8", "auto"]
+    assert [m["slug"] for m in models] == ["claude-opus-5", "auto"]
     assert models[0]["priority"] == 0
     assert models[1]["priority"] == 1
     assert "image" in models[0]["input_modalities"]
