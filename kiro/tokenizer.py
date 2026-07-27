@@ -72,10 +72,14 @@ def _get_encoding():
 
     Caching strategy:
         - A successful encoding is cached for the lifetime of the process.
-        - An ``ImportError`` is cached (``_encoding = False``) because a missing
-          tiktoken package will not appear mid-process.
-        - Any other exception (network error fetching the BPE blob, corrupt
-          cache file, ...) is NOT cached, so the next caller retries. A single
+        - An ``ImportError`` (or any other failure while *importing* the
+          tiktoken module) is cached (``_encoding = False``) because a missing
+          or unloadable package will not appear mid-process. Frozen apps
+          (PyInstaller) may raise ``zlib.error`` / ``OSError`` while extracting
+          tiktoken from the PYZ archive — that is not ``ImportError``, but must
+          still fall back instead of turning chat completions into HTTP 500.
+        - Failures *after* import (network error fetching the BPE blob, corrupt
+          cache file, ...) are NOT cached, so the next caller retries. A single
           transient ``IncompleteRead`` from the Azure CDN must not permanently
           demote the whole process to the length-based fallback.
 
@@ -95,6 +99,18 @@ def _get_encoding():
             "Install with: pip install tiktoken"
         )
         _encoding = False  # tiktoken truly missing — fall back permanently
+        return None
+    except Exception as e:
+        # PyInstaller PYZ extract can raise zlib.error ("incorrect header check")
+        # or OSError during `import tiktoken`. Catching only ImportError lets that
+        # escape into streaming/non-streaming completion paths as HTTP 500 after
+        # Kiro already returned a valid response — usage accounting must not
+        # fail the whole request.
+        logger.error(
+            f"[Tokenizer] Failed to import tiktoken "
+            f"(falling back permanently): [{type(e).__name__}] {e}"
+        )
+        _encoding = False
         return None
 
     try:

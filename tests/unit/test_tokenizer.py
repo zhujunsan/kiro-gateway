@@ -1103,6 +1103,85 @@ class TestEncodingCacheAndRetry:
             if original_tiktoken is not None:
                 sys.modules["tiktoken"] = original_tiktoken
 
+    def test_pyinstaller_zlib_error_on_import_falls_back_permanently(self):
+        """
+        What it does: Simulates PyInstaller PYZ extract failure (zlib.error)
+        during `import tiktoken` and verifies we fall back instead of raising.
+        Purpose: Frozen Tray builds have raised
+        ``Error -3 while decompressing data: incorrect header check`` on first
+        tiktoken import. That is not ImportError; if it escapes, non-streaming
+        /v1/chat/completions returns HTTP 500 after Kiro already succeeded —
+        while streaming may already have emitted content. Usage accounting must
+        never fail the response.
+        """
+        import zlib
+
+        import kiro.tokenizer as tokenizer_module
+
+        original_encoding = tokenizer_module._encoding
+        tokenizer_module._encoding = None
+        real_import = __import__
+
+        def import_side_effect(name, *args, **kwargs):
+            if name == "tiktoken" or (
+                isinstance(name, str) and name.startswith("tiktoken")
+            ):
+                raise zlib.error(
+                    "Error -3 while decompressing data: incorrect header check"
+                )
+            return real_import(name, *args, **kwargs)
+
+        try:
+            with patch("builtins.__import__", side_effect=import_side_effect):
+                encoding = _get_encoding()
+                assert encoding is None, "zlib import failure must yield None"
+                assert tokenizer_module._encoding is False, (
+                    "Unloadable tiktoken must be cached as sentinel False"
+                )
+
+                # count_tokens must still return a positive fallback estimate
+                # without propagating zlib.error to the chat-completions path.
+                tokens = count_tokens("Hello world test")
+                assert tokens > 0
+
+                with patch(
+                    "builtins.__import__",
+                    side_effect=AssertionError(
+                        "import tiktoken must not be retried after zlib failure"
+                    ),
+                ):
+                    assert _get_encoding() is None
+        finally:
+            tokenizer_module._encoding = original_encoding
+
+    def test_oserror_on_import_falls_back_permanently(self):
+        """
+        What it does: Simulates OSError during `import tiktoken` (e.g. missing
+        shared library / unreadable archive member) and verifies permanent
+        fallback.
+        Purpose: Packaging failures beyond ImportError must not crash requests.
+        """
+        import kiro.tokenizer as tokenizer_module
+
+        original_encoding = tokenizer_module._encoding
+        tokenizer_module._encoding = None
+        real_import = __import__
+
+        def import_side_effect(name, *args, **kwargs):
+            if name == "tiktoken" or (
+                isinstance(name, str) and name.startswith("tiktoken")
+            ):
+                raise OSError(2, "No such file or directory", "tiktoken/_tiktoken.so")
+            return real_import(name, *args, **kwargs)
+
+        try:
+            with patch("builtins.__import__", side_effect=import_side_effect):
+                assert _get_encoding() is None
+                assert tokenizer_module._encoding is False
+                assert count_tokens("fallback path") > 0
+        finally:
+            tokenizer_module._encoding = original_encoding
+
 
 class TestTokenizerIntegration:
     """Integration tests for tokenizer."""
