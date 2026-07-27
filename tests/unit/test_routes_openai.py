@@ -2078,3 +2078,72 @@ class TestInvalidModelExpectedResponse:
         assert error["param"] == "model"
         assert "GET /v1/models" in error["message"]
         assert client.request_with_retry.await_count == 1
+
+
+# =============================================================================
+# Streaming error handling after response started (TRAY-M)
+# =============================================================================
+
+class TestChatCompletionsStreamingErrorAfterStarted:
+    """
+    After StreamingResponse starts, first-token retry failure must not
+    re-raise HTTPException (Starlette RuntimeError). Align with Anthropic:
+    emit SSE error + [DONE] and end the stream.
+    """
+
+    @patch("kiro.routes_openai.stream_with_first_token_retry")
+    @patch("kiro.routes_openai.KiroHttpClient")
+    def test_first_token_timeout_emits_sse_error_without_re_raise(
+        self,
+        mock_kiro_http_client_class,
+        mock_stream_retry,
+        test_client,
+        valid_proxy_api_key,
+    ):
+        """
+        What it does: After a streamed chunk, first-token exhaustion raises
+        HTTPException(504); route must emit OpenAI SSE error and [DONE]
+        without crashing the ASGI response (TRAY-M).
+        """
+        async def mock_stream(*args, **kwargs):
+            yield (
+                'data: {"id":"chatcmpl-test","object":"chat.completion.chunk",'
+                '"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+            )
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "Model did not respond within 30s after 3 attempts. "
+                    "Please try again."
+                ),
+            )
+
+        mock_stream_retry.side_effect = mock_stream
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+
+        mock_instance = AsyncMock()
+        mock_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_instance.close = AsyncMock()
+        mock_instance.client = AsyncMock()
+        mock_kiro_http_client_class.return_value = mock_instance
+
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.text
+        assert "did not respond within" in body
+        assert '"type": "server_error"' in body or '"type":"server_error"' in body
+        assert "data: [DONE]" in body
+        # Must not surface Starlette's catch-all after yield+raise
+        assert "RuntimeError" not in body
+        assert "Unexpected message" not in body

@@ -265,11 +265,23 @@ async def _handle_success_response(
                 logger.debug("Client disconnected during Responses streaming (GeneratorExit)")
             except Exception as e:
                 streaming_error = e
+                # After StreamingResponse has started, re-raising HTTPException
+                # causes Starlette RuntimeError (TRAY-M). Align with Anthropic:
+                # emit SSE error and end the stream gracefully.
                 try:
-                    yield "data: [DONE]\n\n"
+                    error_msg = (
+                        str(e.detail)
+                        if isinstance(e, HTTPException)
+                        else (str(e) if str(e) else "(empty message)")
+                    )
+                    error_type = type(e).__name__
+                    status = getattr(e, "status_code", None)
+                    yield (
+                        f"event: error\n"
+                        f"data: {json.dumps({'type': 'error', 'error': {'type': error_type, 'message': error_msg, 'code': status}})}\n\n"
+                    )
                 except Exception:
                     pass
-                raise
             finally:
                 if (
                     completed_response is not None

@@ -803,6 +803,34 @@ class TestDebugSessionIsolation:
         src, code, phase, st = classify_streaming_exception(TimeoutError("read timeout"))
         assert src == "network" and st == 504
 
+        # HTTPException(504) from first-token retry exhaustion must not be
+        # mislabeled as gateway/streaming_error/500 (TRAY-K).
+        from fastapi import HTTPException
+
+        src, code, phase, st = classify_streaming_exception(
+            HTTPException(
+                status_code=504,
+                detail="Model did not respond within 30s after 3 attempts. Please try again.",
+            )
+        )
+        assert (src, code, phase, st) == (
+            "network", "first_token_timeout", "first_token", 504
+        )
+
+        src, code, phase, st = classify_streaming_exception(
+            HTTPException(status_code=504, detail="Gateway Timeout")
+        )
+        assert (src, code, phase, st) == (
+            "network", "first_token_timeout", "first_token", 504
+        )
+
+        src, code, phase, st = classify_streaming_exception(
+            RuntimeError("Model did not respond within 30s after 3 attempts")
+        )
+        assert (src, code, phase, st) == (
+            "network", "first_token_timeout", "first_token", 504
+        )
+
         src, code, phase, st = classify_streaming_exception(
             RuntimeError("peer closed connection without sending complete message body "
                          "(incomplete chunked read)")

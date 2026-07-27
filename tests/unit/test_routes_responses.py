@@ -13,6 +13,7 @@ Covers:
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 from kiro.config import PROXY_API_KEY
 
@@ -353,6 +354,62 @@ class TestResponsesStreaming:
         mock_kiro_http_client_class.assert_called()
         call_kwargs = mock_kiro_http_client_class.call_args[1]
         assert call_kwargs.get("shared_client") is None
+
+    @patch("kiro.routes_responses.stream_with_first_token_retry")
+    @patch("kiro.routes_responses.KiroHttpClient")
+    def test_first_token_timeout_emits_sse_error_without_re_raise(
+        self,
+        mock_kiro_http_client_class,
+        mock_stream_retry,
+        test_client,
+        valid_proxy_api_key,
+    ):
+        """
+        What it does: After a streamed chunk, first-token exhaustion raises
+        HTTPException(504); route must emit SSE error and end the stream
+        without re-raising (TRAY-M / Starlette RuntimeError).
+        """
+        async def mock_stream(*args, **kwargs):
+            yield (
+                'event: response.created\n'
+                'data: {"type":"response.created","response":{"id":"resp_test"}}\n\n'
+            )
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "Model did not respond within 30s after 3 attempts. "
+                    "Please try again."
+                ),
+            )
+
+        mock_stream_retry.side_effect = mock_stream
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+
+        mock_instance = AsyncMock()
+        mock_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_instance.close = AsyncMock()
+        mock_instance.client = AsyncMock()
+        mock_kiro_http_client_class.return_value = mock_instance
+
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "input": "Hello",
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.text
+        assert "response.created" in body
+        assert "event: error" in body
+        assert "did not respond within" in body
+        assert "RuntimeError" not in body
+        assert "Unexpected message" not in body
 
 
 class TestResponsesModelsCompatibility:

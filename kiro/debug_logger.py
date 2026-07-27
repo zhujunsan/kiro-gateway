@@ -81,9 +81,21 @@ def classify_streaming_exception(exc: BaseException) -> tuple[str, str, str, int
     """Map a streaming-path exception to (source, code, phase, gateway_status)."""
     name = type(exc).__name__
     msg = str(exc).lower()
-    if "FirstToken" in name or "first token" in msg:
+    detail = getattr(exc, "detail", None)
+    detail_msg = str(detail).lower() if detail is not None else ""
+    status_code = getattr(exc, "status_code", None)
+
+    # First-token retry exhaustion raises HTTPException(504, "Model did not
+    # respond within ..."). Must not fall through to gateway/streaming_error/500.
+    if (
+        "FirstToken" in name
+        or "first token" in msg
+        or status_code == 504
+        or "did not respond within" in msg
+        or "did not respond within" in detail_msg
+    ):
         return "network", "first_token_timeout", "first_token", 504
-    if "Timeout" in name or "timeout" in msg:
+    if "Timeout" in name or "timeout" in msg or "timeout" in detail_msg:
         return "network", "timeout", "streaming", 504
     if (
         "RemoteProtocolError" in name
