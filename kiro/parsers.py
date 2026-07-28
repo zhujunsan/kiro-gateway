@@ -337,6 +337,11 @@ class AwsEventStreamParser:
         self.last_content: Optional[str] = None  # For deduplicating repeating content
         self.current_tool_call: Optional[Dict[str, Any]] = None
         self.tool_calls: List[Dict[str, Any]] = []
+        # Arguments of tool ids already finalized, keyed by toolUseId. Kiro
+        # re-announces the same toolUseId with empty input right after the real
+        # call. Streaming clients key tool input by id, so forwarding the second
+        # lifecycle would overwrite the real arguments with {}.
+        self.completed_tool_args: Dict[str, str] = {}
     
     def feed(self, chunk: bytes) -> List[Dict[str, Any]]:
         """
@@ -438,8 +443,14 @@ class AwsEventStreamParser:
 
         input_data = data.get('input', '')
 
+        tool_id = data.get('toolUseId', generate_tool_call_id())
+        # Kiro repeats an already-finalized toolUseId with empty input. Track the
+        # repeat so its arguments can still be compared, but emit nothing: the
+        # client already received this id and keys tool input by it.
+        replay = tool_id in self.completed_tool_args
+
         self.current_tool_call = {
-            "id": data.get('toolUseId', generate_tool_call_id()),
+            "id": tool_id,
             "type": "function",
             "function": {
                 "name": data.get('name', ''),
@@ -449,15 +460,23 @@ class AwsEventStreamParser:
             "_input_mode": None,
             "_streamed_arguments": "",
             "_dict_stream_started": False,
+            "_replay": replay,
         }
 
-        events.append({
-            "type": "tool_start",
-            "data": self._tool_call_identity(self.current_tool_call),
-        })
+        if replay:
+            logger.debug(
+                f"Suppressing replayed tool call lifecycle for id={tool_id} "
+                f"(already finalized)"
+            )
+
+        if not replay:
+            events.append({
+                "type": "tool_start",
+                "data": self._tool_call_identity(self.current_tool_call),
+            })
 
         input_delta = self._append_tool_input(input_data)
-        if input_delta:
+        if input_delta and not replay:
             events.append({
                 "type": "tool_input",
                 "data": {
@@ -477,7 +496,7 @@ class AwsEventStreamParser:
             return []
 
         input_delta = self._append_tool_input(data.get('input', ''))
-        if not input_delta:
+        if not input_delta or self.current_tool_call.get("_replay"):
             return []
 
         return [{
@@ -560,32 +579,35 @@ class AwsEventStreamParser:
 
         events: List[Dict[str, Any]] = []
         tool_call_id = self.current_tool_call.get("id")
+        replay = self.current_tool_call.get("_replay", False)
         if self.current_tool_call.get("_input_mode") == "dict":
             if self.current_tool_call.get("_dict_stream_started"):
                 closing_delta = "}"
             else:
                 closing_delta = "{}"
             self.current_tool_call["_streamed_arguments"] += closing_delta
-            events.append({
-                "type": "tool_input",
-                "data": {
-                    "tool_call_id": tool_call_id,
-                    "arguments_delta": closing_delta,
-                },
-            })
+            if not replay:
+                events.append({
+                    "type": "tool_input",
+                    "data": {
+                        "tool_call_id": tool_call_id,
+                        "arguments_delta": closing_delta,
+                    },
+                })
         elif not self.current_tool_call.get("_streamed_arguments"):
             # Empty-input tools still need a complete JSON argument stream for
             # clients that only assemble input from delta events.
-            events.append({
-                "type": "tool_input",
-                "data": {
-                    "tool_call_id": tool_call_id,
-                    "arguments_delta": "{}",
-                },
-            })
+            if not replay:
+                events.append({
+                    "type": "tool_input",
+                    "data": {
+                        "tool_call_id": tool_call_id,
+                        "arguments_delta": "{}",
+                    },
+                })
 
         finalized = self._finalize_tool_call()
-        if finalized:
+        if finalized and not replay:
             events.append({"type": "tool_stop", "data": finalized})
         return events
     
@@ -601,6 +623,7 @@ class AwsEventStreamParser:
         input_mode = self.current_tool_call.pop('_input_mode', None)
         streamed_arguments = self.current_tool_call.pop('_streamed_arguments', "")
         self.current_tool_call.pop('_dict_stream_started', None)
+        replay = self.current_tool_call.pop('_replay', False)
         if input_mode == "dict":
             self.current_tool_call['function']['arguments'] = (
                 streamed_arguments or json.dumps(args_dict or {}, ensure_ascii=False)
@@ -658,6 +681,31 @@ class AwsEventStreamParser:
             self.current_tool_call['function']['arguments'] = "{}"
         
         finalized_tool_call = self.current_tool_call
+        final_args = finalized_tool_call['function']['arguments']
+        tool_id = finalized_tool_call.get('id')
+
+        if replay:
+            # A repeat of an already-finalized id. Keep whichever version carries
+            # real arguments so the non-streaming collector stays correct even if
+            # the first emission was the empty one.
+            previous = self.completed_tool_args.get(tool_id, "{}")
+            if final_args != "{}" and (previous == "{}" or len(final_args) > len(previous)):
+                logger.debug(
+                    f"Replayed tool call id={tool_id} carries better arguments; "
+                    f"replacing stored copy ({len(previous)} -> {len(final_args)} chars)"
+                )
+                self.completed_tool_args[tool_id] = final_args
+                for index, existing in enumerate(self.tool_calls):
+                    if existing.get('id') == tool_id:
+                        self.tool_calls[index] = finalized_tool_call
+                        break
+                else:
+                    self.tool_calls.append(finalized_tool_call)
+            self.current_tool_call = None
+            return finalized_tool_call
+
+        if tool_id is not None:
+            self.completed_tool_args[tool_id] = final_args
         self.tool_calls.append(finalized_tool_call)
         self.current_tool_call = None
         return finalized_tool_call
