@@ -191,6 +191,11 @@ async def stream_kiro_to_anthropic(
     text_block_index: Optional[int] = None
     tool_blocks: List[Dict[str, Any]] = []
     tool_streams: Dict[str, Dict[str, Any]] = {}
+    # Kiro sometimes repeats a completed tool lifecycle with empty {} args
+    # (same toolUseId). Track emitted ids so the ghost cannot open a second
+    # Anthropic tool_use block — Cursor would execute it and show
+    # "Error editing file" / "Invalid tool parameters".
+    streamed_tool_ids: set[str] = set()
     
     # Generate signature for thinking block (used if thinking is present)
     thinking_signature = generate_thinking_signature()
@@ -337,6 +342,14 @@ async def stream_kiro_to_anthropic(
                 # For "strip" mode, we just skip the thinking content
             
             elif event.type == "tool_start" and event.tool_use:
+                tool = event.tool_use
+                tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
+                if tool_id in streamed_tool_ids:
+                    logger.warning(
+                        f"Ignoring duplicate Anthropic tool_start for tool_use_id={tool_id}"
+                    )
+                    continue
+
                 # Anthropic content blocks cannot overlap. Close text/reasoning
                 # before opening the tool block as soon as Kiro announces it.
                 if thinking_block_started and thinking_block_index is not None:
@@ -354,8 +367,6 @@ async def stream_kiro_to_anthropic(
                     text_block_started = False
                     current_block_index += 1
 
-                tool = event.tool_use
-                tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
                 tool_name = tool.get("function", {}).get("name", "") or tool.get("name", "")
                 from kiro.converters_core import get_original_tool_name
                 tool_name = get_original_tool_name(tool_name)
@@ -378,6 +389,7 @@ async def stream_kiro_to_anthropic(
                         "input": {},
                     },
                 })
+                streamed_tool_ids.add(tool_id)
 
             elif event.type == "tool_input":
                 state = tool_streams.get(event.tool_call_id or "")
@@ -425,6 +437,16 @@ async def stream_kiro_to_anthropic(
                     current_block_index = max(
                         current_block_index,
                         stream_state["index"] + 1,
+                    )
+                    continue
+
+                # Duplicate empty lifecycle after a live start/input: tool_start
+                # was ignored above, so there is no stream_state. Do not fall
+                # through to the legacy complete-tool emitter.
+                if tool_id_from_event and tool_id_from_event in streamed_tool_ids:
+                    logger.debug(
+                        f"Ignoring duplicate Anthropic tool_stop for "
+                        f"tool_use_id={tool_id_from_event}"
                     )
                     continue
 
@@ -628,6 +650,7 @@ async def stream_kiro_to_anthropic(
                     "name": tool_name,
                     "input": tool_input
                 })
+                streamed_tool_ids.add(tool_id)
                 current_block_index += 1
             
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
@@ -663,6 +686,8 @@ async def stream_kiro_to_anthropic(
             
             for tc in fallback_tool_calls:
                 tool_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
+                if tool_id in streamed_tool_ids:
+                    continue
                 tool_name = tc.get("function", {}).get("name", "")
                 tool_input = tc.get("function", {}).get("arguments", {})
                 
@@ -703,6 +728,7 @@ async def stream_kiro_to_anthropic(
                     "name": tool_name,
                     "input": tool_input
                 })
+                streamed_tool_ids.add(tool_id)
                 current_block_index += 1
         
         # Close thinking block if still open

@@ -556,6 +556,96 @@ class TestStreamingOpenaiNoneProtection:
         assert names and all(n == "" for n in names)
         
         print("✓ None function name handled")
+
+    @pytest.mark.asyncio
+    async def test_duplicate_empty_tool_lifecycle_emits_one_tool_call(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Drops a repeated empty tool lifecycle with the same id.
+        Goal: Align OpenAI streaming with Responses/Anthropic — no second
+        empty {} tool_call that clients would try to execute.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_start",
+                tool_use={
+                    "id": "call_edit",
+                    "type": "function",
+                    "function": {"name": "Edit", "arguments": ""},
+                },
+            )
+            yield KiroEvent(
+                type="tool_input",
+                tool_call_id="call_edit",
+                tool_input_delta=(
+                    '{"file_path":"a.py","old_string":"x","new_string":"y"}'
+                ),
+            )
+            yield KiroEvent(
+                type="tool_stop",
+                tool_use={
+                    "id": "call_edit",
+                    "type": "function",
+                    "function": {
+                        "name": "Edit",
+                        "arguments": (
+                            '{"file_path":"a.py","old_string":"x","new_string":"y"}'
+                        ),
+                    },
+                },
+            )
+            yield KiroEvent(
+                type="tool_start",
+                tool_use={
+                    "id": "call_edit",
+                    "type": "function",
+                    "function": {"name": "Edit", "arguments": ""},
+                },
+            )
+            yield KiroEvent(
+                type="tool_stop",
+                tool_use={
+                    "id": "call_edit",
+                    "type": "function",
+                    "function": {"name": "Edit", "arguments": "{}"},
+                },
+            )
+            yield KiroEvent(type="usage", usage={"credits": 0.1})
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        opening_ids = []
+        reassembled_by_index: dict = {}
+        for chunk in chunks:
+            if not chunk.startswith("data: "):
+                continue
+            json_str = chunk[6:].strip()
+            if json_str == "[DONE]":
+                continue
+            data = json.loads(json_str)
+            delta = (data.get("choices") or [{}])[0].get("delta") or {}
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                if tc.get("id"):
+                    opening_ids.append(tc["id"])
+                args = (tc.get("function") or {}).get("arguments")
+                if args is not None:
+                    reassembled_by_index[idx] = (
+                        reassembled_by_index.get(idx, "") + args
+                    )
+
+        assert opening_ids == ["call_edit"]
+        assert reassembled_by_index[0] == (
+            '{"file_path":"a.py","old_string":"x","new_string":"y"}'
+        )
     
     @pytest.mark.asyncio
     async def test_handles_none_function_arguments(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):

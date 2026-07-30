@@ -419,6 +419,88 @@ class TestStreamKiroToAnthropic:
             if event.startswith("event: message_stop")
         )
         assert tool_stop_index < message_stop_index
+
+    @pytest.mark.asyncio
+    async def test_duplicate_empty_tool_lifecycle_emits_one_tool_use(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Drops a repeated empty tool lifecycle with the same id.
+        Goal: Cursor must not receive a second Edit/tool_use with {} args
+        (shows as "Error editing file" / "Invalid tool parameters").
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_start",
+                tool_use={
+                    "id": "toolu_edit",
+                    "type": "function",
+                    "function": {"name": "Edit", "arguments": ""},
+                },
+            )
+            yield KiroEvent(
+                type="tool_input",
+                tool_call_id="toolu_edit",
+                tool_input_delta='{"file_path":"a.py","old_string":"x","new_string":"y"}',
+            )
+            yield KiroEvent(
+                type="tool_stop",
+                tool_use={
+                    "id": "toolu_edit",
+                    "type": "function",
+                    "function": {
+                        "name": "Edit",
+                        "arguments": (
+                            '{"file_path":"a.py","old_string":"x","new_string":"y"}'
+                        ),
+                    },
+                },
+            )
+            # Ghost replay from Kiro: same id, empty arguments.
+            yield KiroEvent(
+                type="tool_start",
+                tool_use={
+                    "id": "toolu_edit",
+                    "type": "function",
+                    "function": {"name": "Edit", "arguments": ""},
+                },
+            )
+            yield KiroEvent(
+                type="tool_stop",
+                tool_use={
+                    "id": "toolu_edit",
+                    "type": "function",
+                    "function": {"name": "Edit", "arguments": "{}"},
+                },
+            )
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+
+        events = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
+        tool_block_starts = [
+            e for e in events
+            if "content_block_start" in e and '"type": "tool_use"' in e
+        ]
+        assert len(tool_block_starts) == 1
+        assert "toolu_edit" in tool_block_starts[0]
+        assert '"name": "Edit"' in tool_block_starts[0]
+
+        partial_json = []
+        for event in events:
+            if not event.startswith("event: content_block_delta"):
+                continue
+            data = json.loads(event.split("data: ", 1)[1])
+            if data["delta"]["type"] == "input_json_delta":
+                partial_json.append(data["delta"]["partial_json"])
+        assert "".join(partial_json) == (
+            '{"file_path":"a.py","old_string":"x","new_string":"y"}'
+        )
     
     @pytest.mark.asyncio
     async def test_yields_message_delta_with_stop_reason(self, mock_response, mock_model_cache, mock_auth_manager):

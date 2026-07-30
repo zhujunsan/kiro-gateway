@@ -225,6 +225,11 @@ async def stream_kiro_to_openai_internal(
             
             elif event.type == "tool_start" and event.tool_use:
                 tool_id, tool_name = _tool_identity(event.tool_use)
+                if tool_id in streamed_tool_ids:
+                    logger.warning(
+                        f"Ignoring duplicate OpenAI tool_start for tool_use_id={tool_id}"
+                    )
+                    continue
                 suppress = tool_name == "web_search"
                 tool_streams[tool_id] = {
                     "index": next_tool_index,
