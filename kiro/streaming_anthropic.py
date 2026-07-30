@@ -193,8 +193,8 @@ async def stream_kiro_to_anthropic(
     tool_streams: Dict[str, Dict[str, Any]] = {}
     # Kiro sometimes repeats a completed tool lifecycle with empty {} args
     # (same toolUseId). Track emitted ids so the ghost cannot open a second
-    # Anthropic tool_use block — Cursor would execute it and show
-    # "Error editing file" / "Invalid tool parameters".
+    # Anthropic tool_use block — Claude Code and similar clients would execute
+    # it and show "Error editing file" / "Invalid tool parameters".
     streamed_tool_ids: set[str] = set()
     
     # Generate signature for thinking block (used if thinking is present)

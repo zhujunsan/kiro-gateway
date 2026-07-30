@@ -426,8 +426,9 @@ class TestStreamKiroToAnthropic:
     ):
         """
         What it does: Drops a repeated empty tool lifecycle with the same id.
-        Goal: Cursor must not receive a second Edit/tool_use with {} args
-        (shows as "Error editing file" / "Invalid tool parameters").
+        Goal: Anthropic clients (e.g. Claude Code) must not receive a second
+        Edit/tool_use with {} args (shows as "Error editing file" /
+        "Invalid tool parameters").
         """
         async def mock_parse_kiro_stream(*args, **kwargs):
             yield KiroEvent(
