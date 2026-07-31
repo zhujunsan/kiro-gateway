@@ -294,7 +294,11 @@ async def stream_kiro_to_openai_internal(
 
             elif event.type in ("tool_stop", "tool_use") and event.tool_use:
                 tool = event.tool_use
-                
+                # Retire the live stream state: the call is complete, so any
+                # later delta carrying this id belongs to Kiro's duplicate empty
+                # lifecycle and must not be appended to the finished arguments.
+                tool_streams.pop(tool.get("id"), None)
+
                 # Extract tool name safely (handle None/missing fields)
                 tool_name = ""
                 if tool:

@@ -457,7 +457,9 @@ class TestStreamKiroToAnthropic:
                     },
                 },
             )
-            # Ghost replay from Kiro: same id, empty arguments.
+            # Ghost replay from Kiro: same id, no input. The parser still
+            # normalizes it into a full lifecycle whose delta is a literal "{}",
+            # which would corrupt the completed block's partial_json.
             yield KiroEvent(
                 type="tool_start",
                 tool_use={
@@ -465,6 +467,11 @@ class TestStreamKiroToAnthropic:
                     "type": "function",
                     "function": {"name": "Edit", "arguments": ""},
                 },
+            )
+            yield KiroEvent(
+                type="tool_input",
+                tool_call_id="toolu_edit",
+                tool_input_delta="{}",
             )
             yield KiroEvent(
                 type="tool_stop",
@@ -499,9 +506,13 @@ class TestStreamKiroToAnthropic:
             data = json.loads(event.split("data: ", 1)[1])
             if data["delta"]["type"] == "input_json_delta":
                 partial_json.append(data["delta"]["partial_json"])
-        assert "".join(partial_json) == (
-            '{"file_path":"a.py","old_string":"x","new_string":"y"}'
-        )
+        assembled = "".join(partial_json)
+        assert assembled == '{"file_path":"a.py","old_string":"x","new_string":"y"}'
+        assert json.loads(assembled) == {
+            "file_path": "a.py",
+            "old_string": "x",
+            "new_string": "y",
+        }
     
     @pytest.mark.asyncio
     async def test_yields_message_delta_with_stop_reason(self, mock_response, mock_model_cache, mock_auth_manager):

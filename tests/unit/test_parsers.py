@@ -927,6 +927,49 @@ class TestAwsEventStreamParserToolCalls:
 
         assert deltas == ["{}"]
         assert stop_event["data"]["function"]["arguments"] == "{}"
+
+    def test_duplicate_empty_lifecycle_replays_full_events_under_same_id(
+        self, aws_event_parser
+    ):
+        """
+        What it does: Parses Kiro's replay of a finished tool call.
+        Goal: Pin the upstream shape that downstream deduplication must survive
+        — the replay is not just a bare tool_start, it also carries a "{}"
+        input delta reusing the original toolUseId, which would corrupt the
+        already-streamed arguments if it were forwarded.
+        """
+        events = []
+        events.extend(aws_event_parser.feed(
+            b'{"name":"Shell","toolUseId":"call_ghost","input":""}'
+        ))
+        events.extend(aws_event_parser.feed(
+            b'{"input":"{\\"command\\": \\"ls\\"}"}'
+        ))
+        events.extend(aws_event_parser.feed(b'{"stop":true}'))
+        # Kiro repeats the lifecycle with the same id and no input at all.
+        events.extend(aws_event_parser.feed(
+            b'{"name":"Shell","toolUseId":"call_ghost"}'
+        ))
+        events.extend(aws_event_parser.feed(b'{"stop":true}'))
+
+        assert [event["type"] for event in events] == [
+            "tool_start", "tool_input", "tool_stop",
+            "tool_start", "tool_input", "tool_stop",
+        ]
+        assert all(
+            event["data"].get("id", event["data"].get("tool_call_id")) == "call_ghost"
+            for event in events
+        )
+
+        deltas = [
+            event["data"]["arguments_delta"]
+            for event in events
+            if event["type"] == "tool_input"
+        ]
+        assert deltas == ['{"command": "ls"}', "{}"]
+        # Naive concatenation is exactly the corruption downstream must avoid.
+        with pytest.raises(json.JSONDecodeError):
+            json.loads("".join(deltas))
     
     def test_get_tool_calls_returns_all(self, aws_event_parser):
         """

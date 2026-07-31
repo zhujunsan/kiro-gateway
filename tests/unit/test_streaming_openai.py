@@ -62,6 +62,105 @@ def mock_response():
 
 
 # ==================================================================================================
+# Shared tool lifecycle fixtures
+#
+# Kiro replays a completed tool call as a second lifecycle with the same
+# toolUseId and no input. AwsEventStreamParser normalizes that replay into a
+# full start/input/stop triple whose input delta is the literal "{}", so the
+# ghost is only harmless if downstream drops all three events.
+# ==================================================================================================
+
+_EDIT_TOOL_ARGUMENTS = '{"file_path":"a.py","old_string":"x","new_string":"y"}'
+
+_EDIT_TOOL_LIFECYCLE = (
+    KiroEvent(
+        type="tool_start",
+        tool_use={
+            "id": "call_edit",
+            "type": "function",
+            "function": {"name": "Edit", "arguments": ""},
+        },
+    ),
+    KiroEvent(
+        type="tool_input",
+        tool_call_id="call_edit",
+        tool_input_delta=_EDIT_TOOL_ARGUMENTS,
+    ),
+    KiroEvent(
+        type="tool_stop",
+        tool_use={
+            "id": "call_edit",
+            "type": "function",
+            "function": {"name": "Edit", "arguments": _EDIT_TOOL_ARGUMENTS},
+        },
+    ),
+)
+
+_EDIT_TOOL_GHOST_LIFECYCLE = (
+    KiroEvent(
+        type="tool_start",
+        tool_use={
+            "id": "call_edit",
+            "type": "function",
+            "function": {"name": "Edit", "arguments": ""},
+        },
+    ),
+    KiroEvent(
+        type="tool_input",
+        tool_call_id="call_edit",
+        tool_input_delta="{}",
+    ),
+    KiroEvent(
+        type="tool_stop",
+        tool_use={
+            "id": "call_edit",
+            "type": "function",
+            "function": {"name": "Edit", "arguments": "{}"},
+        },
+    ),
+)
+
+_EDIT_TOOL_LIFECYCLE_WITH_GHOST = _EDIT_TOOL_LIFECYCLE + _EDIT_TOOL_GHOST_LIFECYCLE
+
+
+async def _collect_openai_chunks(
+    parse_stream, http_client, response, model_cache, auth_manager
+):
+    """Run the OpenAI streamer over a mocked event source and collect SSE lines."""
+    chunks = []
+    with patch('kiro.streaming_openai.parse_kiro_stream', parse_stream):
+        with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+            async for chunk in stream_kiro_to_openai(
+                http_client, response, "claude-sonnet-4",
+                model_cache, auth_manager
+            ):
+                chunks.append(chunk)
+    return chunks
+
+
+def _reassemble_tool_calls(chunks):
+    """Rebuild tool_call ids and per-index argument strings like a client would."""
+    opening_ids = []
+    reassembled_by_index: dict = {}
+    for chunk in chunks:
+        if not chunk.startswith("data: "):
+            continue
+        json_str = chunk[6:].strip()
+        if json_str == "[DONE]":
+            continue
+        data = json.loads(json_str)
+        delta = (data.get("choices") or [{}])[0].get("delta") or {}
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            if tc.get("id"):
+                opening_ids.append(tc["id"])
+            args = (tc.get("function") or {}).get("arguments")
+            if args is not None:
+                reassembled_by_index[idx] = reassembled_by_index.get(idx, "") + args
+    return opening_ids, reassembled_by_index
+
+
+# ==================================================================================================
 # Tests for stream_kiro_to_openai()
 # ==================================================================================================
 
@@ -564,9 +663,42 @@ class TestStreamingOpenaiNoneProtection:
         """
         What it does: Drops a repeated empty tool lifecycle with the same id.
         Goal: Align OpenAI streaming with Responses/Anthropic — no second
-        empty {} tool_call that clients would try to execute.
+        empty {} tool_call that clients would try to execute, and no stray
+        {} delta appended to the arguments of the completed call.
         """
         async def mock_parse_kiro_stream(*args, **kwargs):
+            for event in _EDIT_TOOL_LIFECYCLE_WITH_GHOST:
+                yield event
+            yield KiroEvent(type="usage", usage={"credits": 0.1})
+
+        chunks = await _collect_openai_chunks(
+            mock_parse_kiro_stream, mock_http_client, mock_response,
+            mock_model_cache, mock_auth_manager,
+        )
+        opening_ids, reassembled_by_index = _reassemble_tool_calls(chunks)
+
+        assert opening_ids == ["call_edit"]
+        assert reassembled_by_index[0] == _EDIT_TOOL_ARGUMENTS
+        # The client parses the concatenated deltas: a trailing ghost {} makes
+        # this "Extra data" and Cursor falls back to an empty tool call.
+        assert json.loads(reassembled_by_index[0]) == {
+            "file_path": "a.py",
+            "old_string": "x",
+            "new_string": "y",
+        }
+
+    @pytest.mark.asyncio
+    async def test_duplicate_lifecycle_with_arguments_does_not_extend_completed_call(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Ignores a replayed lifecycle that carries real arguments.
+        Goal: Once a tool id is finalized its argument stream is closed, so a
+        second lifecycle must never concatenate onto it regardless of payload.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            for event in _EDIT_TOOL_LIFECYCLE:
+                yield event
             yield KiroEvent(
                 type="tool_start",
                 tool_use={
@@ -578,9 +710,7 @@ class TestStreamingOpenaiNoneProtection:
             yield KiroEvent(
                 type="tool_input",
                 tool_call_id="call_edit",
-                tool_input_delta=(
-                    '{"file_path":"a.py","old_string":"x","new_string":"y"}'
-                ),
+                tool_input_delta='{"file_path":"b.py"}',
             )
             yield KiroEvent(
                 type="tool_stop",
@@ -589,63 +719,110 @@ class TestStreamingOpenaiNoneProtection:
                     "type": "function",
                     "function": {
                         "name": "Edit",
-                        "arguments": (
-                            '{"file_path":"a.py","old_string":"x","new_string":"y"}'
-                        ),
+                        "arguments": '{"file_path":"b.py"}',
                     },
                 },
             )
+            yield KiroEvent(type="usage", usage={"credits": 0.1})
+
+        chunks = await _collect_openai_chunks(
+            mock_parse_kiro_stream, mock_http_client, mock_response,
+            mock_model_cache, mock_auth_manager,
+        )
+        opening_ids, reassembled_by_index = _reassemble_tool_calls(chunks)
+
+        assert opening_ids == ["call_edit"]
+        assert reassembled_by_index[0] == _EDIT_TOOL_ARGUMENTS
+
+    @pytest.mark.asyncio
+    async def test_distinct_tool_after_ghost_still_streams_its_arguments(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Streams a second, different tool that follows a ghost.
+        Goal: Retiring the finished stream state must not suppress unrelated
+        tool ids that arrive later in the same response.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            for event in _EDIT_TOOL_LIFECYCLE_WITH_GHOST:
+                yield event
             yield KiroEvent(
                 type="tool_start",
                 tool_use={
-                    "id": "call_edit",
+                    "id": "call_shell",
                     "type": "function",
-                    "function": {"name": "Edit", "arguments": ""},
+                    "function": {"name": "Shell", "arguments": ""},
+                },
+            )
+            yield KiroEvent(
+                type="tool_input",
+                tool_call_id="call_shell",
+                tool_input_delta='{"command":"ls"}',
+            )
+            yield KiroEvent(
+                type="tool_stop",
+                tool_use={
+                    "id": "call_shell",
+                    "type": "function",
+                    "function": {
+                        "name": "Shell",
+                        "arguments": '{"command":"ls"}',
+                    },
+                },
+            )
+            yield KiroEvent(type="usage", usage={"credits": 0.1})
+
+        chunks = await _collect_openai_chunks(
+            mock_parse_kiro_stream, mock_http_client, mock_response,
+            mock_model_cache, mock_auth_manager,
+        )
+        opening_ids, reassembled_by_index = _reassemble_tool_calls(chunks)
+
+        assert opening_ids == ["call_edit", "call_shell"]
+        assert reassembled_by_index[0] == _EDIT_TOOL_ARGUMENTS
+        assert json.loads(reassembled_by_index[1]) == {"command": "ls"}
+
+    @pytest.mark.asyncio
+    async def test_tool_lifecycle_without_id_does_not_break_streaming(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Handles a lifecycle whose tool_use carries no id.
+        Goal: Retiring stream state keys on the upstream id, which may be
+        missing; that must neither raise nor corrupt the arguments. Id-less
+        calls get a fresh synthetic id per event, so this asserts payload
+        integrity rather than emission count.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_start",
+                tool_use={
+                    "type": "function",
+                    "function": {"name": "Shell", "arguments": ""},
                 },
             )
             yield KiroEvent(
                 type="tool_stop",
                 tool_use={
-                    "id": "call_edit",
                     "type": "function",
-                    "function": {"name": "Edit", "arguments": "{}"},
+                    "function": {
+                        "name": "Shell",
+                        "arguments": '{"command":"ls"}',
+                    },
                 },
             )
             yield KiroEvent(type="usage", usage={"credits": 0.1})
 
-        chunks = []
-        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
-            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
-                async for chunk in stream_kiro_to_openai(
-                    mock_http_client, mock_response, "claude-sonnet-4",
-                    mock_model_cache, mock_auth_manager
-                ):
-                    chunks.append(chunk)
-
-        opening_ids = []
-        reassembled_by_index: dict = {}
-        for chunk in chunks:
-            if not chunk.startswith("data: "):
-                continue
-            json_str = chunk[6:].strip()
-            if json_str == "[DONE]":
-                continue
-            data = json.loads(json_str)
-            delta = (data.get("choices") or [{}])[0].get("delta") or {}
-            for tc in delta.get("tool_calls") or []:
-                idx = tc.get("index", 0)
-                if tc.get("id"):
-                    opening_ids.append(tc["id"])
-                args = (tc.get("function") or {}).get("arguments")
-                if args is not None:
-                    reassembled_by_index[idx] = (
-                        reassembled_by_index.get(idx, "") + args
-                    )
-
-        assert opening_ids == ["call_edit"]
-        assert reassembled_by_index[0] == (
-            '{"file_path":"a.py","old_string":"x","new_string":"y"}'
+        chunks = await _collect_openai_chunks(
+            mock_parse_kiro_stream, mock_http_client, mock_response,
+            mock_model_cache, mock_auth_manager,
         )
+        _, reassembled_by_index = _reassemble_tool_calls(chunks)
+
+        delivered = [args for args in reassembled_by_index.values() if args]
+        assert delivered
+        assert all(json.loads(args) == {"command": "ls"} for args in delivered)
+
     
     @pytest.mark.asyncio
     async def test_handles_none_function_arguments(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
