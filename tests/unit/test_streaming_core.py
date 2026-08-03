@@ -25,6 +25,7 @@ from kiro.streaming_core import (
     parse_kiro_stream,
     collect_stream_to_result,
     calculate_tokens_from_context_usage,
+    collect_with_first_token_retry,
     stream_with_first_token_retry,
     _process_chunk,
 )
@@ -1958,3 +1959,244 @@ class TestStreamWithFirstTokenRetryCore:
         assert make_request_call_count == 1
         assert len(chunks) == 1
         print("✓ make_request called immediately when initial_response is None")
+
+
+# ==================================================================================================
+# Tests for collect_with_first_token_retry (non-streaming path)
+# ==================================================================================================
+
+class TestCollectWithFirstTokenRetry:
+    """
+    Tests for collect_with_first_token_retry.
+
+    Non-streaming requests must get the same first-token retry budget as
+    streaming ones. Previously a silent upstream surfaced immediately as a
+    gateway 500 (Sentry KIRO-GATEWAY-TRAY-1C).
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_payload_on_first_attempt(self):
+        """
+        What it does: Returns the collected payload without retrying.
+        Goal: Happy path must not call make_request when initial_response works.
+        """
+        print("Setup: Initial response collects successfully...")
+        initial_response = AsyncMock()
+        initial_response.status_code = 200
+        initial_response.aclose = AsyncMock()
+
+        make_request_calls = 0
+
+        async def mock_make_request():
+            nonlocal make_request_calls
+            make_request_calls += 1
+            return initial_response
+
+        async def mock_collect(response):
+            assert response is initial_response
+            return {"id": "ok"}
+
+        print("Action: Collecting...")
+        result = await collect_with_first_token_retry(
+            make_request=mock_make_request,
+            collect=mock_collect,
+            initial_response=initial_response,
+            max_retries=3,
+            first_token_timeout=30,
+        )
+
+        print(f"Result: {result}, make_request calls: {make_request_calls}")
+        assert result == {"id": "ok"}
+        assert make_request_calls == 0
+        print("✓ No retry needed on success")
+
+    @pytest.mark.asyncio
+    async def test_retries_after_first_token_timeout(self):
+        """
+        What it does: Retries with a fresh request after a first-token stall.
+        Goal: Verify a transient silent upstream is recovered, not surfaced.
+        """
+        print("Setup: First attempt stalls, second succeeds...")
+        initial_response = AsyncMock()
+        initial_response.status_code = 200
+        initial_response.aclose = AsyncMock()
+
+        retry_response = AsyncMock()
+        retry_response.status_code = 200
+        retry_response.aclose = AsyncMock()
+
+        make_request_calls = 0
+
+        async def mock_make_request():
+            nonlocal make_request_calls
+            make_request_calls += 1
+            return retry_response
+
+        attempts = 0
+
+        async def mock_collect(response):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                assert response is initial_response
+                raise FirstTokenTimeoutError("No response within 30.0 seconds")
+            assert response is retry_response
+            return {"id": "recovered"}
+
+        print("Action: Collecting with retry...")
+        result = await collect_with_first_token_retry(
+            make_request=mock_make_request,
+            collect=mock_collect,
+            initial_response=initial_response,
+            max_retries=3,
+            first_token_timeout=30,
+        )
+
+        print(f"Result: {result}, attempts: {attempts}")
+        assert result == {"id": "recovered"}
+        assert attempts == 2
+        assert make_request_calls == 1
+        # Stalled response must be released, not leaked.
+        initial_response.aclose.assert_awaited()
+        print("✓ Retry recovered a stalled upstream")
+
+    @pytest.mark.asyncio
+    async def test_raises_first_token_timeout_after_all_attempts(self):
+        """
+        What it does: Raises FirstTokenTimeoutError when every attempt stalls.
+        Goal: Callers must be able to classify this as 504, not 500.
+        """
+        print("Setup: Every attempt stalls...")
+
+        async def mock_make_request():
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            return response
+
+        attempts = 0
+
+        async def mock_collect(response):
+            nonlocal attempts
+            attempts += 1
+            raise FirstTokenTimeoutError("No response within 30.0 seconds")
+
+        print("Action: Collecting with all attempts failing...")
+        with pytest.raises(FirstTokenTimeoutError) as exc_info:
+            await collect_with_first_token_retry(
+                make_request=mock_make_request,
+                collect=mock_collect,
+                max_retries=3,
+                first_token_timeout=30,
+            )
+
+        print(f"Attempts: {attempts}, error: {exc_info.value}")
+        assert attempts == 3
+        assert "after 3" in str(exc_info.value)
+        print("✓ FirstTokenTimeoutError raised after exhausting attempts")
+
+    @pytest.mark.asyncio
+    async def test_does_not_retry_other_exceptions(self):
+        """
+        What it does: Propagates non-timeout errors without retrying.
+        Goal: A stream that already produced output must never be replayed.
+        """
+        print("Setup: Collect raises RemoteProtocolError...")
+        import httpx
+
+        async def mock_make_request():
+            raise AssertionError("must not retry on non-timeout errors")
+
+        attempts = 0
+
+        async def mock_collect(response):
+            nonlocal attempts
+            attempts += 1
+            raise httpx.RemoteProtocolError("incomplete chunked read")
+
+        initial_response = AsyncMock()
+        initial_response.status_code = 200
+        initial_response.aclose = AsyncMock()
+
+        print("Action: Collecting...")
+        with pytest.raises(httpx.RemoteProtocolError):
+            await collect_with_first_token_retry(
+                make_request=mock_make_request,
+                collect=mock_collect,
+                initial_response=initial_response,
+                max_retries=3,
+                first_token_timeout=30,
+            )
+
+        print(f"Attempts: {attempts}")
+        assert attempts == 1
+        print("✓ Non-timeout errors propagate immediately")
+
+    @pytest.mark.asyncio
+    async def test_non_200_response_is_delegated_to_collect(self):
+        """
+        What it does: Hands a non-200 response to collect unchanged.
+        Goal: Route owns API-specific error mapping; the helper must not retry
+              or swallow upstream rejections.
+        """
+        print("Setup: Initial response with status 400...")
+        initial_response = AsyncMock()
+        initial_response.status_code = 400
+        initial_response.aclose = AsyncMock()
+
+        seen = {}
+
+        async def mock_make_request():
+            raise AssertionError("must not retry a non-200 response")
+
+        async def mock_collect(response):
+            seen["status"] = response.status_code
+            return {"error": "bad request"}
+
+        print("Action: Collecting...")
+        result = await collect_with_first_token_retry(
+            make_request=mock_make_request,
+            collect=mock_collect,
+            initial_response=initial_response,
+            max_retries=3,
+            first_token_timeout=30,
+        )
+
+        print(f"Result: {result}, seen: {seen}")
+        assert result == {"error": "bad request"}
+        assert seen["status"] == 400
+        print("✓ Non-200 delegated to collect")
+
+    @pytest.mark.asyncio
+    async def test_single_attempt_config_does_not_retry(self):
+        """
+        What it does: Honors max_retries=1.
+        Goal: Verify the retry budget is configurable and respected.
+        """
+        print("Setup: max_retries=1 with a stalling collect...")
+
+        async def mock_make_request():
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            return response
+
+        attempts = 0
+
+        async def mock_collect(response):
+            nonlocal attempts
+            attempts += 1
+            raise FirstTokenTimeoutError("stalled")
+
+        print("Action: Collecting...")
+        with pytest.raises(FirstTokenTimeoutError):
+            await collect_with_first_token_retry(
+                make_request=mock_make_request,
+                collect=mock_collect,
+                max_retries=1,
+                first_token_timeout=15,
+            )
+
+        print(f"Attempts: {attempts}")
+        assert attempts == 1
+        print("✓ max_retries=1 performs a single attempt")

@@ -50,6 +50,8 @@ from kiro.streaming_responses import (
     stream_with_first_token_retry,
     collect_stream_response,
 )
+from kiro.streaming_core import collect_with_first_token_retry
+from kiro.collect_errors import classify_collect_exception
 from kiro.response_store import (
     chain_input_with_previous,
     get_response_store,
@@ -319,14 +321,28 @@ async def _handle_success_response(
 
         return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
 
-    responses_json = await collect_stream_response(
-        http_client.client,
-        response,
-        request_data.model,
-        model_cache,
-        auth_manager,
-        request_messages=messages_for_tokenizer,
-        request_tools=tools_for_tokenizer,
+    # Non-streaming gets the same first-token retry budget as streaming, so a
+    # silent upstream is retried instead of failing the client on the first stall.
+    async def collect_non_streaming(resp):
+        return await collect_stream_response(
+            http_client.client,
+            resp,
+            request_data.model,
+            model_cache,
+            auth_manager,
+            request_messages=messages_for_tokenizer,
+            request_tools=tools_for_tokenizer,
+        )
+
+    async def make_collect_request():
+        return await http_client.request_with_retry(
+            "POST", url, kiro_payload, stream=True
+        )
+
+    responses_json = await collect_with_first_token_retry(
+        make_request=make_collect_request,
+        collect=collect_non_streaming,
+        initial_response=response,
     )
     if build_result is not None:
         responses_json = _merge_conversion_metadata(responses_json, build_result)
@@ -558,14 +574,42 @@ async def create_response(request: Request, request_data: ResponsesRequest):
                 raise
             except Exception as e:
                 await http_client.close()
+                failure = classify_collect_exception(e)
+
+                if failure.is_upstream:
+                    # Upstream transport failure (stall / cut stream): recoverable,
+                    # so try the next account instead of reporting a gateway bug.
+                    await account_manager.report_failure(
+                        account.id, request_data.model, ErrorType.RECOVERABLE,
+                        failure.status_code, failure.code,
+                    )
+                    last_error_message = failure.message
+                    last_error_status = failure.status_code
+                    logger.warning(
+                        f"HTTP {failure.status_code} - POST /v1/responses "
+                        f"(non-streaming) - [{failure.code}] {failure.message[:100]}"
+                    )
+                    if debug_logger:
+                        debug_logger.flush_on_error(
+                            failure.status_code, failure.message,
+                            source=failure.source, code=failure.code,
+                            phase=failure.phase,
+                        )
+                    if len(all_accounts) == 1:
+                        break
+                    logger.warning(
+                        f"Upstream transport error on account {account.id}, trying next account"
+                    )
+                    continue
+
                 logger.error(f"Internal error: {e}", exc_info=True)
                 logger.error(f"HTTP 500 - POST /v1/responses - {str(e)[:100]}")
                 if debug_logger:
                     debug_logger.flush_on_error(
                         500, str(e),
-                        source="gateway",
-                        code=type(e).__name__,
-                        phase="unknown",
+                        source=failure.source,
+                        code=failure.code,
+                        phase=failure.phase,
                     )
                 raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
@@ -700,14 +744,30 @@ async def create_response(request: Request, request_data: ResponsesRequest):
         raise
     except Exception as e:
         await http_client.close()
+        failure = classify_collect_exception(e)
+
+        if failure.is_upstream:
+            # Upstream stalled or cut the response: report as a network incident
+            # (502/504), not as a gateway 500.
+            logger.warning(
+                f"HTTP {failure.status_code} - POST /v1/responses (non-streaming) - "
+                f"[{failure.code}] {failure.message[:100]}"
+            )
+            if debug_logger:
+                debug_logger.flush_on_error(
+                    failure.status_code, failure.message,
+                    source=failure.source, code=failure.code, phase=failure.phase,
+                )
+            raise HTTPException(status_code=failure.status_code, detail=failure.message)
+
         logger.error(f"Internal error: {e}", exc_info=True)
         logger.error(f"HTTP 500 - POST /v1/responses - {str(e)[:100]}")
         if debug_logger:
             debug_logger.flush_on_error(
                 500, str(e),
-                source="gateway",
-                code=type(e).__name__,
-                phase="unknown",
+                source=failure.source,
+                code=failure.code,
+                phase=failure.phase,
             )
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 

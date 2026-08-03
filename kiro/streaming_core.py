@@ -415,6 +415,86 @@ def calculate_tokens_from_context_usage(
 # First Token Retry Logic
 # ==================================================================================================
 
+async def collect_with_first_token_retry(
+    make_request: Callable[[], Awaitable[httpx.Response]],
+    collect: Callable[[httpx.Response], Awaitable[Any]],
+    initial_response: Optional[httpx.Response] = None,
+    max_retries: int = FIRST_TOKEN_MAX_RETRIES,
+    first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
+) -> Any:
+    """
+    Non-streaming counterpart of ``stream_with_first_token_retry``.
+
+    Streaming clients get up to ``max_retries`` attempts when Kiro accepts the
+    request (HTTP 200) but never emits a first token. Non-streaming callers used
+    to surface that same stall as an immediate gateway error, so a silent
+    upstream turned into a hard failure for the client. This helper gives the
+    collect path identical retry semantics.
+
+    Only ``FirstTokenTimeoutError`` is retried: a stream that already produced
+    output must not be replayed, and any other failure is propagated to the
+    caller for classification.
+
+    Args:
+        make_request: Coroutine factory issuing a fresh Kiro request.
+        collect: Coroutine consuming a response into a final payload.
+        initial_response: Pre-validated HTTP 200 response for the first attempt.
+        max_retries: Total attempts, including the first one.
+        first_token_timeout: Per-attempt first-token budget, for messages only.
+
+    Returns:
+        Whatever ``collect`` returns.
+
+    Raises:
+        FirstTokenTimeoutError: When every attempt times out waiting for the
+            first token.
+        Exception: Any other error raised by ``make_request`` / ``collect``.
+    """
+    last_error: Optional[FirstTokenTimeoutError] = None
+
+    for attempt in range(max_retries):
+        response: Optional[httpx.Response] = None
+        try:
+            if attempt == 0 and initial_response is not None:
+                response = initial_response
+                logger.debug("Reusing initial response for first attempt (non-streaming)")
+            else:
+                logger.warning(
+                    f"Retry attempt {attempt + 1}/{max_retries} after first token "
+                    f"timeout (non-streaming)"
+                )
+                response = await make_request()
+
+            if response.status_code != 200:
+                # Let the caller classify upstream rejections; it owns the
+                # API-specific error body and status mapping.
+                return await collect(response)
+
+            return await collect(response)
+
+        except FirstTokenTimeoutError as e:
+            last_error = e
+            logger.warning(
+                f"[FirstTokenTimeout] Attempt {attempt + 1}/{max_retries} failed "
+                f"(non-streaming) - model did not respond within {first_token_timeout}s"
+            )
+            if response is not None:
+                try:
+                    await response.aclose()
+                except Exception:
+                    pass
+            continue
+
+    logger.error(
+        f"[FirstTokenTimeout] All {max_retries} attempts exhausted (non-streaming) - "
+        f"model never responded within {first_token_timeout}s per attempt"
+    )
+    raise FirstTokenTimeoutError(
+        f"Model did not respond within {first_token_timeout}s after {max_retries} "
+        "attempts. Please try again."
+    ) from last_error
+
+
 async def stream_with_first_token_retry(
     make_request: Callable[[], Awaitable[httpx.Response]],
     stream_processor: Callable[[httpx.Response], AsyncGenerator[str, None]],

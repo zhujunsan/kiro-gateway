@@ -67,6 +67,13 @@ EMPTY_CONTENT_PLACEHOLDER = " "
 # clients send to resume an assistant turn and is unambiguous to the model.
 SYNTHETIC_CURRENT_MESSAGE = "Continue."
 
+# Bedrock (behind Kiro) only accepts object-typed tool input schemas. Anything
+# else fails the entire request with TOOL_SCHEMA_INVALID, so tool schemas are
+# normalized to this type before being sent (see normalize_tool_input_schema).
+TOOL_SCHEMA_OBJECT_TYPE = "object"
+# Property name used to host a non-object client schema without losing it.
+TOOL_SCHEMA_WRAPPED_VALUE_KEY = "value"
+
 
 # ==================================================================================================
 # Data Classes for Unified Message Format
@@ -643,6 +650,60 @@ def validate_tool_names(tools: Optional[List[UnifiedTool]]) -> None:
         tool.name = prepare_tool_name_for_kiro(tool.name)
 
 
+def normalize_tool_input_schema(
+    schema: Optional[Dict[str, Any]],
+    tool_name: str = "",
+) -> Dict[str, Any]:
+    """
+    Ensure a tool input schema satisfies Bedrock's object-schema requirement.
+
+    Bedrock rejects the whole request with
+    ``TOOL_SCHEMA_INVALID: The value at toolConfig.tools.N.toolSpec.
+    inputSchema.json.type must be one of the following: object`` when a tool
+    declares no schema (``{}``) or a non-object ``type``. Clients legitimately
+    send parameterless tools this way, so normalize instead of failing:
+
+    * missing / empty schema -> ``{"type": "object", "properties": {}}``
+    * schema without ``type`` -> inject ``"type": "object"``
+    * non-object ``type`` (e.g. ``"string"``, ``["object", "null"]``) -> wrap the
+      original schema under ``properties.value`` so no client intent is lost
+
+    Args:
+        schema: Sanitized JSON Schema for the tool's parameters.
+        tool_name: Tool name, used for log context only.
+
+    Returns:
+        A schema dict whose top-level ``type`` is ``"object"``.
+    """
+    if not schema:
+        logger.debug(
+            f"Tool '{tool_name}' has empty input schema, using empty object schema"
+        )
+        return {"type": TOOL_SCHEMA_OBJECT_TYPE, "properties": {}}
+
+    schema_type = schema.get("type")
+    if schema_type == TOOL_SCHEMA_OBJECT_TYPE:
+        return schema
+
+    if schema_type is None:
+        logger.debug(
+            f"Tool '{tool_name}' input schema has no 'type', injecting "
+            f"'{TOOL_SCHEMA_OBJECT_TYPE}'"
+        )
+        normalized = dict(schema)
+        normalized["type"] = TOOL_SCHEMA_OBJECT_TYPE
+        return normalized
+
+    logger.warning(
+        f"Tool '{tool_name}' input schema has non-object type {schema_type!r}; "
+        f"wrapping it under properties.{TOOL_SCHEMA_WRAPPED_VALUE_KEY} to satisfy Kiro API"
+    )
+    return {
+        "type": TOOL_SCHEMA_OBJECT_TYPE,
+        "properties": {TOOL_SCHEMA_WRAPPED_VALUE_KEY: schema},
+    }
+
+
 def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dict[str, Any]]:
     """
     Converts unified tools to Kiro API format.
@@ -660,6 +721,8 @@ def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dic
     for tool in tools:
         # Sanitize parameters from fields that Kiro API doesn't accept
         sanitized_params = sanitize_json_schema(tool.input_schema)
+        # Bedrock rejects the whole request when a tool schema is not an object
+        sanitized_params = normalize_tool_input_schema(sanitized_params, tool.name)
         
         # Kiro API requires non-empty description
         description = tool.description

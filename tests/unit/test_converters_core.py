@@ -35,6 +35,9 @@ from kiro.converters_core import (
     extract_tool_uses_from_message,
     sanitize_json_schema,
     sanitize_tool_use_id,
+    normalize_tool_input_schema,
+    TOOL_SCHEMA_OBJECT_TYPE,
+    TOOL_SCHEMA_WRAPPED_VALUE_KEY,
     TOOL_USE_ID_MAX_LENGTH,
     convert_tools_to_kiro_format,
     convert_tool_results_to_kiro_format,
@@ -3769,6 +3772,208 @@ class TestConvertToolsToKiroFormat:
         schema = result[0]["toolSpecification"]["inputSchema"]["json"]
         assert "required" not in schema
         assert "additionalProperties" not in schema
+
+    def test_empty_schema_becomes_object_schema(self):
+        """
+        What it does: Verifies parameterless tools get an object schema.
+        Purpose: Bedrock rejects the whole request with TOOL_SCHEMA_INVALID when
+                 inputSchema.json is {} (see Sentry KIRO-GATEWAY-TRAY-1T).
+        """
+        print("Setup: Tool with empty input schema...")
+        tools = [UnifiedTool(name="tool_search", description="", input_schema={})]
+
+        print("Action: Converting tools...")
+        result = convert_tools_to_kiro_format(tools)
+
+        print(f"Result: {result}")
+        schema = result[0]["toolSpecification"]["inputSchema"]["json"]
+        assert schema["type"] == TOOL_SCHEMA_OBJECT_TYPE
+        assert schema["properties"] == {}
+
+    def test_none_schema_becomes_object_schema(self):
+        """
+        What it does: Verifies None input_schema also yields an object schema.
+        Purpose: Clients may omit the schema entirely; must not send bare {}.
+        """
+        print("Setup: Tool with None input schema...")
+        tools = [UnifiedTool(name="ping", description="Ping", input_schema=None)]
+
+        print("Action: Converting tools...")
+        result = convert_tools_to_kiro_format(tools)
+
+        print(f"Result: {result}")
+        schema = result[0]["toolSpecification"]["inputSchema"]["json"]
+        assert schema == {"type": TOOL_SCHEMA_OBJECT_TYPE, "properties": {}}
+
+    def test_schema_without_type_gets_object_type(self):
+        """
+        What it does: Verifies a schema with properties but no "type".
+        Purpose: Ensure "type": "object" is injected without losing properties.
+        """
+        print("Setup: Tool schema with properties but no type...")
+        tools = [UnifiedTool(
+            name="lookup",
+            description="Lookup",
+            input_schema={"properties": {"q": {"type": "string"}}, "required": ["q"]},
+        )]
+
+        print("Action: Converting tools...")
+        result = convert_tools_to_kiro_format(tools)
+
+        print(f"Result: {result}")
+        schema = result[0]["toolSpecification"]["inputSchema"]["json"]
+        assert schema["type"] == TOOL_SCHEMA_OBJECT_TYPE
+        assert schema["properties"] == {"q": {"type": "string"}}
+        assert schema["required"] == ["q"]
+
+    def test_non_object_schema_is_wrapped(self):
+        """
+        What it does: Verifies a non-object schema is wrapped, not dropped.
+        Purpose: Preserve client intent while satisfying Bedrock's object rule.
+        """
+        print("Setup: Tool schema declared as string...")
+        tools = [UnifiedTool(
+            name="echo",
+            description="Echo",
+            input_schema={"type": "string", "maxLength": 10},
+        )]
+
+        print("Action: Converting tools...")
+        result = convert_tools_to_kiro_format(tools)
+
+        print(f"Result: {result}")
+        schema = result[0]["toolSpecification"]["inputSchema"]["json"]
+        assert schema["type"] == TOOL_SCHEMA_OBJECT_TYPE
+        wrapped = schema["properties"][TOOL_SCHEMA_WRAPPED_VALUE_KEY]
+        assert wrapped == {"type": "string", "maxLength": 10}
+
+    def test_every_tool_gets_object_schema(self):
+        """
+        What it does: Verifies normalization applies to all tools in a batch.
+        Purpose: One bad tool anywhere in the list fails the whole request, so
+                 every entry must be normalized (1T had the bad tool at index 0).
+        """
+        print("Setup: Mixed batch of tools...")
+        tools = [
+            UnifiedTool(name="a", description="A", input_schema={}),
+            UnifiedTool(name="b", description="B", input_schema={"type": "object"}),
+            UnifiedTool(name="c", description="C", input_schema={"type": "array"}),
+        ]
+
+        print("Action: Converting tools...")
+        result = convert_tools_to_kiro_format(tools)
+
+        print(f"Result: {result}")
+        assert len(result) == 3
+        for entry in result:
+            schema = entry["toolSpecification"]["inputSchema"]["json"]
+            assert schema["type"] == TOOL_SCHEMA_OBJECT_TYPE
+
+
+# ==================================================================================================
+# Tests for normalize_tool_input_schema
+# ==================================================================================================
+
+class TestNormalizeToolInputSchema:
+    """
+    Tests for normalize_tool_input_schema.
+
+    Bedrock (behind Kiro) rejects the entire request with TOOL_SCHEMA_INVALID
+    unless every toolSpec.inputSchema.json has "type": "object".
+    """
+
+    def test_none_returns_empty_object_schema(self):
+        """
+        What it does: Verifies None input.
+        Purpose: Missing schema must still be a valid object schema.
+        """
+        print("Setup: None schema...")
+
+        print("Action: Normalizing...")
+        result = normalize_tool_input_schema(None, "t")
+
+        print(f"Result: {result}")
+        assert result == {"type": TOOL_SCHEMA_OBJECT_TYPE, "properties": {}}
+
+    def test_empty_dict_returns_empty_object_schema(self):
+        """
+        What it does: Verifies {} input (the exact 1T payload shape).
+        Purpose: Ensure the reported crash input is normalized.
+        """
+        print("Setup: Empty dict schema...")
+
+        print("Action: Normalizing...")
+        result = normalize_tool_input_schema({}, "tool_search")
+
+        print(f"Result: {result}")
+        assert result == {"type": TOOL_SCHEMA_OBJECT_TYPE, "properties": {}}
+
+    def test_object_schema_is_returned_unchanged(self):
+        """
+        What it does: Verifies already-valid schemas pass through untouched.
+        Purpose: Normalization must not rewrite conforming client schemas.
+        """
+        print("Setup: Valid object schema...")
+        schema = {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        }
+
+        print("Action: Normalizing...")
+        result = normalize_tool_input_schema(schema, "get_weather")
+
+        print(f"Result: {result}")
+        assert result is schema
+
+    def test_missing_type_is_injected_without_mutating_input(self):
+        """
+        What it does: Verifies "type" injection leaves the caller's dict intact.
+        Purpose: Avoid surprising in-place mutation of client-derived schemas.
+        """
+        print("Setup: Schema without type...")
+        schema = {"properties": {"a": {"type": "number"}}}
+
+        print("Action: Normalizing...")
+        result = normalize_tool_input_schema(schema, "calc")
+
+        print(f"Result: {result}, original: {schema}")
+        assert result["type"] == TOOL_SCHEMA_OBJECT_TYPE
+        assert result["properties"] == {"a": {"type": "number"}}
+        assert "type" not in schema
+
+    def test_list_type_is_wrapped(self):
+        """
+        What it does: Verifies a nullable-style ["object", "null"] type.
+        Purpose: Bedrock accepts only the literal string "object", so a list
+                 type must be wrapped rather than passed through.
+        """
+        print("Setup: Schema with list type...")
+        schema = {"type": ["object", "null"], "properties": {}}
+
+        print("Action: Normalizing...")
+        result = normalize_tool_input_schema(schema, "nullable")
+
+        print(f"Result: {result}")
+        assert result["type"] == TOOL_SCHEMA_OBJECT_TYPE
+        assert result["properties"][TOOL_SCHEMA_WRAPPED_VALUE_KEY] == schema
+
+    def test_wrapped_result_is_object_typed_and_idempotent(self):
+        """
+        What it does: Verifies normalizing twice is stable.
+        Purpose: Repeated passes (retries, re-serialization) must not nest
+                 wrappers indefinitely.
+        """
+        print("Setup: Non-object schema...")
+        schema = {"type": "string"}
+
+        print("Action: Normalizing twice...")
+        once = normalize_tool_input_schema(schema, "echo")
+        twice = normalize_tool_input_schema(once, "echo")
+
+        print(f"Once: {once}, Twice: {twice}")
+        assert twice is once
+        assert twice["type"] == TOOL_SCHEMA_OBJECT_TYPE
 
 
 # ==================================================================================================

@@ -50,6 +50,8 @@ from kiro.streaming_anthropic import (
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
 )
+from kiro.streaming_core import collect_with_first_token_retry
+from kiro.collect_errors import classify_collect_exception
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
@@ -528,15 +530,29 @@ async def messages(
                         )
                     
                     else:
-                        # Non-streaming mode
-                        anthropic_response = await collect_anthropic_response(
-                            response,
-                            request_data.model,
-                            model_cache,
-                            auth_manager,
-                            request_messages=messages_for_tokenizer,
-                            request_tools=tools_for_tokenizer,
-                            request_system=system_for_tokenizer,
+                        # Non-streaming mode: same first-token retry budget as
+                        # streaming, so a silent upstream is retried instead of
+                        # failing the client on the first stall.
+                        async def collect_non_streaming(resp):
+                            return await collect_anthropic_response(
+                                resp,
+                                request_data.model,
+                                model_cache,
+                                auth_manager,
+                                request_messages=messages_for_tokenizer,
+                                request_tools=tools_for_tokenizer,
+                                request_system=system_for_tokenizer,
+                            )
+
+                        async def make_collect_request():
+                            return await http_client.request_with_retry(
+                                "POST", url, kiro_payload, stream=True
+                            )
+
+                        anthropic_response = await collect_with_first_token_retry(
+                            make_request=make_collect_request,
+                            collect=collect_non_streaming,
+                            initial_response=response,
                         )
                         
                         await http_client.close()
@@ -668,14 +684,42 @@ async def messages(
                 raise
             except Exception as e:
                 await http_client.close()
+                failure = classify_collect_exception(e)
+
+                if failure.is_upstream:
+                    # Upstream transport failure (stall / cut stream): recoverable,
+                    # so try the next account instead of reporting a gateway bug.
+                    await account_manager.report_failure(
+                        account.id, request_data.model, ErrorType.RECOVERABLE,
+                        failure.status_code, failure.code
+                    )
+                    last_error_message = failure.message
+                    last_error_status = failure.status_code
+                    logger.warning(
+                        f"HTTP {failure.status_code} - POST /v1/messages "
+                        f"(non-streaming) - [{failure.code}] {failure.message[:100]}"
+                    )
+                    if debug_logger:
+                        debug_logger.flush_on_error(
+                            failure.status_code, failure.message,
+                            source=failure.source, code=failure.code,
+                            phase=failure.phase,
+                        )
+                    if len(all_accounts) == 1:
+                        break
+                    logger.warning(
+                        f"Upstream transport error on account {account.id}, trying next account"
+                    )
+                    continue
+
                 logger.error(f"Internal error: {e}", exc_info=True)
                 logger.error(f"HTTP 500 - POST /v1/messages - {str(e)[:100]}")
                 if debug_logger:
                     debug_logger.flush_on_error(
                     500, str(e),
-                    source="gateway",
-                    code=type(e).__name__,
-                    phase="unknown",
+                    source=failure.source,
+                    code=failure.code,
+                    phase=failure.phase,
                 )
                 
                 return JSONResponse(
@@ -960,15 +1004,28 @@ async def messages(
             )
         
         else:
-            # Non-streaming mode - collect entire response
-            anthropic_response = await collect_anthropic_response(
-                response,
-                request_data.model,
-                model_cache,
-                auth_manager,
-                request_messages=messages_for_tokenizer,
-                request_tools=tools_for_tokenizer,
-                request_system=system_for_tokenizer,
+            # Non-streaming mode - collect entire response, retrying a silent
+            # upstream exactly like the streaming path does.
+            async def collect_non_streaming_legacy(resp):
+                return await collect_anthropic_response(
+                    resp,
+                    request_data.model,
+                    model_cache,
+                    auth_manager,
+                    request_messages=messages_for_tokenizer,
+                    request_tools=tools_for_tokenizer,
+                    request_system=system_for_tokenizer,
+                )
+
+            async def make_collect_request_legacy():
+                return await http_client.request_with_retry(
+                    "POST", url, kiro_payload, stream=True
+                )
+
+            anthropic_response = await collect_with_first_token_retry(
+                make_request=make_collect_request_legacy,
+                collect=collect_non_streaming_legacy,
+                initial_response=response,
             )
             
             await http_client.close()
@@ -999,14 +1056,42 @@ async def messages(
         raise
     except Exception as e:
         await http_client.close()
+        failure = classify_collect_exception(e)
+
+        if failure.is_upstream:
+            # Upstream stalled or cut the response: report as a network incident
+            # (502/504), not as a gateway 500.
+            logger.warning(
+                f"HTTP {failure.status_code} - POST /v1/messages (non-streaming) - "
+                f"[{failure.code}] {failure.message[:100]}"
+            )
+            if debug_logger:
+                debug_logger.flush_on_error(
+                    failure.status_code, failure.message,
+                    source=failure.source, code=failure.code, phase=failure.phase,
+                )
+            return JSONResponse(
+                status_code=failure.status_code,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": (
+                            "timeout_error" if failure.status_code == 504
+                            else "api_error"
+                        ),
+                        "message": failure.message,
+                    },
+                },
+            )
+
         logger.error(f"Internal error: {e}", exc_info=True)
         logger.error(f"HTTP 500 - POST /v1/messages - {str(e)[:100]}")
         if debug_logger:
             debug_logger.flush_on_error(
                     500, str(e),
-                    source="gateway",
-                    code=type(e).__name__,
-                    phase="unknown",
+                    source=failure.source,
+                    code=failure.code,
+                    phase=failure.phase,
                 )
         
         return JSONResponse(
