@@ -54,8 +54,9 @@ def generate_truncation_tool_result(
     
     Message is carefully worded to:
     - Acknowledge API limitation (not model's fault)
-    - Warn against repeating same operation
-    - NOT give specific instructions (avoid micro-steps)
+    - State that the argument was dropped whole, so nothing can be continued
+    - Name the concrete size limit, so the model resizes in one step
+    - Suggest splitting without prescribing a chunk size (avoids micro-steps)
     
     Args:
         tool_name: Name of the truncated tool
@@ -69,16 +70,24 @@ def generate_truncation_tool_result(
         >>> generate_truncation_tool_result("Write", "call_123", {"size_bytes": 5000, "reason": "missing 2 closing braces"})
         {'type': 'tool_result', 'tool_use_id': 'call_123', 'content': '[API Limitation] ...', 'is_error': True}
     """
+    from kiro.config import TOOL_ARGS_SIZE_LIMIT_BYTES
+
+    limit_kb = TOOL_ARGS_SIZE_LIMIT_BYTES // 1000
+
     content = (
-        "[API Limitation] Your tool call was truncated by the upstream API due to output size limits.\n\n"
-        "If the tool result below shows an error or unexpected behavior, this is likely a CONSEQUENCE of the truncation, "
-        "not the root cause. The tool call itself was cut off before it could be fully transmitted.\n\n"
-        "Repeating the exact same operation will be truncated again. Consider adapting your approach."
+        "[API Limitation] Your tool call was discarded by the upstream API because its "
+        f"arguments exceeded the size limit of roughly {limit_kb} KB.\n\n"
+        "Note that the argument was dropped ENTIRELY rather than cut short, so no partial "
+        "result was applied and there is nothing to continue from. If the tool result below "
+        "shows an error or unexpected behavior, that is a CONSEQUENCE of this, not the root cause.\n\n"
+        f"Retrying the same call will fail the same way. Split the content into portions under "
+        f"{limit_kb} KB and send them as several sequential calls."
     )
-    
+
     logger.debug(
         f"Generated synthetic tool_result for truncated tool '{tool_name}' "
-        f"(id={tool_use_id}, {truncation_info['size_bytes']} bytes, {truncation_info['reason']})"
+        f"(id={tool_use_id}, {truncation_info['size_bytes']} bytes, {truncation_info['reason']}, "
+        f"advertised limit {limit_kb} KB)"
     )
     
     return {

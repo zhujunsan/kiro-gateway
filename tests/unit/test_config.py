@@ -1047,3 +1047,104 @@ class TestAccountSystemConfig:
         
         print(f"Comparing STATE_SAVE_INTERVAL_SECONDS: Expected 10, Got {config_module.STATE_SAVE_INTERVAL_SECONDS}")
         assert config_module.STATE_SAVE_INTERVAL_SECONDS == 10
+
+class TestToolArgsSizeLimit:
+    """Tests for TOOL_ARGS_SIZE_LIMIT_BYTES / TOOL_ARGS_SIZE_HINT configuration."""
+
+    def test_size_limit_default_value(self):
+        """
+        What it does: Verifies the default advertised tool argument ceiling.
+        Purpose: The default sits below the ~58 KB measured ceiling so the model
+                 has headroom for the surrounding JSON envelope.
+        """
+        print("Setup: Removing TOOL_ARGS_SIZE_LIMIT_BYTES from environment...")
+
+        env = dict(os.environ)
+        env.pop("TOOL_ARGS_SIZE_LIMIT_BYTES", None)
+
+        with patch.dict(os.environ, env, clear=True):
+            import kiro.config as config_module
+            from importlib import reload
+            reload(config_module)
+
+            print(f"TOOL_ARGS_SIZE_LIMIT_BYTES: {config_module.TOOL_ARGS_SIZE_LIMIT_BYTES}")
+            assert config_module.TOOL_ARGS_SIZE_LIMIT_BYTES == 50000
+
+    def test_size_limit_from_env(self):
+        """
+        What it does: Verifies the limit is read from the environment.
+        Purpose: Users must be able to tune it if Kiro's behavior changes.
+        """
+        print("Setup: Setting TOOL_ARGS_SIZE_LIMIT_BYTES=40000...")
+
+        with patch.dict(os.environ, {"TOOL_ARGS_SIZE_LIMIT_BYTES": "40000"}):
+            import kiro.config as config_module
+            from importlib import reload
+            reload(config_module)
+
+            print(f"TOOL_ARGS_SIZE_LIMIT_BYTES: {config_module.TOOL_ARGS_SIZE_LIMIT_BYTES}")
+            assert config_module.TOOL_ARGS_SIZE_LIMIT_BYTES == 40000
+
+    def test_size_limit_zero_disables(self):
+        """
+        What it does: Verifies 0 is accepted as the disabled value.
+        Purpose: Matches the convention used by other size limits in config.
+        """
+        print("Setup: Setting TOOL_ARGS_SIZE_LIMIT_BYTES=0...")
+
+        with patch.dict(os.environ, {"TOOL_ARGS_SIZE_LIMIT_BYTES": "0"}):
+            import kiro.config as config_module
+            from importlib import reload
+            reload(config_module)
+
+            print(f"TOOL_ARGS_SIZE_LIMIT_BYTES: {config_module.TOOL_ARGS_SIZE_LIMIT_BYTES}")
+            assert config_module.TOOL_ARGS_SIZE_LIMIT_BYTES == 0
+
+    def test_hint_enabled_by_default(self):
+        """
+        What it does: Verifies the size hint defaults to enabled.
+        Purpose: Clients cannot discover this limit on their own, so warning
+                 them is the safer default.
+        """
+        print("Setup: Removing TOOL_ARGS_SIZE_HINT from environment...")
+
+        env = dict(os.environ)
+        env.pop("TOOL_ARGS_SIZE_HINT", None)
+
+        with patch.dict(os.environ, env, clear=True):
+            import kiro.config as config_module
+            from importlib import reload
+            reload(config_module)
+
+            print(f"TOOL_ARGS_SIZE_HINT: {config_module.TOOL_ARGS_SIZE_HINT}")
+            assert config_module.TOOL_ARGS_SIZE_HINT is True
+
+    def test_hint_can_be_disabled(self):
+        """
+        What it does: Verifies the hint can be turned off.
+        Purpose: Users wanting native pass-through must be able to opt out.
+        """
+        print("Setup: Setting TOOL_ARGS_SIZE_HINT=false...")
+
+        with patch.dict(os.environ, {"TOOL_ARGS_SIZE_HINT": "false"}):
+            import kiro.config as config_module
+            from importlib import reload
+            reload(config_module)
+
+            print(f"TOOL_ARGS_SIZE_HINT: {config_module.TOOL_ARGS_SIZE_HINT}")
+            assert config_module.TOOL_ARGS_SIZE_HINT is False
+
+    def test_hint_accepts_alternative_truthy_values(self):
+        """
+        What it does: Verifies "1" and "yes" enable the hint.
+        Purpose: Consistent with how other booleans in config are parsed.
+        """
+        for value in ("1", "yes", "TRUE"):
+            print(f"Setup: Setting TOOL_ARGS_SIZE_HINT={value}...")
+
+            with patch.dict(os.environ, {"TOOL_ARGS_SIZE_HINT": value}):
+                import kiro.config as config_module
+                from importlib import reload
+                reload(config_module)
+
+                assert config_module.TOOL_ARGS_SIZE_HINT is True, f"{value} should enable"

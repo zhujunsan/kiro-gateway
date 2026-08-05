@@ -353,6 +353,32 @@ TOOL_DESCRIPTION_MAX_LENGTH: int = int(os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", 
 # Default: true (enabled)
 TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "true").lower() in ("true", "1", "yes")
 
+# Measured ceiling (in bytes) for a single tool call's `arguments` payload.
+#
+# Kiro's generateAssistantResponse accumulates the whole tool `input` server-side
+# and only validates its size once generation finishes. Past the ceiling it does
+# NOT deliver a partial payload - it drops the large argument entirely and emits
+# a fragment such as `{"path": "/tmp/out.txt"` with no closing brace, which the
+# parser then reports as a truncated tool call.
+#
+# Empirically bisected against claude-opus-4.6 (payloads are the `arguments`
+# byte counts actually delivered downstream):
+#   - 39114 B / 42228 B / 57893 B -> complete, valid JSON
+#   - 56 KiB / 64 KiB / 96 KiB / 128 KiB / 256 KiB requests -> ~30 B fragment
+# Inflating the prompt (783 B vs 161 KB request bodies) did not shift the
+# boundary, so this is an output-side limit rather than a context budget.
+#
+# The advertised value is deliberately below the measured ceiling so the model
+# has headroom for the surrounding JSON envelope (key names, escaping).
+TOOL_ARGS_SIZE_LIMIT_BYTES: int = int(os.getenv("TOOL_ARGS_SIZE_LIMIT_BYTES", "50000"))
+
+# Advertise the tool argument size limit to the model via the system prompt.
+# When enabled, tools whose input schema accepts large free-form text get a
+# short hint telling the model to split oversized writes into several calls.
+# Set to false to send tool definitions exactly as the client provided them.
+# Default: true (enabled)
+TOOL_ARGS_SIZE_HINT: bool = os.getenv("TOOL_ARGS_SIZE_HINT", "true").lower() in ("true", "1", "yes")
+
 # ==================================================================================================
 # Logging Settings
 # ==================================================================================================

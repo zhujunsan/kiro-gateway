@@ -1949,3 +1949,113 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestAnthropicToolArgsSizeHint:
+    """Test suite verifying the tool argument size hint reaches the Anthropic path.
+
+    The hint is injected in the shared core, but both API surfaces must be
+    covered explicitly - a regression that bypasses the core on one adapter
+    would otherwise go unnoticed.
+    """
+
+    WRITE_TOOL = {
+        "name": "Write",
+        "description": "Write a file",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+        },
+    }
+
+    READ_TOOL = {
+        "name": "Read",
+        "description": "Read a file",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+        },
+    }
+
+    def _convert(self, tools):
+        """Convert a minimal Anthropic request carrying the given tools."""
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            messages=[AnthropicMessage(role="user", content="Create a large file")],
+            max_tokens=1024,
+            system="You are a helpful assistant.",
+            tools=tools,
+        )
+
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                return anthropic_to_kiro(request, "conv-size-hint", "arn:aws:test")
+
+    def _system_content(self, result):
+        """Extract the content carrying the system prompt."""
+        history = result["conversationState"].get("history") or []
+        if history:
+            return history[0]["userInputMessage"]["content"]
+        return result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+    def test_hint_present_for_bulk_text_tool(self):
+        """
+        What it does: Verifies the hint appears for an Anthropic Write tool.
+        Purpose: Feature parity with the OpenAI surface.
+        """
+        print("Setup: Anthropic request with Write tool...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = self._convert([self.WRITE_TOOL])
+
+        print("Checking system prompt for hint...")
+        content = self._system_content(result)
+        assert "Tool Call Size Limit" in content
+        assert "50 KB" in content
+        assert "`Write`" in content
+
+    def test_hint_absent_for_scalar_only_tools(self):
+        """
+        What it does: Verifies a Read-only tool set gets no hint.
+        Purpose: Same targeting rules must apply on both adapters.
+        """
+        print("Setup: Anthropic request with Read tool only...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = self._convert([self.READ_TOOL])
+
+        print("Checking system prompt has no hint...")
+        assert "Tool Call Size Limit" not in self._system_content(result)
+
+    def test_hint_absent_when_disabled(self):
+        """
+        What it does: Verifies the opt-out works on the Anthropic path.
+        Purpose: Config must behave identically across adapters.
+        """
+        print("Setup: Anthropic request with hint disabled...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", False):
+            result = self._convert([self.WRITE_TOOL])
+
+        print("Checking system prompt has no hint...")
+        assert "Tool Call Size Limit" not in self._system_content(result)
+
+    def test_user_system_prompt_preserved(self):
+        """
+        What it does: Verifies the user's system prompt survives injection.
+        Purpose: The gateway must append, never replace.
+        """
+        print("Setup: Anthropic request with Write tool...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = self._convert([self.WRITE_TOOL])
+
+        print("Checking original prompt intact...")
+        content = self._system_content(result)
+        assert "You are a helpful assistant." in content
+        assert "Tool Call Size Limit" in content

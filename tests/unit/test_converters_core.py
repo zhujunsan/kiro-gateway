@@ -30,6 +30,8 @@ from kiro.converters_core import (
     build_kiro_history,
     build_kiro_payload,
     process_tools_with_long_descriptions,
+    get_tool_args_size_hint,
+    _tool_accepts_bulk_text,
     inject_thinking_tags,
     extract_tool_results_from_content,
     extract_tool_uses_from_message,
@@ -7065,3 +7067,437 @@ class TestBuildKiroPayloadWithThinkingConfig:
         print(f"Checking for <max_thinking_length>7000</max_thinking_length> in content...")
         assert "<max_thinking_length>7000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+# ==================================================================================================
+# Tests for tool argument size hint (Kiro drops oversized tool arguments wholesale)
+# ==================================================================================================
+
+
+class TestToolAcceptsBulkText:
+    """Test suite for _tool_accepts_bulk_text schema detection."""
+
+    def test_detects_content_property(self):
+        """
+        What it does: Verifies a tool with a string `content` property is detected.
+        Purpose: Write-style tools must receive the size hint.
+        """
+        print("Setup: Tool with path + content string properties...")
+        schema = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+        }
+        tool = UnifiedTool(name="Write", description="Write a file", input_schema=schema)
+
+        print("Action: Checking bulk text detection...")
+        assert _tool_accepts_bulk_text(tool) is True
+
+    def test_detects_new_string_property(self):
+        """
+        What it does: Verifies StrReplace-style `new_string` is detected.
+        Purpose: Edit tools carry bulk text too.
+        """
+        print("Setup: Tool with old_string/new_string...")
+        schema = {
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+            }
+        }
+        tool = UnifiedTool(name="StrReplace", input_schema=schema)
+
+        print("Action: Checking detection...")
+        assert _tool_accepts_bulk_text(tool) is True
+
+    def test_detects_property_name_case_insensitively(self):
+        """
+        What it does: Verifies detection ignores property name casing.
+        Purpose: Clients may use camelCase or capitalized field names.
+        """
+        print("Setup: Tool with 'Content' capitalized...")
+        tool = UnifiedTool(
+            name="WriteFile",
+            input_schema={"properties": {"Content": {"type": "string"}}},
+        )
+
+        print("Action: Checking detection...")
+        assert _tool_accepts_bulk_text(tool) is True
+
+    def test_detects_union_type_including_string(self):
+        """
+        What it does: Verifies a ["string", "null"] union still counts.
+        Purpose: Optional text fields are commonly declared as unions.
+        """
+        print("Setup: Tool with content typed as union...")
+        tool = UnifiedTool(
+            name="Patch",
+            input_schema={"properties": {"patch": {"type": ["string", "null"]}}},
+        )
+
+        print("Action: Checking detection...")
+        assert _tool_accepts_bulk_text(tool) is True
+
+    def test_detects_property_without_declared_type(self):
+        """
+        What it does: Verifies a bulk-name property with no `type` is detected.
+        Purpose: Free-form fields sometimes omit type; a false positive only
+                 costs one hint, a false negative loses the whole write.
+        """
+        print("Setup: Tool with content lacking type...")
+        tool = UnifiedTool(
+            name="Write",
+            input_schema={"properties": {"content": {"description": "text"}}},
+        )
+
+        print("Action: Checking detection...")
+        assert _tool_accepts_bulk_text(tool) is True
+
+    def test_ignores_scalar_only_tool(self):
+        """
+        What it does: Verifies a tool with only short scalars is not detected.
+        Purpose: Read-style tools must not add system prompt noise.
+        """
+        print("Setup: Tool with path/offset/limit only...")
+        schema = {
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {"type": "integer"},
+                "limit": {"type": "integer"},
+            }
+        }
+        tool = UnifiedTool(name="Read", input_schema=schema)
+
+        print("Action: Checking detection...")
+        assert _tool_accepts_bulk_text(tool) is False
+
+    def test_ignores_non_string_content_property(self):
+        """
+        What it does: Verifies `content` declared as integer is not detected.
+        Purpose: Only text payloads can grow large enough to matter.
+        """
+        print("Setup: Tool with integer content...")
+        tool = UnifiedTool(
+            name="Counter",
+            input_schema={"properties": {"content": {"type": "integer"}}},
+        )
+
+        print("Action: Checking detection...")
+        assert _tool_accepts_bulk_text(tool) is False
+
+    def test_handles_missing_schema(self):
+        """
+        What it does: Verifies None input_schema does not raise.
+        Purpose: Tools may arrive without a schema.
+        """
+        print("Setup: Tool with no schema...")
+        assert _tool_accepts_bulk_text(UnifiedTool(name="NoSchema")) is False
+
+    def test_handles_non_dict_schema(self):
+        """
+        What it does: Verifies a non-dict schema does not raise.
+        Purpose: Malformed client input must not crash payload building.
+        """
+        print("Setup: Tool with string as schema...")
+        tool = UnifiedTool(name="Weird", input_schema="not-a-dict")
+        assert _tool_accepts_bulk_text(tool) is False
+
+    def test_handles_schema_without_properties(self):
+        """
+        What it does: Verifies a schema lacking `properties` does not raise.
+        Purpose: Empty object schemas are legal.
+        """
+        print("Setup: Tool with empty object schema...")
+        tool = UnifiedTool(name="NoArgs", input_schema={"type": "object"})
+        assert _tool_accepts_bulk_text(tool) is False
+
+    def test_handles_non_dict_properties(self):
+        """
+        What it does: Verifies `properties` as a list does not raise.
+        Purpose: Malformed schemas must degrade gracefully.
+        """
+        print("Setup: Tool with list properties...")
+        tool = UnifiedTool(name="Bad", input_schema={"properties": ["content"]})
+        assert _tool_accepts_bulk_text(tool) is False
+
+    def test_handles_non_dict_property_schema(self):
+        """
+        What it does: Verifies a bulk-named property mapped to a non-dict counts.
+        Purpose: Treated as a candidate rather than crashing.
+        """
+        print("Setup: Tool with content mapped to a string...")
+        tool = UnifiedTool(name="Odd", input_schema={"properties": {"content": "string"}})
+        assert _tool_accepts_bulk_text(tool) is True
+
+
+class TestGetToolArgsSizeHint:
+    """Test suite for get_tool_args_size_hint generation."""
+
+    WRITE_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+        },
+    }
+
+    def test_hint_generated_for_bulk_text_tool(self):
+        """
+        What it does: Verifies the hint is produced for a Write-style tool.
+        Purpose: Core behavior - the model must learn the ceiling up front.
+        """
+        print("Setup: Write tool with content property...")
+        tools = [UnifiedTool(name="Write", input_schema=self.WRITE_SCHEMA)]
+
+        print("Action: Generating hint...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            hint = get_tool_args_size_hint(tools)
+
+        print("Checking hint content...")
+        assert "# Tool Call Size Limit" in hint
+        assert "50 KB" in hint
+        assert "`Write`" in hint
+
+    def test_hint_states_argument_is_dropped_entirely(self):
+        """
+        What it does: Verifies the hint says the argument is discarded, not cut.
+        Purpose: If the model thinks it was cut short it will try to continue
+                 from a partial write that never happened.
+        """
+        print("Setup: Write tool...")
+        tools = [UnifiedTool(name="Write", input_schema=self.WRITE_SCHEMA)]
+
+        print("Action: Generating hint...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            hint = get_tool_args_size_hint(tools)
+
+        print("Checking wording...")
+        assert "discards the entire argument" in hint
+        assert "split it across" in hint.lower() or "split" in hint.lower()
+
+    def test_hint_lists_only_bulk_text_tools(self):
+        """
+        What it does: Verifies scalar-only tools are excluded from the list.
+        Purpose: Keep the hint targeted so the model does not turn conservative
+                 on tools that have no size problem.
+        """
+        print("Setup: Write + Read + StrReplace...")
+        tools = [
+            UnifiedTool(name="Write", input_schema=self.WRITE_SCHEMA),
+            UnifiedTool(
+                name="Read",
+                input_schema={"properties": {"path": {"type": "string"}}},
+            ),
+            UnifiedTool(
+                name="StrReplace",
+                input_schema={"properties": {"new_string": {"type": "string"}}},
+            ),
+        ]
+
+        print("Action: Generating hint...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            hint = get_tool_args_size_hint(tools)
+
+        print("Checking tool list...")
+        assert "`Write`" in hint
+        assert "`StrReplace`" in hint
+        assert "`Read`" not in hint
+
+    def test_no_hint_when_disabled(self):
+        """
+        What it does: Verifies TOOL_ARGS_SIZE_HINT=false suppresses the hint.
+        Purpose: Users must be able to get native pass-through behavior.
+        """
+        print("Setup: Write tool with hint disabled...")
+        tools = [UnifiedTool(name="Write", input_schema=self.WRITE_SCHEMA)]
+
+        print("Action: Generating hint with flag off...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", False):
+            hint = get_tool_args_size_hint(tools)
+
+        print("Checking hint is empty...")
+        assert hint == ""
+
+    def test_no_hint_when_limit_is_zero(self):
+        """
+        What it does: Verifies a limit of 0 disables the hint.
+        Purpose: 0 is the documented "disabled" value for size limits.
+        """
+        print("Setup: Write tool with limit 0...")
+        tools = [UnifiedTool(name="Write", input_schema=self.WRITE_SCHEMA)]
+
+        print("Action: Generating hint...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 0):
+            hint = get_tool_args_size_hint(tools)
+
+        print("Checking hint is empty...")
+        assert hint == ""
+
+    def test_no_hint_for_none_tools(self):
+        """
+        What it does: Verifies None tools yields no hint.
+        Purpose: Tool-free requests must not gain system prompt text.
+        """
+        print("Action: Generating hint for None...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True):
+            assert get_tool_args_size_hint(None) == ""
+
+    def test_no_hint_for_empty_tool_list(self):
+        """
+        What it does: Verifies an empty list yields no hint.
+        Purpose: Same as None, different shape.
+        """
+        print("Action: Generating hint for []...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True):
+            assert get_tool_args_size_hint([]) == ""
+
+    def test_no_hint_when_no_tool_takes_bulk_text(self):
+        """
+        What it does: Verifies scalar-only tool sets produce no hint.
+        Purpose: Avoid spending system prompt budget when nothing is at risk.
+        """
+        print("Setup: Read + Glob only...")
+        tools = [
+            UnifiedTool(name="Read", input_schema={"properties": {"path": {"type": "string"}}}),
+            UnifiedTool(name="Glob", input_schema={"properties": {"pattern": {"type": "string"}}}),
+        ]
+
+        print("Action: Generating hint...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            hint = get_tool_args_size_hint(tools)
+
+        print("Checking hint is empty...")
+        assert hint == ""
+
+    def test_hint_reflects_custom_limit(self):
+        """
+        What it does: Verifies the advertised number follows the config value.
+        Purpose: Users tuning the limit must see it reflected in the prompt.
+        """
+        print("Setup: Write tool with 40000 byte limit...")
+        tools = [UnifiedTool(name="Write", input_schema=self.WRITE_SCHEMA)]
+
+        print("Action: Generating hint...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 40000):
+            hint = get_tool_args_size_hint(tools)
+
+        print("Checking advertised value...")
+        assert "40 KB" in hint
+        assert "50 KB" not in hint
+
+    def test_hint_skips_tools_without_name(self):
+        """
+        What it does: Verifies unnamed tools are not listed.
+        Purpose: A blank backtick pair would confuse the model.
+        """
+        print("Setup: Unnamed bulk-text tool plus a named one...")
+        tools = [
+            UnifiedTool(name="", input_schema=self.WRITE_SCHEMA),
+            UnifiedTool(name="Write", input_schema=self.WRITE_SCHEMA),
+        ]
+
+        print("Action: Generating hint...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            hint = get_tool_args_size_hint(tools)
+
+        print("Checking list has no empty entry...")
+        assert "``" not in hint
+        assert "`Write`" in hint
+
+
+class TestToolArgsSizeHintInPayload:
+    """Test suite for hint integration into the Kiro payload."""
+
+    WRITE_TOOL = UnifiedTool(
+        name="Write",
+        description="Write a file",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+        },
+    )
+
+    def _build(self, tools):
+        """Build a minimal payload with the given tools."""
+        messages = [UnifiedMessage(role="user", content="Create a large file")]
+        return build_kiro_payload(
+            messages=messages,
+            system_prompt="You are a helpful assistant.",
+            model_id="claude-sonnet-4.5",
+            tools=tools,
+            conversation_id="test-conv-size-hint",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(),
+        )
+
+    def _system_prompt(self, result):
+        """Extract the system prompt from a built payload."""
+        history = result.payload["conversationState"].get("history") or []
+        if history:
+            return history[0]["userInputMessage"]["content"]
+        return result.payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+    def test_hint_present_in_system_prompt(self):
+        """
+        What it does: Verifies the hint reaches the payload's system prompt.
+        Purpose: The whole feature depends on this wiring.
+        """
+        print("Setup: Building payload with Write tool...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = self._build([self.WRITE_TOOL])
+
+        print("Checking system prompt for hint...")
+        assert "Tool Call Size Limit" in self._system_prompt(result)
+
+    def test_hint_absent_when_disabled(self):
+        """
+        What it does: Verifies disabling the flag keeps the payload clean.
+        Purpose: Opt-out must fully bypass the injection.
+        """
+        print("Setup: Building payload with hint disabled...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", False):
+            result = self._build([self.WRITE_TOOL])
+
+        print("Checking system prompt has no hint...")
+        assert "Tool Call Size Limit" not in self._system_prompt(result)
+
+    def test_hint_absent_without_tools(self):
+        """
+        What it does: Verifies tool-free payloads carry no hint.
+        Purpose: Chat-only requests must be untouched.
+        """
+        print("Setup: Building payload with no tools...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = self._build(None)
+
+        print("Checking system prompt has no hint...")
+        assert "Tool Call Size Limit" not in self._system_prompt(result)
+
+    def test_original_system_prompt_preserved(self):
+        """
+        What it does: Verifies the user's system prompt survives injection.
+        Purpose: The gateway must add, never replace, user content.
+        """
+        print("Setup: Building payload with Write tool...")
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = self._build([self.WRITE_TOOL])
+
+        print("Checking original prompt is intact...")
+        prompt = self._system_prompt(result)
+        assert "You are a helpful assistant." in prompt
+        assert "Tool Call Size Limit" in prompt

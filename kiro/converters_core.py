@@ -386,6 +386,140 @@ def get_truncation_recovery_system_addition() -> str:
     )
 
 
+# Property names that typically carry bulk text in a tool's input schema.
+# Used to decide which tools need the argument size hint (see
+# _tool_accepts_bulk_text). Matched case-insensitively.
+BULK_TEXT_PROPERTY_NAMES: frozenset[str] = frozenset({
+    "content",
+    "contents",
+    "text",
+    "body",
+    "new_str",
+    "new_string",
+    "old_str",
+    "old_string",
+    "file_text",
+    "data",
+    "patch",
+    "diff",
+    "source",
+    "code",
+})
+
+
+def _tool_accepts_bulk_text(tool: UnifiedTool) -> bool:
+    """
+    Check whether a tool takes a free-form text argument that can grow large.
+
+    Only such tools are at risk of hitting Kiro's tool-argument ceiling, so the
+    size hint is limited to them: adding it to every tool would waste system
+    prompt budget and add noise for tools that only take short scalars.
+
+    Detection is schema-driven rather than name-driven so it works for any
+    client's tool set (Cursor's Write/StrReplace, Codex's apply_patch, custom
+    MCP tools) without maintaining an allowlist.
+
+    Args:
+        tool: Tool in unified format
+
+    Returns:
+        True if the tool has at least one string property whose name suggests
+        bulk text content
+
+    Examples:
+        >>> schema = {"properties": {"path": {"type": "string"}, "content": {"type": "string"}}}
+        >>> _tool_accepts_bulk_text(UnifiedTool(name="Write", input_schema=schema))
+        True
+        >>> schema = {"properties": {"path": {"type": "string"}}}
+        >>> _tool_accepts_bulk_text(UnifiedTool(name="Read", input_schema=schema))
+        False
+    """
+    schema = tool.input_schema
+    if not isinstance(schema, dict):
+        return False
+
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return False
+
+    for prop_name, prop_schema in properties.items():
+        if not isinstance(prop_name, str):
+            continue
+        if prop_name.lower() not in BULK_TEXT_PROPERTY_NAMES:
+            continue
+        # An unspecified type is treated as a candidate: some clients omit
+        # "type" for free-form fields, and a false positive only costs a hint.
+        if not isinstance(prop_schema, dict):
+            return True
+        prop_type = prop_schema.get("type")
+        if prop_type in (None, "string") or (
+            isinstance(prop_type, list) and "string" in prop_type
+        ):
+            return True
+
+    return False
+
+
+def get_tool_args_size_hint(tools: Optional[List[UnifiedTool]]) -> str:
+    """
+    Generate system prompt addition warning about the tool argument size limit.
+
+    Kiro drops a tool call's arguments entirely once they exceed roughly 58 KB
+    (see TOOL_ARGS_SIZE_LIMIT_BYTES for the measurements). Clients such as
+    Cursor have no way to know this, so their Write/StrReplace tools happily
+    attempt multi-hundred-KB writes that come back with empty arguments.
+
+    Telling the model up front is the only prevention available at the gateway
+    level: the limit applies to generated output, so it cannot be detected or
+    worked around while building the request.
+
+    Args:
+        tools: List of tools in unified format (or None)
+
+    Returns:
+        System prompt addition text, or empty string when the hint is disabled,
+        no tools are present, or no tool accepts bulk text
+
+    Examples:
+        >>> get_tool_args_size_hint(None)
+        ''
+    """
+    from kiro.config import TOOL_ARGS_SIZE_HINT, TOOL_ARGS_SIZE_LIMIT_BYTES
+
+    if not TOOL_ARGS_SIZE_HINT or not tools:
+        return ""
+
+    if TOOL_ARGS_SIZE_LIMIT_BYTES <= 0:
+        return ""
+
+    bulk_tools = [tool.name for tool in tools if tool.name and _tool_accepts_bulk_text(tool)]
+    if not bulk_tools:
+        return ""
+
+    limit_kb = TOOL_ARGS_SIZE_LIMIT_BYTES // 1000
+    tool_list = ", ".join(f"`{name}`" for name in bulk_tools)
+
+    logger.debug(
+        f"Injecting tool argument size hint ({limit_kb} KB) for {len(bulk_tools)} "
+        f"bulk-text tool(s): {bulk_tools}"
+    )
+
+    return (
+        "\n\n---\n"
+        "# Tool Call Size Limit\n\n"
+        f"A single tool call's arguments must stay under roughly {limit_kb} KB. "
+        "This applies to these tools, which accept large text arguments: "
+        f"{tool_list}.\n\n"
+        "If a tool call exceeds the limit, the upstream API discards the entire "
+        "argument rather than delivering a partial value, so the call arrives "
+        "empty and fails. Nothing on this end can recover the lost content.\n\n"
+        f"When writing content larger than {limit_kb} KB, split it across "
+        "several sequential tool calls (for example, create the file with the "
+        "first portion, then append the remainder) instead of sending one "
+        "oversized call."
+    )
+
+
 def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
     """
     Inject fake reasoning tags into content based on configuration.
@@ -1840,6 +1974,13 @@ def build_kiro_payload(
     truncation_system_addition = get_truncation_recovery_system_addition()
     if truncation_system_addition:
         full_system_prompt = full_system_prompt + truncation_system_addition if full_system_prompt else truncation_system_addition.strip()
+
+    # Warn about Kiro's tool argument size ceiling so the model splits large
+    # writes up front. Uses the processed tools so the hint reflects what is
+    # actually sent upstream.
+    tool_args_hint = get_tool_args_size_hint(processed_tools)
+    if tool_args_hint:
+        full_system_prompt = full_system_prompt + tool_args_hint if full_system_prompt else tool_args_hint.strip()
     
     # If no tools are defined, strip ALL tool-related content from messages
     # Kiro API rejects requests with toolResults but no tools

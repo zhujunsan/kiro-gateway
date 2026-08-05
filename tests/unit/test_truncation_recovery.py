@@ -110,17 +110,20 @@ class TestToolTruncationMessage:
         
         # Assert - Key phrases present
         assert "[API Limitation]" in content, "Should contain [API Limitation] marker"
-        assert "truncated" in content.lower(), "Should mention truncation"
+        assert "discarded" in content.lower(), "Should say the call was discarded"
         assert "upstream api" in content.lower(), "Should mention upstream API"
-        assert "output size limits" in content.lower(), "Should mention size limits"
+        assert "size limit" in content.lower(), "Should mention size limits"
         
         # Assert - Universal formulation (conditional language)
         assert "if" in content.lower() or "likely" in content.lower(), "Should use conditional language"
         assert "consequence" in content.lower(), "Should explain error is consequence"
         
-        # Assert - Warning about repetition
-        assert "repeating" in content.lower(), "Should warn about repeating"
-        assert "adapt" in content.lower(), "Should suggest adaptation"
+        # Assert - Warning against a naive retry, plus an actionable next step.
+        # Kiro drops oversized arguments whole, so "adapt somehow" is not enough:
+        # the model needs the concrete ceiling to resize in a single attempt.
+        assert "retrying" in content.lower(), "Should warn against retrying as-is"
+        assert "split" in content.lower(), "Should advise splitting the content"
+        assert "kb" in content.lower(), "Should name the concrete size limit"
         
         print("✅ Test passed: Tool truncation message format correct")
     
@@ -156,14 +159,17 @@ class TestToolTruncationMessage:
         
         print("✅ Test passed: Works for all tool types")
     
-    def test_generate_truncation_tool_result_no_specific_instructions(self):
+    def test_generate_truncation_tool_result_no_micro_management(self):
         """
-        Test Case: Message doesn't give specific instructions
+        Test Case: Message avoids prescribing a chunk size
         
-        What it does: Verify message doesn't tell model HOW to fix (e.g., "break into steps")
-        Goal: Ensure universal formulation without micro-management
+        What it does: Verify the message names the ceiling and suggests splitting
+                      without dictating how many lines or bytes per call.
+        Goal: Prescribing a step size makes the model fall into micro-steps, but
+              withholding the ceiling entirely makes it guess. Name the limit,
+              leave the granularity to the model.
         """
-        print("\n=== Test: Message doesn't give specific instructions ===")
+        print("\n=== Test: Message avoids micro-management ===")
         
         # Arrange
         result = generate_truncation_tool_result(
@@ -175,23 +181,24 @@ class TestToolTruncationMessage:
         content = result["content"].lower()
         print(f"Checking content for specific instructions...")
         
-        # Assert - Should NOT contain specific instructions
+        # Assert - Must not prescribe a granularity (causes micro-steps)
         forbidden_phrases = [
-            "break into smaller",
-            "split the file",
-            "write in chunks",
-            "reduce the size",
-            "make it shorter",
-            "use multiple calls"
+            "one line at a time",
+            "line by line",
+            "a few lines",
+            "10 lines",
+            "100 lines",
+            "one function at a time",
         ]
         
         for phrase in forbidden_phrases:
-            assert phrase not in content, f"Should NOT contain specific instruction: '{phrase}'"
+            assert phrase not in content, f"Should NOT prescribe granularity: '{phrase}'"
         
-        # Assert - Should contain general guidance
-        assert "adapt" in content or "consider" in content, "Should suggest general adaptation"
+        # Assert - Must still give an actionable direction with the real ceiling
+        assert "split" in content, "Should suggest splitting"
+        assert "kb" in content, "Should name the concrete limit"
         
-        print("✅ Test passed: No specific instructions (universal formulation)")
+        print("✅ Test passed: Names the limit without prescribing granularity")
 
 
 class TestContentTruncationMessage:
@@ -346,3 +353,125 @@ class TestMessageIntegration:
         assert "[System Notice]" in conversation[-1]["content"], "Should contain system notice"
         
         print("✅ Test passed: Insertion works correctly")
+
+
+class TestToolResultAdvertisesSizeLimit:
+    """Test suite for the concrete size limit in tool truncation messages."""
+
+    TRUNCATION_INFO = {"size_bytes": 30, "reason": "missing 1 closing brace(s)"}
+
+    def test_message_states_concrete_limit(self):
+        """
+        What it does: Verifies the advertised limit appears in the message.
+        Goal: The model should resize in one step instead of guessing blindly.
+        """
+        print("\n=== Test: Tool result advertises concrete limit ===")
+
+        with patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = generate_truncation_tool_result(
+                "Write", "call_abc", self.TRUNCATION_INFO
+            )
+
+        print(f"Message: {result['content'][:120]}...")
+        assert "50 KB" in result["content"]
+
+    def test_message_follows_configured_limit(self):
+        """
+        What it does: Verifies the number tracks the config value.
+        Goal: A tuned limit must not be contradicted by a stale message.
+        """
+        print("\n=== Test: Tool result follows configured limit ===")
+
+        with patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 40000):
+            result = generate_truncation_tool_result(
+                "Write", "call_abc", self.TRUNCATION_INFO
+            )
+
+        print(f"Message mentions: {'40 KB' in result['content']}")
+        assert "40 KB" in result["content"]
+        assert "50 KB" not in result["content"]
+
+    def test_message_states_argument_dropped_entirely(self):
+        """
+        What it does: Verifies the message says the argument was dropped whole.
+        Goal: Prevent the model from trying to continue a partial write that
+              never landed - Kiro discards the argument rather than cutting it.
+        """
+        print("\n=== Test: Tool result says argument dropped entirely ===")
+
+        with patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = generate_truncation_tool_result(
+                "Write", "call_abc", self.TRUNCATION_INFO
+            )
+
+        content = result["content"]
+        print(f"Contains ENTIRELY: {'ENTIRELY' in content}")
+        assert "ENTIRELY" in content
+        assert "nothing to continue from" in content
+
+    def test_message_advises_splitting(self):
+        """
+        What it does: Verifies the message tells the model to split the content.
+        Goal: Give an actionable path forward, not just a rejection.
+        """
+        print("\n=== Test: Tool result advises splitting ===")
+
+        with patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = generate_truncation_tool_result(
+                "Write", "call_abc", self.TRUNCATION_INFO
+            )
+
+        content = result["content"]
+        print(f"Contains split advice: {'Split the content' in content}")
+        assert "Split the content" in content
+        assert "sequential calls" in content
+
+    def test_message_retains_api_limitation_prefix(self):
+        """
+        What it does: Verifies the [API Limitation] prefix is preserved.
+        Goal: The system prompt legitimizes this exact prefix; changing it would
+              make the model treat the notice as prompt injection.
+        """
+        print("\n=== Test: Tool result retains [API Limitation] prefix ===")
+
+        with patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = generate_truncation_tool_result(
+                "Write", "call_abc", self.TRUNCATION_INFO
+            )
+
+        print(f"Prefix: {result['content'][:20]}")
+        assert result["content"].startswith("[API Limitation]")
+
+    def test_message_still_flags_error_and_id(self):
+        """
+        What it does: Verifies structural fields survive the message rewrite.
+        Goal: The tool_result must stay pairable and marked as an error.
+        """
+        print("\n=== Test: Tool result structure intact ===")
+
+        with patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = generate_truncation_tool_result(
+                "Write", "call_xyz", self.TRUNCATION_INFO
+            )
+
+        print(f"Result keys: {sorted(result)}")
+        assert result["type"] == "tool_result"
+        assert result["tool_use_id"] == "call_xyz"
+        assert result["is_error"] is True
+
+    def test_zero_limit_does_not_crash(self):
+        """
+        What it does: Verifies a limit of 0 still produces a usable message.
+        Goal: Message generation must not divide by or depend on a positive
+              limit - recovery is orthogonal to whether the hint is enabled.
+        """
+        print("\n=== Test: Tool result with zero limit ===")
+
+        with patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 0):
+            result = generate_truncation_tool_result(
+                "Write", "call_abc", self.TRUNCATION_INFO
+            )
+
+        print(f"Message generated, length={len(result['content'])}")
+        assert result["content"].startswith("[API Limitation]")
+        assert result["is_error"] is True
