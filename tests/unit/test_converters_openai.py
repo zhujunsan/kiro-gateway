@@ -1992,6 +1992,117 @@ class TestExtractThinkingConfigFromOpenAI:
         assert config.budget_tokens == expected_budget
 
 
+# ==================================================================================================
+# Tests for tool argument size hint injection (OpenAI path)
+# ==================================================================================================
+
+
+class TestOpenAIToolArgsSizeHint:
+    """Test suite verifying the tool argument size hint reaches the OpenAI path.
+
+    The hint is injected in the shared core, but both API surfaces must be
+    covered explicitly - a regression that bypasses the core on one adapter
+    would otherwise go unnoticed.
+    """
+
+    WRITE_TOOL = Tool(
+        type="function",
+        function=ToolFunction(
+            name="Write",
+            description="Write a file",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+            },
+        ),
+    )
+
+    READ_TOOL = Tool(
+        type="function",
+        function=ToolFunction(
+            name="Read",
+            description="Read a file",
+            parameters={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+            },
+        ),
+    )
+
+    def _convert(self, tools):
+        """Convert a minimal OpenAI request carrying the given tools."""
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4.5",
+            messages=[
+                ChatMessage(role="system", content="You are a helpful assistant."),
+                ChatMessage(role="user", content="Create a large file"),
+            ],
+            max_tokens=1024,
+            tools=tools,
+        )
+
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+            return build_kiro_payload(request, "conv-size-hint", "arn:aws:test")
+
+    def _system_content(self, result):
+        """Extract the content carrying the system prompt."""
+        history = result["conversationState"].get("history") or []
+        if history:
+            return history[0]["userInputMessage"]["content"]
+        return result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+    def test_hint_present_for_bulk_text_tool(self):
+        """
+        What it does: Verifies the hint appears for an OpenAI Write tool.
+        Purpose: Feature parity with the Anthropic surface.
+        """
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = self._convert([self.WRITE_TOOL])
+
+        content = self._system_content(result)
+        assert "Tool Call Size Limit" in content
+        assert "50 KB" in content
+        assert "`Write`" in content
+
+    def test_hint_absent_for_scalar_only_tools(self):
+        """
+        What it does: Verifies a Read-only tool set gets no hint.
+        Purpose: Same targeting rules must apply on both adapters.
+        """
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = self._convert([self.READ_TOOL])
+
+        assert "Tool Call Size Limit" not in self._system_content(result)
+
+    def test_hint_absent_when_disabled(self):
+        """
+        What it does: Verifies the opt-out works on the OpenAI path.
+        Purpose: Config must behave identically across adapters.
+        """
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", False):
+            result = self._convert([self.WRITE_TOOL])
+
+        assert "Tool Call Size Limit" not in self._system_content(result)
+
+    def test_user_system_prompt_preserved(self):
+        """
+        What it does: Verifies the user's system prompt survives injection.
+        Purpose: The gateway must append, never replace.
+        """
+        with patch("kiro.config.TOOL_ARGS_SIZE_HINT", True), \
+             patch("kiro.config.TOOL_ARGS_SIZE_LIMIT_BYTES", 50000):
+            result = self._convert([self.WRITE_TOOL])
+
+        content = self._system_content(result)
+        assert "You are a helpful assistant." in content
+        assert "Tool Call Size Limit" in content
+
+
 class TestBuildKiroPayloadIntegration:
     """Integration tests for build_kiro_payload with thinking config."""
     

@@ -24,7 +24,7 @@ Any attempt to make an unauthorized network call will result in immediate test f
 pip install -r requirements.txt
 
 # Additional testing dependencies
-pip install pytest pytest-asyncio hypothesis
+pip install pytest pytest-asyncio
 ```
 
 ### Running All Tests
@@ -76,10 +76,13 @@ tests/
 │   ├── test_account_manager.py     # AccountManager tests (failover, Circuit Breaker, sticky behavior, state persistence)
 │   ├── test_auth_manager.py        # KiroAuthManager tests (including api_region parameter priority)
 │   ├── test_cache.py               # ModelInfoCache tests (is_valid_model, add_hidden_model)
+│   ├── test_codex_models.py        # Per-model Codex ModelInfo capability stubs
+│   ├── test_collect_errors.py      # Error classification (first-token timeout, FATAL vs RECOVERABLE)
 │   ├── test_config.py              # Configuration tests (SERVER_HOST, SERVER_PORT, LOG_LEVEL, Account System constants)
 │   ├── test_converters_anthropic.py # Anthropic Messages API → Kiro converter tests
 │   ├── test_converters_core.py     # Shared conversion logic tests (UnifiedMessage, merging, truncation recovery system prompt)
 │   ├── test_converters_openai.py   # OpenAI Chat API → Kiro converter tests
+│   ├── test_converters_responses.py # Responses API models and converters tests
 │   ├── test_debug_logger.py        # DebugLogger tests (off/errors/all modes)
 │   ├── test_debug_middleware.py    # DebugLoggerMiddleware tests (endpoint filtering, mode handling)
 │   ├── test_exceptions.py          # Exception handlers tests (validation_exception_handler, sanitize_validation_errors)
@@ -88,20 +91,28 @@ tests/
 │   ├── test_main_cli.py            # CLI argument parsing tests (--host, --port)
 │   ├── test_main_lifespan.py       # Application lifespan tests (Account System initialization, legacy migration, background tasks)
 │   ├── test_mcp_tools.py           # MCP Tools tests (WebSearch: ID generation, MCP API calls, SSE emulation, query extraction)
+│   ├── test_model_aliases.py       # Cursor-safe model alias generation and resolution
 │   ├── test_model_resolver.py      # Dynamic Model Resolution System tests
 │   ├── test_models_anthropic.py    # Anthropic Pydantic models tests (all content blocks, tools, streaming, server-side tools)
 │   ├── test_models_openai.py       # OpenAI Pydantic models tests (messages, tools, responses, streaming)
 │   ├── test_network_errors.py      # Network error handling tests
 │   ├── test_parsers.py             # AwsEventStreamParser tests (JSON truncation diagnostics, truncation recovery integration)
+│   ├── test_payload_guards.py      # Payload size guard tests (check_payload_size, trim_payload_to_limit)
+│   ├── test_proxy.py               # Proxy resolution/normalization tests (VPN URL handling)
+│   ├── test_response_store.py      # Responses API in-process store and CRUD routes
 │   ├── test_routes_anthropic.py    # Anthropic API endpoint tests (/v1/messages, truncation recovery, WebSearch, Account System failover)
 │   ├── test_routes_openai.py       # OpenAI API endpoint tests (/v1/chat/completions, truncation recovery, WebSearch, Account System failover)
+│   ├── test_routes_responses.py    # OpenAI Responses API endpoint tests (routes_responses.py)
 │   ├── test_streaming_anthropic.py # Anthropic streaming response tests (truncation detection, stop_reason priority, initial_response reuse)
 │   ├── test_streaming_core.py      # Shared streaming logic tests (first-token retry, initial_response parameter)
 │   ├── test_streaming_openai.py    # OpenAI streaming response tests (truncation detection, finish_reason priority, initial_response reuse)
+│   ├── test_streaming_responses.py # Streaming Responses API tests (streaming_responses module)
+│   ├── test_streaming_tool_calls.py # Incremental (OpenAI-spec) tool_call streaming tests
 │   ├── test_thinking_parser.py     # ThinkingParser tests (FSM for thinking blocks)
 │   ├── test_tokenizer.py           # Tokenizer tests (tiktoken)
 │   ├── test_truncation_recovery.py # Truncation Recovery System tests (synthetic message generation)
 │   ├── test_truncation_state.py    # Truncation state cache tests (save/retrieve, one-time retrieval, thread safety)
+│   ├── test_usage_endpoint.py      # /usage endpoint tests (upstream retry, outage reporting)
 │   └── test_vpn_proxy.py           # VPN/Proxy configuration tests (environment variables, URL normalization, NO_PROXY)
 ├── integration/                     # Integration tests for full flow
 │   ├── test_account_system_flow.py # Account System integration tests (full failover, sticky behavior, Circuit Breaker, state persistence)
@@ -114,7 +125,7 @@ tests/
 ### Principles
 
 1. **Isolation**: Each test is completely isolated from external services through mocks
-2. **Detail**: Abundant print() for understanding test flow during debugging
+2. **Detail**: Use assert messages and caplog for understanding test failures
 3. **Coverage**: Tests cover not only happy path, but also edge cases and errors
 4. **Security**: All tests use mock credentials, never real ones
 
@@ -139,7 +150,7 @@ When adding new tests:
 1. Follow existing class structure (`Test*Success`, `Test*Errors`, `Test*EdgeCases`)
 2. Use descriptive names: `test_<what_it_does>_<expected_result>`
 3. Add docstring with "What it does" and "Purpose"
-4. Use print() for logging test steps
+4. Use assert messages or caplog for debugging
 
 ## Troubleshooting
 

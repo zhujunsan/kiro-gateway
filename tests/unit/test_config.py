@@ -14,33 +14,19 @@ class TestLogLevelConfig:
     """Tests for LOG_LEVEL configuration."""
     
     def test_default_log_level_is_info(self):
-        """
-        What it does: Verifies that LOG_LEVEL defaults to INFO.
-        Purpose: Ensure that INFO is used when no environment variable is set.
-        
-        Note: This test verifies the config.py code logic, not the actual
-        value from the .env file. We mock os.getenv to simulate
-        the absence of the environment variable.
-        """
-        print("Setup: Mocking os.getenv for LOG_LEVEL...")
-        
-        # Create a mock that returns None for LOG_LEVEL (simulating missing variable)
+        """Verifies that LOG_LEVEL defaults to INFO when no env var is set."""
         original_getenv = os.getenv
         
         def mock_getenv(key, default=None):
             if key == "LOG_LEVEL":
-                print(f"os.getenv('{key}') -> None (mocked)")
-                return default  # Return default, simulating missing variable
+                return default
             return original_getenv(key, default)
         
         with patch.object(os, 'getenv', side_effect=mock_getenv):
-            # Reload config module with mocked getenv
             import importlib
             import kiro.config as config_module
             importlib.reload(config_module)
             
-            print(f"LOG_LEVEL: {config_module.LOG_LEVEL}")
-            print(f"Comparing: Expected 'INFO', Got '{config_module.LOG_LEVEL}'")
             assert config_module.LOG_LEVEL == "INFO"
         
         # Restore module with real values
@@ -48,82 +34,29 @@ class TestLogLevelConfig:
         import kiro.config as config_module
         importlib.reload(config_module)
     
-    def test_log_level_from_environment(self):
-        """
-        What it does: Verifies loading LOG_LEVEL from environment variable.
-        Purpose: Ensure that the value from environment is used.
-        """
-        print("Setup: Setting LOG_LEVEL=DEBUG...")
-        
-        with patch.dict(os.environ, {"LOG_LEVEL": "DEBUG"}):
+    @pytest.mark.parametrize("env_value,expected", [
+        ("DEBUG", "DEBUG"),
+        ("TRACE", "TRACE"),
+        ("ERROR", "ERROR"),
+        ("CRITICAL", "CRITICAL"),
+    ])
+    def test_log_level_from_environment(self, env_value, expected):
+        """Verifies LOG_LEVEL is loaded correctly from environment variable."""
+        with patch.dict(os.environ, {"LOG_LEVEL": env_value}):
             import importlib
             import kiro.config as config_module
             importlib.reload(config_module)
             
-            print(f"LOG_LEVEL: {config_module.LOG_LEVEL}")
-            print(f"Comparing: Expected 'DEBUG', Got '{config_module.LOG_LEVEL}'")
-            assert config_module.LOG_LEVEL == "DEBUG"
+            assert config_module.LOG_LEVEL == expected
     
     def test_log_level_uppercase_conversion(self):
-        """
-        What it does: Verifies LOG_LEVEL conversion to uppercase.
-        Purpose: Ensure that lowercase value is converted to uppercase.
-        """
-        print("Setup: Setting LOG_LEVEL=warning (lowercase)...")
-        
+        """Verifies LOG_LEVEL conversion to uppercase."""
         with patch.dict(os.environ, {"LOG_LEVEL": "warning"}):
             import importlib
             import kiro.config as config_module
             importlib.reload(config_module)
             
-            print(f"LOG_LEVEL: {config_module.LOG_LEVEL}")
-            print(f"Comparing: Expected 'WARNING', Got '{config_module.LOG_LEVEL}'")
             assert config_module.LOG_LEVEL == "WARNING"
-    
-    def test_log_level_trace(self):
-        """
-        What it does: Verifies setting LOG_LEVEL=TRACE.
-        Purpose: Ensure that TRACE level is supported.
-        """
-        print("Setup: Setting LOG_LEVEL=TRACE...")
-        
-        with patch.dict(os.environ, {"LOG_LEVEL": "TRACE"}):
-            import importlib
-            import kiro.config as config_module
-            importlib.reload(config_module)
-            
-            print(f"LOG_LEVEL: {config_module.LOG_LEVEL}")
-            assert config_module.LOG_LEVEL == "TRACE"
-    
-    def test_log_level_error(self):
-        """
-        What it does: Verifies setting LOG_LEVEL=ERROR.
-        Purpose: Ensure that ERROR level is supported.
-        """
-        print("Setup: Setting LOG_LEVEL=ERROR...")
-        
-        with patch.dict(os.environ, {"LOG_LEVEL": "ERROR"}):
-            import importlib
-            import kiro.config as config_module
-            importlib.reload(config_module)
-            
-            print(f"LOG_LEVEL: {config_module.LOG_LEVEL}")
-            assert config_module.LOG_LEVEL == "ERROR"
-    
-    def test_log_level_critical(self):
-        """
-        What it does: Verifies setting LOG_LEVEL=CRITICAL.
-        Purpose: Ensure that CRITICAL level is supported.
-        """
-        print("Setup: Setting LOG_LEVEL=CRITICAL...")
-        
-        with patch.dict(os.environ, {"LOG_LEVEL": "CRITICAL"}):
-            import importlib
-            import kiro.config as config_module
-            importlib.reload(config_module)
-            
-            print(f"LOG_LEVEL: {config_module.LOG_LEVEL}")
-            assert config_module.LOG_LEVEL == "CRITICAL"
 
 
 class TestToolDescriptionMaxLengthConfig:
@@ -635,26 +568,6 @@ class TestFallbackModelsConfig:
         assert not any(target.startswith("gpt-") for target in MODEL_ALIASES.values())
         assert expected_gpt_ids.issubset(fallback_ids)
     
-    def test_fallback_models_use_dot_format(self):
-        """
-        What it does: Verifies that model IDs use dot format (e.g., claude-4.5).
-        Purpose: Ensure consistency with Kiro API format.
-        """
-        print("Setup: Importing FALLBACK_MODELS...")
-        from kiro.config import FALLBACK_MODELS
-        
-        print("Action: Checking model ID format...")
-        for model in FALLBACK_MODELS:
-            model_id = model["modelId"]
-            print(f"Checking: {model_id}")
-            
-            # If model has version number, it should use dot format
-            if any(char.isdigit() for char in model_id):
-                # Check for patterns like "4.5" or "4-5"
-                if "-4-5" in model_id or "-4-0" in model_id:
-                    print(f"  WARNING: {model_id} uses dash format instead of dot")
-                    # This is acceptable but not ideal
-                    pass
 
 
 class TestFallbackModelsIntegration:
@@ -757,112 +670,33 @@ class TestWebSearchConfig:
     """Tests for WebSearch configuration (WEB_SEARCH_ENABLED)."""
     
     def test_web_search_enabled_default_true(self, monkeypatch):
-        """
-        What it does: Verifies WEB_SEARCH_ENABLED defaults to true.
-        Purpose: Ensure auto-injection is enabled by default.
-        """
-        print("Setup: Removing WEB_SEARCH_ENABLED from environment...")
+        """Verifies WEB_SEARCH_ENABLED defaults to true."""
         monkeypatch.delenv("WEB_SEARCH_ENABLED", raising=False)
         
-        print("Action: Reloading config module...")
         from importlib import reload
         import kiro.config as config_module
         reload(config_module)
         
-        print(f"Comparing WEB_SEARCH_ENABLED: Expected True, Got {config_module.WEB_SEARCH_ENABLED}")
         assert config_module.WEB_SEARCH_ENABLED is True
     
-    def test_web_search_enabled_false(self, monkeypatch):
-        """
-        What it does: Verifies WEB_SEARCH_ENABLED=false disables auto-injection.
-        Purpose: Ensure users can disable auto-injection.
-        """
-        print("Setup: Setting WEB_SEARCH_ENABLED=false...")
-        monkeypatch.setenv("WEB_SEARCH_ENABLED", "false")
-        
-        print("Action: Reloading config module...")
-        from importlib import reload
-        import kiro.config as config_module
-        reload(config_module)
-        
-        print(f"Comparing WEB_SEARCH_ENABLED: Expected False, Got {config_module.WEB_SEARCH_ENABLED}")
-        assert config_module.WEB_SEARCH_ENABLED is False
-    
-    def test_web_search_enabled_true(self, monkeypatch):
-        """
-        What it does: Verifies WEB_SEARCH_ENABLED=true enables auto-injection.
-        Purpose: Ensure explicit true value works.
-        """
-        print("Setup: Setting WEB_SEARCH_ENABLED=true...")
-        monkeypatch.setenv("WEB_SEARCH_ENABLED", "true")
-        
-        print("Action: Reloading config module...")
-        from importlib import reload
-        import kiro.config as config_module
-        reload(config_module)
-        
-        print(f"Comparing WEB_SEARCH_ENABLED: Expected True, Got {config_module.WEB_SEARCH_ENABLED}")
-        assert config_module.WEB_SEARCH_ENABLED is True
-    
-    def test_web_search_enabled_numeric_values(self, monkeypatch):
-        """
-        What it does: Verifies numeric values (1/0) work for WEB_SEARCH_ENABLED.
-        Purpose: Ensure compatibility with numeric boolean values.
-        """
-        print("Setup: Testing WEB_SEARCH_ENABLED=1...")
-        monkeypatch.setenv("WEB_SEARCH_ENABLED", "1")
+    @pytest.mark.parametrize("env_value,expected", [
+        ("false", False),
+        ("true", True),
+        ("1", True),
+        ("0", False),
+        ("yes", True),
+        ("TRUE", True),
+        ("FALSE", False),
+    ])
+    def test_web_search_enabled_variants(self, monkeypatch, env_value, expected):
+        """Verifies WEB_SEARCH_ENABLED parses various boolean representations."""
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", env_value)
         
         from importlib import reload
         import kiro.config as config_module
         reload(config_module)
         
-        print(f"Comparing WEB_SEARCH_ENABLED: Expected True, Got {config_module.WEB_SEARCH_ENABLED}")
-        assert config_module.WEB_SEARCH_ENABLED is True
-        
-        print("Setup: Testing WEB_SEARCH_ENABLED=0...")
-        monkeypatch.setenv("WEB_SEARCH_ENABLED", "0")
-        reload(config_module)
-        
-        print(f"Comparing WEB_SEARCH_ENABLED: Expected False, Got {config_module.WEB_SEARCH_ENABLED}")
-        assert config_module.WEB_SEARCH_ENABLED is False
-    
-    def test_web_search_enabled_yes_value(self, monkeypatch):
-        """
-        What it does: Verifies WEB_SEARCH_ENABLED=yes enables auto-injection.
-        Purpose: Ensure 'yes' value works.
-        """
-        print("Setup: Setting WEB_SEARCH_ENABLED=yes...")
-        monkeypatch.setenv("WEB_SEARCH_ENABLED", "yes")
-        
-        print("Action: Reloading config module...")
-        from importlib import reload
-        import kiro.config as config_module
-        reload(config_module)
-        
-        print(f"Comparing WEB_SEARCH_ENABLED: Expected True, Got {config_module.WEB_SEARCH_ENABLED}")
-        assert config_module.WEB_SEARCH_ENABLED is True
-    
-    def test_web_search_enabled_case_insensitive(self, monkeypatch):
-        """
-        What it does: Verifies WEB_SEARCH_ENABLED is case-insensitive.
-        Purpose: Ensure TRUE, True, true all work.
-        """
-        print("Setup: Testing WEB_SEARCH_ENABLED=TRUE...")
-        monkeypatch.setenv("WEB_SEARCH_ENABLED", "TRUE")
-        
-        from importlib import reload
-        import kiro.config as config_module
-        reload(config_module)
-        
-        print(f"Comparing WEB_SEARCH_ENABLED: Expected True, Got {config_module.WEB_SEARCH_ENABLED}")
-        assert config_module.WEB_SEARCH_ENABLED is True
-        
-        print("Setup: Testing WEB_SEARCH_ENABLED=FALSE...")
-        monkeypatch.setenv("WEB_SEARCH_ENABLED", "FALSE")
-        reload(config_module)
-        
-        print(f"Comparing WEB_SEARCH_ENABLED: Expected False, Got {config_module.WEB_SEARCH_ENABLED}")
-        assert config_module.WEB_SEARCH_ENABLED is False
+        assert config_module.WEB_SEARCH_ENABLED is expected
 
 
 # ==================================================================================================
