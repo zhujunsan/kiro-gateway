@@ -7,8 +7,10 @@ Tests token management logic for Kiro without real network requests.
 
 import asyncio
 import json
+import os
 import pytest
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
@@ -4254,4 +4256,407 @@ class TestAPIRegionPriorityHierarchy:
         print(f"  - default=ap-south-1 (parameter)")
         print(f"Result: api_host={manager5._api_host}")
         assert "ap-south-1" in manager5._api_host
+
+
+# =============================================================================
+# Tests for _save_credentials_to_file() - atomic write
+# =============================================================================
+
+class TestKiroAuthManagerSaveCredentialsToFileAtomic:
+    """Tests for atomic write in _save_credentials_to_file().
+
+    Background: the previous implementation opened the target file in 'w' mode,
+    which truncates it to 0 bytes before writing. A crash in that window left a
+    half-written kiro-auth-token.json, destroying accessToken/refreshToken and
+    forcing the user to re-login. The fix writes a tmp file in the same
+    directory and then atomically replace()s the target.
+    """
+
+    @staticmethod
+    def _make_manager(creds_path, **kwargs):
+        """Builds a manager pinned to creds_path with fresh in-memory tokens."""
+        manager = KiroAuthManager(creds_file=str(creds_path), **kwargs)
+        manager._access_token = "new_access_token"
+        manager._refresh_token = "new_refresh_token"
+        manager._expires_at = datetime(2099, 1, 1, tzinfo=timezone.utc)
+        return manager
+
+    def test_save_writes_updated_tokens(self, tmp_path):
+        """
+        What it does: Verifies tokens are written to the credentials file.
+        Purpose: Ensure the atomic rewrite still persists refreshed tokens.
+        """
+        print("Setup: Creating credentials file...")
+        creds_path = tmp_path / "kiro-auth-token.json"
+        creds_path.write_text(json.dumps({
+            "accessToken": "old_access_token",
+            "refreshToken": "old_refresh_token",
+        }), encoding="utf-8")
+
+        manager = self._make_manager(creds_path)
+
+        print("Action: Calling _save_credentials_to_file()...")
+        manager._save_credentials_to_file()
+
+        print("Verification: Reading file back...")
+        saved = json.loads(creds_path.read_text(encoding="utf-8"))
+        print(f"Comparing accessToken: Expected 'new_access_token', Got '{saved['accessToken']}'")
+        assert saved["accessToken"] == "new_access_token"
+        assert saved["refreshToken"] == "new_refresh_token"
+        assert saved["expiresAt"] == "2099-01-01T00:00:00+00:00"
+
+    def test_save_preserves_unknown_fields(self, tmp_path):
+        """
+        What it does: Verifies unrelated fields survive the rewrite.
+        Purpose: Preserve read-merge-write semantics of the original function
+                 (Kiro IDE stores extra keys we must not drop).
+        """
+        print("Setup: Creating credentials file with extra fields...")
+        creds_path = tmp_path / "kiro-auth-token.json"
+        creds_path.write_text(json.dumps({
+            "accessToken": "old_access_token",
+            "refreshToken": "old_refresh_token",
+            "clientId": "client-123",
+            "clientSecret": "secret-456",
+            "region": "eu-west-1",
+            "nested": {"keep": [1, 2, 3]},
+        }), encoding="utf-8")
+
+        manager = self._make_manager(creds_path)
+
+        print("Action: Calling _save_credentials_to_file()...")
+        manager._save_credentials_to_file()
+
+        print("Verification: Extra fields preserved...")
+        saved = json.loads(creds_path.read_text(encoding="utf-8"))
+        assert saved["clientId"] == "client-123"
+        assert saved["clientSecret"] == "secret-456"
+        assert saved["region"] == "eu-west-1"
+        assert saved["nested"] == {"keep": [1, 2, 3]}
+        assert saved["accessToken"] == "new_access_token"
+
+    def test_save_writes_profile_arn_when_present(self, tmp_path):
+        """
+        What it does: Verifies profileArn is persisted when set.
+        Purpose: Cover the optional-field branch of the merge logic.
+        """
+        print("Setup: Creating credentials file...")
+        creds_path = tmp_path / "kiro-auth-token.json"
+        creds_path.write_text(json.dumps({"refreshToken": "old"}), encoding="utf-8")
+
+        arn = "arn:aws:codewhisperer:us-east-1:123456789:profile/test"
+        manager = self._make_manager(creds_path, profile_arn=arn)
+
+        print("Action: Calling _save_credentials_to_file()...")
+        manager._save_credentials_to_file()
+
+        saved = json.loads(creds_path.read_text(encoding="utf-8"))
+        print(f"Comparing profileArn: Expected '{arn}', Got '{saved.get('profileArn')}'")
+        assert saved["profileArn"] == arn
+
+    def test_original_file_intact_when_json_dump_crashes(self, tmp_path):
+        """
+        What it does: Simulates a crash mid-write and verifies the original
+                      credentials file is byte-identical afterwards.
+        Purpose: This is the core value of the atomic-write fix - with the old
+                 'w' mode the target would already be truncated to 0 bytes.
+        """
+        print("Setup: Creating credentials file...")
+        creds_path = tmp_path / "kiro-auth-token.json"
+        original_bytes = json.dumps({
+            "accessToken": "old_access_token",
+            "refreshToken": "old_refresh_token",
+            "clientId": "client-123",
+        }, indent=2).encode("utf-8")
+        creds_path.write_bytes(original_bytes)
+
+        manager = self._make_manager(creds_path)
+
+        print("Action: Calling _save_credentials_to_file() with json.dump raising...")
+        with patch("kiro.auth.json.dump", side_effect=OSError("disk full")):
+            manager._save_credentials_to_file()
+
+        print("Verification: Original file untouched (not truncated)...")
+        assert creds_path.exists()
+        assert creds_path.read_bytes() == original_bytes
+
+        print("Verification: No leftover tmp file...")
+        leftovers = list(tmp_path.glob("*.tmp"))
+        print(f"Comparing leftovers: Expected [], Got {leftovers}")
+        assert leftovers == []
+
+    def test_no_tmp_file_left_after_successful_save(self, tmp_path):
+        """
+        What it does: Verifies the tmp file is gone after a successful save.
+        Purpose: replace() must consume the tmp file, not leave clutter next to
+                 the credentials (this directory is the user's ~/.aws/sso/cache).
+        """
+        print("Setup: Creating credentials file...")
+        creds_path = tmp_path / "kiro-auth-token.json"
+        creds_path.write_text(json.dumps({"refreshToken": "old"}), encoding="utf-8")
+
+        manager = self._make_manager(creds_path)
+        manager._save_credentials_to_file()
+
+        print("Verification: Only the credentials file remains...")
+        remaining = sorted(p.name for p in tmp_path.iterdir())
+        print(f"Comparing dir contents: Expected ['kiro-auth-token.json'], Got {remaining}")
+        assert remaining == ["kiro-auth-token.json"]
+
+    def test_tmp_file_created_in_same_directory_as_target(self, tmp_path):
+        """
+        What it does: Captures the path opened during save and asserts it lives
+                      in the same directory as the credentials file.
+        Purpose: os.replace() across filesystems raises OSError, and the
+                 credentials file typically sits under the user's home
+                 directory while the default tmp dir may be another volume.
+        """
+        print("Setup: Creating credentials file in nested directory...")
+        creds_dir = tmp_path / "cache"
+        creds_dir.mkdir()
+        creds_path = creds_dir / "kiro-auth-token.json"
+        creds_path.write_text(json.dumps({"refreshToken": "old"}), encoding="utf-8")
+
+        manager = self._make_manager(creds_path)
+
+        opened_paths = []
+        real_open = os.open
+
+        def tracking_open(path, flags, *args, **kwargs):
+            opened_paths.append(str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        print("Action: Calling _save_credentials_to_file() with os.open traced...")
+        with patch("kiro.auth.os.open", side_effect=tracking_open):
+            manager._save_credentials_to_file()
+
+        print(f"Verification: Opened paths: {opened_paths}")
+        assert len(opened_paths) == 1
+        tmp_written = Path(opened_paths[0])
+        print(f"Comparing tmp parent: Expected '{creds_dir}', Got '{tmp_written.parent}'")
+        assert tmp_written.parent == creds_dir
+        assert tmp_written != creds_path
+
+    def test_replace_is_used_for_final_write(self, tmp_path):
+        """
+        What it does: Asserts the target file is written via Path.replace().
+        Purpose: Guard against a future refactor silently going back to a
+                 non-atomic in-place write.
+        """
+        print("Setup: Creating credentials file...")
+        creds_path = tmp_path / "kiro-auth-token.json"
+        creds_path.write_text(json.dumps({"refreshToken": "old"}), encoding="utf-8")
+
+        manager = self._make_manager(creds_path)
+
+        print("Action: Calling _save_credentials_to_file() with replace patched...")
+        with patch.object(Path, "replace", autospec=True) as mock_replace:
+            manager._save_credentials_to_file()
+
+        assert mock_replace.call_count == 1
+        target_arg = mock_replace.call_args[0][1]
+        print(f"Comparing replace target: Expected '{creds_path}', Got '{target_arg}'")
+        assert Path(target_arg) == creds_path
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits not meaningful on Windows")
+    def test_restrictive_permissions_are_preserved(self, tmp_path):
+        """
+        What it does: Verifies a 0600 credentials file stays 0600 after save.
+        Purpose: The file holds accessToken/refreshToken - the rewrite must not
+                 widen permissions (a fresh file would default to umask-based
+                 0644 and expose the tokens to other local users).
+        """
+        print("Setup: Creating credentials file with mode 0600...")
+        creds_path = tmp_path / "kiro-auth-token.json"
+        creds_path.write_text(json.dumps({"refreshToken": "old"}), encoding="utf-8")
+        os.chmod(creds_path, 0o600)
+
+        manager = self._make_manager(creds_path)
+        manager._save_credentials_to_file()
+
+        mode = creds_path.stat().st_mode & 0o777
+        print(f"Comparing mode: Expected 0o600, Got {oct(mode)}")
+        assert mode == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits not meaningful on Windows")
+    def test_existing_wide_permissions_are_not_widened_further(self, tmp_path):
+        """
+        What it does: Verifies an already-0644 file keeps exactly 0644.
+        Purpose: We preserve the user's chosen mode rather than silently
+                 tightening or loosening it; only new files get 0600.
+        """
+        print("Setup: Creating credentials file with mode 0644...")
+        creds_path = tmp_path / "kiro-auth-token.json"
+        creds_path.write_text(json.dumps({"refreshToken": "old"}), encoding="utf-8")
+        os.chmod(creds_path, 0o644)
+
+        manager = self._make_manager(creds_path)
+        manager._save_credentials_to_file()
+
+        mode = creds_path.stat().st_mode & 0o777
+        print(f"Comparing mode: Expected 0o644, Got {oct(mode)}")
+        assert mode == 0o644
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits not meaningful on Windows")
+    def test_new_file_is_created_with_0600(self, tmp_path):
+        """
+        What it does: Verifies a credentials file created from scratch is 0600.
+        Purpose: When no original file exists there is no mode to preserve, so
+                 tokens must default to owner-only.
+        """
+        print("Setup: Pointing manager at a non-existent credentials file...")
+        creds_path = tmp_path / "kiro-auth-token.json"
+
+        manager = self._make_manager(creds_path)
+        manager._save_credentials_to_file()
+
+        assert creds_path.exists()
+        mode = creds_path.stat().st_mode & 0o777
+        print(f"Comparing mode: Expected 0o600, Got {oct(mode)}")
+        assert mode == 0o600
+
+    def test_missing_target_directory_does_not_raise(self, tmp_path):
+        """
+        What it does: Points the manager at a path inside a non-existent
+                      directory and verifies no exception escapes.
+        Purpose: A save failure must never break token refresh (the token is
+                 still valid in memory).
+        """
+        print("Setup: Pointing manager at a path in a missing directory...")
+        creds_path = tmp_path / "does-not-exist" / "kiro-auth-token.json"
+
+        manager = self._make_manager(creds_path)
+
+        print("Action: Calling _save_credentials_to_file()...")
+        manager._save_credentials_to_file()
+
+        print("Verification: Nothing was created, no exception raised...")
+        assert not creds_path.exists()
+        assert not creds_path.parent.exists()
+
+    @pytest.mark.skipif(os.name == "nt", reason="chmod-based read-only dirs are not enforced on Windows")
+    def test_read_only_directory_does_not_raise(self, tmp_path):
+        """
+        What it does: Makes the credentials directory read-only and verifies
+                      the save fails silently while the original stays intact.
+        Purpose: Cover the unwritable-directory path (e.g. root-owned mount)
+                 without losing existing credentials.
+        """
+        print("Setup: Creating credentials file in a read-only directory...")
+        creds_dir = tmp_path / "ro"
+        creds_dir.mkdir()
+        creds_path = creds_dir / "kiro-auth-token.json"
+        original_bytes = json.dumps({"refreshToken": "old_refresh_token"}).encode("utf-8")
+        creds_path.write_bytes(original_bytes)
+        os.chmod(creds_dir, 0o500)
+
+        try:
+            manager = self._make_manager(creds_path)
+            print("Action: Calling _save_credentials_to_file()...")
+            manager._save_credentials_to_file()
+
+            print("Verification: Original credentials preserved...")
+            assert creds_path.read_bytes() == original_bytes
+            assert list(creds_dir.glob("*.tmp")) == []
+        finally:
+            os.chmod(creds_dir, 0o700)
+
+    def test_corrupted_existing_file_does_not_raise(self, tmp_path):
+        """
+        What it does: Feeds an unparsable existing credentials file to save.
+        Purpose: json.load raises JSONDecodeError (a ValueError subclass); it
+                 must be caught rather than propagating into token refresh.
+        """
+        print("Setup: Creating corrupted credentials file...")
+        creds_path = tmp_path / "kiro-auth-token.json"
+        creds_path.write_text("{not json", encoding="utf-8")
+
+        manager = self._make_manager(creds_path)
+
+        print("Action: Calling _save_credentials_to_file()...")
+        manager._save_credentials_to_file()
+
+        print("Verification: Corrupted file left as-is, no tmp leftovers...")
+        assert creds_path.read_text(encoding="utf-8") == "{not json"
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_non_serializable_token_does_not_leave_tmp_file(self, tmp_path):
+        """
+        What it does: Puts a non-JSON-serializable object in the token field.
+        Purpose: json.dump raises TypeError mid-write; the tmp file must be
+                 cleaned up and the original preserved.
+        """
+        print("Setup: Creating credentials file...")
+        creds_path = tmp_path / "kiro-auth-token.json"
+        original_bytes = json.dumps({"refreshToken": "old_refresh_token"}).encode("utf-8")
+        creds_path.write_bytes(original_bytes)
+
+        manager = self._make_manager(creds_path)
+        manager._access_token = object()
+
+        print("Action: Calling _save_credentials_to_file()...")
+        manager._save_credentials_to_file()
+
+        print("Verification: Original intact, tmp file removed...")
+        assert creds_path.read_bytes() == original_bytes
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_returns_early_when_no_creds_file_configured(self, tmp_path):
+        """
+        What it does: Verifies save is a no-op without a configured file.
+        Purpose: SQLite/env-token setups must not create stray files.
+        """
+        print("Setup: Creating manager without creds_file...")
+        manager = KiroAuthManager(refresh_token="test_token")
+        manager._access_token = "new_access_token"
+
+        print("Action: Calling _save_credentials_to_file()...")
+        manager._save_credentials_to_file()
+
+        print("Verification: No files created...")
+        assert list(tmp_path.iterdir()) == []
+
+    def test_expands_user_home_in_path(self, tmp_path, monkeypatch):
+        """
+        What it does: Uses a '~'-prefixed credentials path with HOME redirected
+                      to tmp_path and verifies the file lands in the real home.
+        Purpose: Credentials normally live at ~/.aws/sso/cache/, so tilde
+                 expansion must happen before the tmp file is placed.
+        """
+        print("Setup: Redirecting HOME and creating ~/.aws/sso/cache...")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        cache_dir = tmp_path / ".aws" / "sso" / "cache"
+        cache_dir.mkdir(parents=True)
+        creds_path = cache_dir / "kiro-auth-token.json"
+        creds_path.write_text(json.dumps({"refreshToken": "old"}), encoding="utf-8")
+
+        manager = KiroAuthManager(creds_file="~/.aws/sso/cache/kiro-auth-token.json")
+        manager._access_token = "new_access_token"
+        manager._refresh_token = "new_refresh_token"
+
+        print("Action: Calling _save_credentials_to_file()...")
+        manager._save_credentials_to_file()
+
+        print("Verification: Tokens written to expanded path...")
+        saved = json.loads(creds_path.read_text(encoding="utf-8"))
+        assert saved["accessToken"] == "new_access_token"
+        assert list(cache_dir.glob("*.tmp")) == []
+
+    def test_cleanup_tmp_file_survives_unlink_failure(self, tmp_path):
+        """
+        What it does: Makes tmp cleanup itself fail and verifies no raise.
+        Purpose: A failing cleanup inside the error handler would convert a
+                 recoverable save error into a failed token refresh.
+        """
+        print("Setup: Preparing a tmp path whose unlink fails...")
+        tmp_file = tmp_path / "kiro-auth-token.json.tmp"
+        tmp_file.write_text("partial", encoding="utf-8")
+
+        print("Action: Calling _cleanup_tmp_file() with unlink raising...")
+        with patch.object(Path, "unlink", autospec=True, side_effect=OSError("locked")):
+            KiroAuthManager._cleanup_tmp_file(tmp_file)
+
+        print("Verification: No exception escaped...")
+        assert tmp_file.exists()
 

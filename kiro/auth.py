@@ -489,19 +489,31 @@ class KiroAuthManager:
     
     def _save_credentials_to_file(self) -> None:
         """
-        Saves updated credentials to a JSON file.
+        Saves updated credentials to a JSON file atomically.
         
         Updates the existing file while preserving other fields.
+        
+        Uses tmp file + rename for atomic write: opening the target in 'w' mode
+        truncates it before any new bytes are written, so a crash (SIGKILL,
+        power loss) in that window would leave a half-written token file that
+        cannot be parsed on next start, forcing the user to re-login.
+        
+        The tmp file is created in the same directory as the target so that
+        replace() stays within one filesystem, and with 0600 permissions so the
+        tokens are never world-readable, not even briefly.
         """
         if not self._creds_file:
             return
         
+        path = Path(self._creds_file).expanduser()
+        tmp_path = path.with_suffix('.json.tmp')
+        
         try:
-            path = Path(self._creds_file).expanduser()
-            
             # Read existing data
             existing_data = {}
+            original_mode: Optional[int] = None
             if path.exists():
+                original_mode = path.stat().st_mode & 0o777
                 with open(path, 'r', encoding='utf-8') as f:
                     existing_data = json.load(f)
             
@@ -513,14 +525,43 @@ class KiroAuthManager:
             if self._profile_arn:
                 existing_data['profileArn'] = self._profile_arn
             
-            # Save
-            with open(path, 'w', encoding='utf-8') as f:
+            # Save to tmp file with restrictive permissions
+            fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(existing_data, f, indent=2, ensure_ascii=False)
+            
+            # Keep whatever permissions the original file had (never widen them)
+            if original_mode is not None:
+                os.chmod(tmp_path, original_mode)
+            
+            # Atomic rename
+            tmp_path.replace(path)
             
             logger.debug(f"Credentials saved to {self._creds_file}")
             
-        except Exception as e:
-            logger.error(f"Error saving credentials: {e}")
+        except (OSError, ValueError, TypeError) as e:
+            logger.error(
+                f"Error saving credentials to {path}: {e}. "
+                f"Existing credentials file left unchanged, "
+                f"token refresh continues in memory."
+            )
+            self._cleanup_tmp_file(tmp_path)
+    
+    @staticmethod
+    def _cleanup_tmp_file(tmp_path: Path) -> None:
+        """
+        Removes a leftover temporary file, ignoring failures.
+        
+        Called from error handlers, so it must never raise: a failing cleanup
+        would turn a recoverable save error into a failed token refresh.
+        
+        Args:
+            tmp_path: Path of the temporary file to remove
+        """
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(f"Failed to remove temporary file {tmp_path}: {e}")
     
     def _save_credentials_to_sqlite(self) -> None:
         """
