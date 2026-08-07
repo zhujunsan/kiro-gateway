@@ -11,7 +11,8 @@ import json
 
 import pytest
 
-from kiro import streaming_openai
+from kiro import streaming_anthropic, streaming_openai
+from kiro.parsers import AwsEventStreamParser
 from kiro.streaming_core import KiroEvent
 
 
@@ -292,3 +293,229 @@ async def test_xml_fallback_is_returned_as_streamed_tool_call(monkeypatch):
         for delta in tool_deltas[1:]
     )
     assert json.loads(arguments) == {"command": "pwd"}
+
+
+# ==================================================================================================
+# Duplicate tool_use id regression (Anthropic + OpenAI + Responses)
+# ==================================================================================================
+#
+# Upstream Kiro emits the *same* toolUseId twice for a single tool call: once
+# carrying the real arguments, then a second, empty repetition. The
+# non-streaming path collapses these via deduplicate_tool_calls(), but the
+# streaming paths used to forward both, so clients that key tool input by id
+# saw the empty repetition overwrite the real arguments (Claude Code rendered
+# an empty Bash description).
+
+
+DUP_TOOL_ARGS = {"command": "ls -la", "description": "列出当前目录内容"}
+
+
+def _duplicate_id_upstream_chunks():
+    """Raw Kiro chunks that emit one toolUseId twice.
+
+    Mirrors the observed gateway log: a full lifecycle carrying the real
+    arguments, immediately followed by a second lifecycle for the same id whose
+    accumulated argument string is empty.
+    """
+    args_json = json.dumps(DUP_TOOL_ARGS, ensure_ascii=False)
+    return [
+        b'{"name":"Bash","toolUseId":"toolu_dup"}',
+        json.dumps({"input": args_json}, ensure_ascii=False).encode("utf-8"),
+        b'{"stop":true}',
+        # Second, empty emission of the SAME id.
+        b'{"name":"Bash","toolUseId":"toolu_dup"}',
+        b'{"stop":true}',
+        b'{"usage":0.1}',
+    ]
+
+
+def _duplicate_id_events():
+    """Drive the real AwsEventStreamParser and collect the KiroEvents it emits.
+
+    Going through the parser (rather than hand-building KiroEvents) is what makes
+    these tests cover the actual de-duplication path.
+    """
+    parser = AwsEventStreamParser()
+    raw_events = []
+    for chunk in _duplicate_id_upstream_chunks():
+        raw_events.extend(parser.feed(chunk))
+
+    events = []
+    for ev in raw_events:
+        etype = ev["type"]
+        data = ev["data"]
+        if etype == "tool_start":
+            events.append(KiroEvent(type="tool_start", tool_use=data))
+        elif etype == "tool_input":
+            events.append(KiroEvent(
+                type="tool_input",
+                tool_call_id=data["tool_call_id"],
+                tool_input_delta=data["arguments_delta"],
+            ))
+        elif etype == "tool_stop":
+            events.append(KiroEvent(type="tool_stop", tool_use=data))
+        elif etype == "usage":
+            events.append(KiroEvent(type="usage", usage={"credits": data}))
+    return events
+
+
+def test_parser_suppresses_replayed_tool_id():
+    """The parser must not surface a second lifecycle for a finalized id."""
+    parser = AwsEventStreamParser()
+    events = []
+    for chunk in _duplicate_id_upstream_chunks():
+        events.extend(parser.feed(chunk))
+
+    starts = [e for e in events if e["type"] == "tool_start"]
+    stops = [e for e in events if e["type"] == "tool_stop"]
+    assert len(starts) == 1, f"expected one tool_start, got {len(starts)}"
+    assert len(stops) == 1, f"expected one tool_stop, got {len(stops)}"
+
+    deltas = "".join(
+        e["data"]["arguments_delta"] for e in events if e["type"] == "tool_input"
+    )
+    assert json.loads(deltas) == DUP_TOOL_ARGS
+
+    # The non-streaming collector must also keep exactly one, correct copy.
+    assert len(parser.tool_calls) == 1
+    assert json.loads(parser.tool_calls[0]["function"]["arguments"]) == DUP_TOOL_ARGS
+
+
+def test_parser_keeps_real_arguments_when_empty_emission_comes_first():
+    """If the empty emission arrives first, the real arguments must still win."""
+    parser = AwsEventStreamParser()
+    args_json = json.dumps(DUP_TOOL_ARGS, ensure_ascii=False)
+    chunks = [
+        b'{"name":"Bash","toolUseId":"toolu_dup"}',
+        b'{"stop":true}',
+        b'{"name":"Bash","toolUseId":"toolu_dup"}',
+        json.dumps({"input": args_json}, ensure_ascii=False).encode("utf-8"),
+        b'{"stop":true}',
+    ]
+    for chunk in chunks:
+        parser.feed(chunk)
+
+    assert len(parser.tool_calls) == 1
+    assert json.loads(parser.tool_calls[0]["function"]["arguments"]) == DUP_TOOL_ARGS
+
+
+def test_parser_keeps_distinct_tool_ids_separate():
+    """De-duplication must key on id, not collapse genuinely different calls."""
+    parser = AwsEventStreamParser()
+    chunks = [
+        b'{"name":"Bash","toolUseId":"toolu_a"}',
+        json.dumps({"input": '{"command": "pwd"}'}).encode("utf-8"),
+        b'{"stop":true}',
+        b'{"name":"Bash","toolUseId":"toolu_b"}',
+        json.dumps({"input": '{"command": "whoami"}'}).encode("utf-8"),
+        b'{"stop":true}',
+    ]
+    events = []
+    for chunk in chunks:
+        events.extend(parser.feed(chunk))
+
+    starts = [e for e in events if e["type"] == "tool_start"]
+    assert len(starts) == 2
+    assert [s["data"]["id"] for s in starts] == ["toolu_a", "toolu_b"]
+    assert len(parser.tool_calls) == 2
+    assert json.loads(parser.tool_calls[0]["function"]["arguments"]) == {"command": "pwd"}
+    assert json.loads(parser.tool_calls[1]["function"]["arguments"]) == {"command": "whoami"}
+
+
+async def _collect_anthropic_sse(gen):
+    """Drain an Anthropic SSE generator into parsed data payloads."""
+    events = []
+    async for raw in gen:
+        for line in raw.splitlines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[len("data: "):]))
+    return events
+
+
+@pytest.mark.asyncio
+async def test_duplicate_tool_id_emits_single_anthropic_block(monkeypatch):
+    """A repeated toolUseId must not open a second, empty tool_use block."""
+    async def fake_parse_kiro_stream(response, *args, **kwargs):
+        for ev in _duplicate_id_events():
+            yield ev
+
+    monkeypatch.setattr(
+        streaming_anthropic, "parse_kiro_stream", fake_parse_kiro_stream
+    )
+    monkeypatch.setattr(
+        streaming_anthropic, "parse_bracket_tool_calls", lambda _content: []
+    )
+    monkeypatch.setattr(
+        streaming_anthropic, "parse_xml_tool_calls", lambda _content: []
+    )
+
+    events = await _collect_anthropic_sse(
+        streaming_anthropic.stream_kiro_to_anthropic(
+            _FakeResponse(),
+            "claude-sonnet-4",
+            _FakeModelCache(),
+            None,
+        )
+    )
+
+    starts = [
+        e for e in events
+        if e.get("type") == "content_block_start"
+        and e["content_block"].get("type") == "tool_use"
+    ]
+    assert len(starts) == 1, (
+        f"expected one tool_use block, got {len(starts)}: "
+        f"{[s['content_block']['id'] for s in starts]}"
+    )
+
+    index = starts[0]["index"]
+    reassembled = "".join(
+        e["delta"]["partial_json"]
+        for e in events
+        if e.get("type") == "content_block_delta"
+        and e.get("index") == index
+        and e["delta"].get("type") == "input_json_delta"
+    )
+    assert json.loads(reassembled) == {
+        "command": "ls -la",
+        "description": "列出当前目录内容",
+    }
+
+    stops = [
+        e for e in events
+        if e.get("type") == "content_block_stop" and e.get("index") == index
+    ]
+    assert len(stops) == 1, f"expected one stop for block {index}, got {len(stops)}"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_tool_id_emits_single_openai_tool_call(monkeypatch):
+    """The OpenAI path must not append an empty duplicate tool_call."""
+    _patch_stream(monkeypatch, _duplicate_id_events())
+
+    chunks = await _collect_sse(streaming_openai.stream_kiro_to_openai_internal(
+        client=None,
+        response=_FakeResponse(),
+        model="claude-sonnet-4",
+        model_cache=_FakeModelCache(),
+        auth_manager=None,
+    ))
+
+    tool_deltas = [
+        data["choices"][0]["delta"]["tool_calls"][0]
+        for _raw, data in chunks
+        if data is not None
+        and "tool_calls" in data["choices"][0]["delta"]
+    ]
+    named = [d for d in tool_deltas if d.get("function", {}).get("name")]
+    assert len(named) == 1, f"expected one tool_call opener, got {len(named)}"
+
+    arguments = "".join(
+        d["function"].get("arguments", "")
+        for d in tool_deltas
+        if d["index"] == named[0]["index"]
+    )
+    assert json.loads(arguments) == {
+        "command": "ls -la",
+        "description": "列出当前目录内容",
+    }
