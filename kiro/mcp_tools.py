@@ -40,6 +40,7 @@ import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
+from kiro.config import PROFILE_ARN
 from kiro.tokenizer import count_message_tokens, count_tokens
 from kiro.proxy import resolve_proxy
 
@@ -91,13 +92,16 @@ async def call_kiro_mcp_api(
         auth_manager: KiroAuthManager instance
     
     Returns:
-        Tuple of (tool_use_id, results_dict) or (None, None) on error
+        Tuple of (tool_use_id, results_dict) or (None, None) on error.
+        Also returns (None, None) without opening a network connection when
+        neither the auth manager nor PROFILE_ARN provides a profile ARN.
     
     MCP Request Format:
         {
             "id": "web_search_tooluse_{22random}_{timestamp}_{8random}",
             "jsonrpc": "2.0",
             "method": "tools/call",
+            "profileArn": "arn:aws:codewhisperer:...:profile/...",
             "params": {
                 "name": "web_search",
                 "arguments": {"query": "..."}
@@ -119,6 +123,14 @@ async def call_kiro_mcp_api(
     
     CRITICAL: result.content[0].text is a JSON STRING, not a dict!
     """
+    profile_arn = auth_manager.profile_arn or PROFILE_ARN
+    if not profile_arn:
+        logger.error(
+            "MCP web search requires a profile ARN. Configure PROFILE_ARN or use "
+            "credentials that include profile_arn."
+        )
+        return None, None
+
     # Generate IDs
     random_22 = generate_random_id(22)
     timestamp = int(time.time() * 1000)
@@ -131,6 +143,7 @@ async def call_kiro_mcp_api(
         "id": request_id,
         "jsonrpc": "2.0",
         "method": "tools/call",
+        "profileArn": profile_arn,
         "params": {
             "name": "web_search",
             "arguments": {"query": query}
