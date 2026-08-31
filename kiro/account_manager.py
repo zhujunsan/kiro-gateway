@@ -40,7 +40,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import HTTPException
@@ -931,6 +931,43 @@ class AccountManager:
         return any(
             account.auth_manager is not None for account in self._accounts.values()
         )
+
+    async def ensure_first_account(self) -> Optional[Account]:
+        """Return the first usable account for legacy mode, initializing on demand.
+
+        Startup no longer aborts when credentials are bad, so legacy mode must be
+        able to recover: after the user signs in to Kiro, the next request should
+        succeed without restarting the gateway. Each configured account is retried
+        under its own single-flight lock.
+
+        Returns:
+            The first initialized account, or None when none can be initialized.
+        """
+        for account in self._accounts.values():
+            if account.auth_manager is not None:
+                return account
+
+        for account_id in list(self._accounts.keys()):
+            if await self._ensure_account_initialized(account_id):
+                account = self._accounts.get(account_id)
+                if account is not None and account.auth_manager is not None:
+                    return account
+        return None
+
+    def account_unavailable_error(self) -> Tuple[int, str, str]:
+        """Return ``(status, code, message)`` describing why no account is usable.
+
+        Credential problems answer 401: they cannot be fixed by retrying, so a
+        503 would only invite clients to hammer a signed-out account. Everything
+        else stays 503 (retry may genuinely help).
+
+        Returns:
+            Tuple of HTTP status, stable error code, and actionable message.
+        """
+        failure = self.describe_init_failure()
+        code = failure["code"]
+        status = 401 if code in (ACCOUNT_AUTH_REQUIRED_CODE, NO_CREDENTIALS_CODE) else 503
+        return status, code, failure["message"]
 
     def describe_init_failure(self) -> Dict[str, Any]:
         """Summarize why no account is usable, for startup logs and /health.

@@ -755,10 +755,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         # ==============================================================================
         # LEGACY MODE: Single Account (no failover)
         # ==============================================================================
-        account = request.app.state.account_manager.get_first_account()
-        if not account.auth_manager:
-            logger.error("No initialized accounts available (legacy mode)")
-            raise HTTPException(503, "No initialized accounts available")
+        account_manager = request.app.state.account_manager
+        account = await account_manager.ensure_first_account()
+        if account is None:
+            # Degraded start / signed-out user: 401 for credential problems so
+            # clients stop retrying, 503 for anything a retry could fix.
+            status, code, message = account_manager.account_unavailable_error()
+            logger.error("No initialized accounts available (legacy mode): {}", code)
+            raise HTTPException(status_code=status, detail=message)
         auth_manager = account.auth_manager
         model_cache = account.model_cache
         model_resolver = account.model_resolver

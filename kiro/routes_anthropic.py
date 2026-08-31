@@ -298,16 +298,21 @@ async def messages(
             if tool_type and tool_type.startswith("web_search"):
                 # Path A: Early return, direct MCP call
                 # Get auth_manager from first available account (no failover needed for early return)
-                account = request.app.state.account_manager.get_first_account()
-                if not account.auth_manager:
-                    logger.error("No initialized accounts available for native web_search")
+                account_manager = request.app.state.account_manager
+                account = await account_manager.ensure_first_account()
+                if account is None:
+                    status, code, message = account_manager.account_unavailable_error()
+                    logger.error(
+                        "No initialized accounts available for native web_search: {}",
+                        code,
+                    )
                     return JSONResponse(
-                        status_code=503,
+                        status_code=status,
                         content={
                             "type": "error",
                             "error": {
-                                "type": "api_error",
-                                "message": "No initialized accounts available"
+                                "type": code,
+                                "message": message,
                             }
                         }
                     )
@@ -784,16 +789,18 @@ async def messages(
         # ==============================================================================
         # LEGACY MODE: Single Account (no failover)
         # ==============================================================================
-        account = request.app.state.account_manager.get_first_account()
-        if not account.auth_manager:
-            logger.error("No initialized accounts available (legacy mode)")
+        account_manager = request.app.state.account_manager
+        account = await account_manager.ensure_first_account()
+        if account is None:
+            status, code, message = account_manager.account_unavailable_error()
+            logger.error("No initialized accounts available (legacy mode): {}", code)
             return JSONResponse(
-                status_code=503,
+                status_code=status,
                 content={
                     "type": "error",
                     "error": {
-                        "type": "api_error",
-                        "message": "No initialized accounts available"
+                        "type": code,
+                        "message": message,
                     }
                 }
             )

@@ -1341,6 +1341,124 @@ class TestAccountManagerHasInitializedAccount:
         assert manager.has_initialized_account() is True
 
 
+class TestAccountManagerEnsureFirstAccount:
+    """Legacy mode must recover after the user signs in, without a restart.
+
+    Startup no longer aborts on bad credentials, so this is the path that turns a
+    degraded gateway back into a working one. It previously raised RuntimeError
+    and surfaced as HTTP 500.
+    """
+
+    @staticmethod
+    def _manager(tmp_path) -> AccountManager:
+        return AccountManager(
+            credentials_file=str(tmp_path / "creds.json"),
+            state_file=str(tmp_path / "state.json"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_already_initialized_account_without_reinit(self, tmp_path):
+        manager = self._manager(tmp_path)
+        ready = Account(id="a")
+        ready.auth_manager = Mock()
+        manager._accounts["a"] = ready
+        with patch.object(manager, "_initialize_account", new=AsyncMock()) as init:
+            account = await manager.ensure_first_account()
+        assert account is ready
+        init.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_initializes_on_demand_when_none_ready(self, tmp_path):
+        manager = self._manager(tmp_path)
+        manager._accounts["a"] = Account(id="a")
+
+        async def _init(account_id):
+            manager._accounts[account_id].auth_manager = Mock()
+            return True
+
+        with patch.object(manager, "_initialize_account", new=AsyncMock(side_effect=_init)):
+            account = await manager.ensure_first_account()
+
+        assert account is not None
+        assert account.auth_manager is not None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_all_inits_fail(self, tmp_path):
+        manager = self._manager(tmp_path)
+        manager._accounts["a"] = Account(id="a")
+        manager._accounts["b"] = Account(id="b")
+
+        with patch.object(
+            manager, "_initialize_account", new=AsyncMock(return_value=False)
+        ) as init:
+            assert await manager.ensure_first_account() is None
+
+        # Every configured account gets a chance before giving up.
+        assert init.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_returns_none_with_no_accounts(self, tmp_path):
+        assert await self._manager(tmp_path).ensure_first_account() is None
+
+    @pytest.mark.asyncio
+    async def test_falls_through_to_second_account(self, tmp_path):
+        manager = self._manager(tmp_path)
+        manager._accounts["bad"] = Account(id="bad")
+        manager._accounts["good"] = Account(id="good")
+
+        async def _init(account_id):
+            if account_id == "bad":
+                return False
+            manager._accounts[account_id].auth_manager = Mock()
+            return True
+
+        with patch.object(manager, "_initialize_account", new=AsyncMock(side_effect=_init)):
+            account = await manager.ensure_first_account()
+
+        assert account is not None
+        assert account.id == "good"
+
+
+class TestAccountUnavailableError:
+    """Credential problems must answer 401, retryable ones 503."""
+
+    @staticmethod
+    def _manager(tmp_path) -> AccountManager:
+        return AccountManager(
+            credentials_file=str(tmp_path / "creds.json"),
+            state_file=str(tmp_path / "state.json"),
+        )
+
+    def test_missing_credentials_is_401(self, tmp_path):
+        status, code, message = self._manager(tmp_path).account_unavailable_error()
+        assert status == 401
+        assert code == "account_not_configured"
+        assert message
+
+    def test_expired_credentials_is_401(self, tmp_path):
+        manager = self._manager(tmp_path)
+        account = Account(id="a")
+        account.last_init_error = "HTTPStatusError: 400"
+        account.last_init_auth_failure = True
+        manager._accounts["a"] = account
+
+        status, code, _message = manager.account_unavailable_error()
+        assert status == 401
+        assert code == "account_auth_required"
+
+    def test_transient_failure_stays_503(self, tmp_path):
+        """A proxy failure may well succeed on retry, so keep 503."""
+        manager = self._manager(tmp_path)
+        account = Account(id="a")
+        account.last_init_error = "ConnectError: proxy down"
+        account.last_init_auth_failure = False
+        manager._accounts["a"] = account
+
+        status, code, _message = manager.account_unavailable_error()
+        assert status == 503
+        assert code == "account_init_failed"
+
+
 class TestAccountManagerGetAllAvailableModels:
     """
     Tests for AccountManager.get_all_available_models() method.
