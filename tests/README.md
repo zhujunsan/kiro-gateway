@@ -112,7 +112,7 @@ tests/
 │   ├── test_tokenizer.py           # Tokenizer tests (tiktoken)
 │   ├── test_truncation_recovery.py # Truncation Recovery System tests (synthetic message generation)
 │   ├── test_truncation_state.py    # Truncation state cache tests (save/retrieve, one-time retrieval, thread safety)
-│   ├── test_usage_endpoint.py      # /usage endpoint tests (upstream retry, outage reporting)
+│   ├── test_usage_endpoint.py      # /usage endpoint tests (upstream retry, outage reporting, auth-required vs transport failure classification)
 │   └── test_vpn_proxy.py           # VPN/Proxy configuration tests (environment variables, URL normalization, NO_PROXY)
 ├── integration/                     # Integration tests for full flow
 │   ├── test_account_system_flow.py # Account System integration tests (full failover, sticky behavior, Circuit Breaker, state persistence)

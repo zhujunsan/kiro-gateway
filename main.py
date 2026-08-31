@@ -86,8 +86,14 @@ from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.account_manager import AccountManager
 from kiro.proxy import resolve_proxy
+from kiro.auth_state import (
+    ACCOUNT_AUTH_REQUIRED_CODE,
+    NO_CREDENTIALS_CODE,
+)
 from kiro.usage_upstream import (
     build_usage_account_unavailable_response,
+    build_usage_auth_required_response,
+    build_usage_login_required_response,
     build_usage_network_error_response,
     fetch_usage_limits,
     obtain_usage_access_token,
@@ -482,17 +488,13 @@ async def lifespan(app: FastAPI):
     # Initialize first working account (blocking)
     # ==============================================================================
     all_accounts = list(app.state.account_manager._accounts.keys())
-    
-    if not all_accounts:
-        logger.error("No accounts configured in credentials.json")
-        raise RuntimeError("No accounts configured in credentials.json")
-    
+
     # Determine start index from state.json
     start_index = app.state.account_manager._current_account_index
-    
+
     # Try to initialize accounts (full circle)
     initialized = False
-    
+
     for i in range(len(all_accounts)):
         current_index = (start_index + i) % len(all_accounts)
         account_id = all_accounts[current_index]
@@ -507,11 +509,29 @@ async def lifespan(app: FastAPI):
             break
         else:
             logger.warning(f"Failed to initialize account: {account_id}")
-    
+
+    # ==============================================================================
+    # Degraded start: never crash because the user is signed out
+    # ==============================================================================
+    # Raising here used to kill the process, so the supervisor respawned it in a
+    # crash loop and the tray could only report "gateway exited". The account
+    # routes already answer 503 when no account is initialized, and lazy
+    # initialization retries on every request, so serving is strictly better:
+    # /health stays reachable and the user gets an actionable reason. See
+    # app_startup_state / GET /health for what clients read.
+    app.state.account_startup = (
+        None if initialized else app.state.account_manager.describe_init_failure()
+    )
     if not initialized:
-        logger.error("Failed to initialize any account. Check your credentials.")
-        raise RuntimeError("Failed to initialize any account")
-    
+        failure = app.state.account_startup
+        logger.error(
+            "Starting in degraded mode ({}): {}",
+            failure["code"],
+            failure["message"],
+        )
+        for account_id, error in (failure.get("errors") or {}).items():
+            logger.error("  account {} → {}", account_id, error)
+
     # Save initial state
     await app.state.account_manager._save_state()
     
@@ -676,6 +696,10 @@ async def kiro_usage(request: Request, raw: bool = False):
     Token refresh (AWS SSO OIDC) and getUsageLimits transport blips soft-fail
     as 503 JSON (tray treats non-200 as a miss). getUsageLimits retries with
     backoff; Sentry is only notified after a sustained failure streak.
+
+    When credentials are expired or absent the response is 401
+    ``usage_auth_required`` instead, so pollers stop and prompt for re-login
+    rather than retrying a state only the user can fix.
     """
     auth, am = _usage_pick_auth()
     if auth is None:
@@ -685,10 +709,19 @@ async def kiro_usage(request: Request, raw: bool = False):
                 try:
                     await am._initialize_account(_ids[0])
                 except Exception:
-                    pass
+                    logger.debug("GET /usage lazy account init failed", exc_info=True)
                 _acc = am._accounts.get(_ids[0])
                 auth = _acc.auth_manager if _acc else None
     if auth is None:
+        # Distinguish "signed out" from "not ready yet": the former must not be
+        # polled, the latter should be retried shortly.
+        if am is not None:
+            failure = am.describe_init_failure()
+            if failure["code"] in (ACCOUNT_AUTH_REQUIRED_CODE, NO_CREDENTIALS_CODE):
+                return build_usage_login_required_response(
+                    code=failure["code"],
+                    message=failure["message"],
+                )
         return build_usage_account_unavailable_response()
 
     token, token_error = await obtain_usage_access_token(auth)
@@ -728,13 +761,19 @@ async def kiro_usage(request: Request, raw: bool = False):
         headers=headers,
         proxy=resolve_proxy(),
     )
+    if result.auth_required:
+        # Upstream rejected the token: tell the client to re-login instead of
+        # forwarding a raw 401/403 that looks retryable.
+        assert result.error is not None
+        return build_usage_auth_required_response(result.error)
+
     if result.response is None:
         assert result.error is not None
         return build_usage_network_error_response(result.error)
 
     resp = result.response
     if resp.status_code != 200:
-        # Non-retryable upstream body (auth/validation): soft JSON, no raise.
+        # Non-retryable upstream body (validation): soft JSON, no raise.
         return JSONResponse(status_code=resp.status_code, content={"detail": resp.text})
 
     data = resp.json()

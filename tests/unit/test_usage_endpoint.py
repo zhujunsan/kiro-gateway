@@ -6,17 +6,292 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from kiro.auth_state import (
+    ACCOUNT_AUTH_REQUIRED_CODE,
+    NO_CREDENTIALS_CODE,
+    USAGE_AUTH_REQUIRED_CODE,
+    auth_failure_reason,
+    build_auth_required_payload,
+    is_auth_failure,
+    transport_failure_reason,
+)
 from kiro.usage_upstream import (
     USAGE_OUTAGE_CONSECUTIVE_THRESHOLD,
     USAGE_OUTAGE_DURATION_S,
     USAGE_UPSTREAM_MAX_ATTEMPTS,
     UsageUpstreamMonitor,
+    build_usage_auth_required_response,
+    build_usage_login_required_response,
     build_usage_network_error_response,
     fetch_usage_limits,
     finalize_usage_transport_failure,
     obtain_usage_access_token,
+    report_usage_auth_required,
     report_usage_outage,
 )
+
+
+def _status_error(status: int, url: str = "https://oidc.test/token") -> httpx.HTTPStatusError:
+    """Build an HTTPStatusError carrying a real response, like httpx does."""
+    request = httpx.Request("POST", url)
+    response = httpx.Response(status, request=request, text="body")
+    return httpx.HTTPStatusError(f"status {status}", request=request, response=response)
+
+
+class TestIsAuthFailure:
+    """Credential failures must be told apart from transport failures."""
+
+    @pytest.mark.parametrize("status", [400, 401, 403])
+    def test_idp_rejection_statuses_are_auth_failures(self, status: int) -> None:
+        assert is_auth_failure(_status_error(status)) is True
+
+    @pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+    def test_capacity_statuses_are_not_auth_failures(self, status: int) -> None:
+        assert is_auth_failure(_status_error(status)) is False
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ConnectError("All connection attempts failed"),
+            httpx.ReadTimeout("slow"),
+            httpx.ConnectTimeout("slow connect"),
+            httpx.ConnectError("[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert"),
+            httpx.ConnectError("[Errno 8] nodename nor servname provided"),
+        ],
+    )
+    def test_transport_errors_are_not_auth_failures(self, exc: Exception) -> None:
+        assert is_auth_failure(exc) is False
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Token expired and refresh failed. Please run 'kiro-cli login'",
+            "Failed to obtain access token",
+            "Refresh token is not set",
+            "Client ID is not set (required for AWS SSO OIDC)",
+        ],
+    )
+    def test_value_errors_from_auth_manager_are_auth_failures(self, message: str) -> None:
+        assert is_auth_failure(ValueError(message)) is True
+
+    def test_marker_match_without_response_object(self) -> None:
+        assert is_auth_failure(RuntimeError("upstream said invalid_grant")) is True
+
+    def test_unrelated_runtime_error_is_not_auth_failure(self) -> None:
+        assert is_auth_failure(RuntimeError("disk full")) is False
+
+
+class TestFailureReasonTags:
+    """Reason tags drive log text, Sentry tags, and fingerprints."""
+
+    def test_400_maps_to_invalid_grant(self) -> None:
+        assert auth_failure_reason(_status_error(400)) == "invalid_grant"
+
+    def test_401_and_403_map_distinctly(self) -> None:
+        assert auth_failure_reason(_status_error(401)) == "unauthorized"
+        assert auth_failure_reason(_status_error(403)) == "forbidden"
+
+    def test_missing_credentials_detected_from_message(self) -> None:
+        assert auth_failure_reason(ValueError("Client secret is not set")) == (
+            "missing_credentials"
+        )
+
+    def test_generic_auth_failure_falls_back_to_refresh_failed(self) -> None:
+        assert auth_failure_reason(ValueError("Failed to obtain access token")) == (
+            "refresh_failed"
+        )
+
+    @pytest.mark.parametrize(
+        "exc,expected",
+        [
+            (httpx.ReadTimeout("x"), "timeout"),
+            (httpx.ConnectTimeout("x"), "timeout"),
+            (httpx.ConnectError("[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE]"), "tls"),
+            (httpx.ConnectError("[Errno 8] nodename nor servname provided"), "dns"),
+            (httpx.ConnectError("All connection attempts failed"), "connect"),
+            (httpx.HTTPError("weird"), "other"),
+        ],
+    )
+    def test_transport_causes_are_split(self, exc: Exception, expected: str) -> None:
+        assert transport_failure_reason(exc) == expected
+
+    def test_status_error_is_upstream_status(self) -> None:
+        assert transport_failure_reason(_status_error(503)) == "upstream_status"
+
+
+class TestBuildAuthRequiredPayload:
+    """Response bodies must be switchable without string matching."""
+
+    def test_payload_carries_code_and_login_flag(self) -> None:
+        payload = build_auth_required_payload(
+            code=USAGE_AUTH_REQUIRED_CODE, message="sign in", reason="invalid_grant"
+        )
+        assert payload["error"]["code"] == USAGE_AUTH_REQUIRED_CODE
+        assert payload["error"]["type"] == USAGE_AUTH_REQUIRED_CODE
+        assert payload["error"]["login_required"] is True
+        assert payload["error"]["reason"] == "invalid_grant"
+
+    def test_reason_is_omitted_when_absent(self) -> None:
+        payload = build_auth_required_payload(code="x", message="y")
+        assert "reason" not in payload["error"]
+
+
+class TestAuthRequiredResponses:
+    """401, not 503: 503 is what made clients poll a signed-out account."""
+
+    def test_auth_required_response_is_401_with_actionable_message(self) -> None:
+        response = build_usage_auth_required_response(_status_error(400))
+        assert response.status_code == 401
+        assert USAGE_AUTH_REQUIRED_CODE.encode() in response.body
+        assert b"login_required" in response.body
+        assert b"Open Kiro" in response.body
+
+    @pytest.mark.parametrize(
+        "code", [ACCOUNT_AUTH_REQUIRED_CODE, NO_CREDENTIALS_CODE]
+    )
+    def test_login_required_response_carries_account_code(self, code: str) -> None:
+        response = build_usage_login_required_response(code=code, message="do this")
+        assert response.status_code == 401
+        assert code.encode() in response.body
+        assert b"login_required" in response.body
+
+
+@pytest.mark.asyncio
+class TestMonitorAuthGating:
+    """A signed-out account must produce one report, not one per window."""
+
+    async def test_auth_failure_reports_only_once(self) -> None:
+        monitor = UsageUpstreamMonitor()
+        assert await monitor.note_auth_failure() is True
+        for _ in range(50):
+            assert await monitor.note_auth_failure() is False
+
+    async def test_success_rearms_auth_reporting(self) -> None:
+        monitor = UsageUpstreamMonitor()
+        assert await monitor.note_auth_failure() is True
+        await monitor.note_success()
+        assert await monitor.note_auth_failure() is True
+
+    async def test_auth_failures_do_not_advance_outage_streak(self) -> None:
+        monitor = UsageUpstreamMonitor()
+        for _ in range(20):
+            await monitor.note_auth_failure()
+        assert monitor.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+class TestFinalizeSplitsAuthFromTransport:
+    """finalize_usage_transport_failure is the shared soft-fail entry point."""
+
+    async def test_auth_failure_returns_401_and_never_reports_outage(self) -> None:
+        monitor = UsageUpstreamMonitor()
+        fake_sdk = MagicMock()
+        with patch.dict("sys.modules", {"sentry_sdk": fake_sdk}):
+            for _ in range(USAGE_OUTAGE_CONSECUTIVE_THRESHOLD * 3):
+                response = await finalize_usage_transport_failure(
+                    _status_error(400), attempts=1, monitor=monitor
+                )
+                assert response.status_code == 401
+        fake_sdk.capture_message.assert_not_called()
+        assert monitor.consecutive_failures == 0
+
+    async def test_transport_failure_still_escalates(self) -> None:
+        monitor = UsageUpstreamMonitor()
+        fake_sdk = MagicMock()
+        with patch.dict("sys.modules", {"sentry_sdk": fake_sdk}):
+            for _ in range(USAGE_OUTAGE_CONSECUTIVE_THRESHOLD):
+                response = await finalize_usage_transport_failure(
+                    httpx.ConnectError("down"), attempts=1, monitor=monitor
+                )
+                assert response.status_code == 503
+        fake_sdk.capture_message.assert_called_once()
+
+    async def test_auth_then_transport_are_tracked_independently(self) -> None:
+        monitor = UsageUpstreamMonitor()
+        await finalize_usage_transport_failure(
+            _status_error(401), attempts=1, monitor=monitor
+        )
+        assert monitor.consecutive_failures == 0
+        await finalize_usage_transport_failure(
+            httpx.ReadTimeout("slow"), attempts=1, monitor=monitor
+        )
+        assert monitor.consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+class TestFetchUsageLimitsAuthRejection:
+    """Amazon Q rejecting our bearer token is a credential problem."""
+
+    @pytest.mark.parametrize("status", [401, 403])
+    async def test_auth_reject_status_sets_auth_required(self, status: int) -> None:
+        async def rejecting(url: str, headers: dict[str, str]):
+            request = httpx.Request("GET", url)
+            return httpx.Response(status, request=request, text="denied")
+
+        monitor = UsageUpstreamMonitor()
+        result = await fetch_usage_limits(
+            url="https://example.test/usage",
+            headers={},
+            proxy=None,
+            monitor=monitor,
+            transport_get=rejecting,
+        )
+        assert result.auth_required is True
+        assert result.attempts == 1  # never retried
+        assert result.reported_outage is False
+        assert monitor.consecutive_failures == 0
+
+    async def test_non_auth_non_retryable_status_is_forwarded(self) -> None:
+        async def bad_request(url: str, headers: dict[str, str]):
+            request = httpx.Request("GET", url)
+            return httpx.Response(400, request=request, text="bad param")
+
+        result = await fetch_usage_limits(
+            url="https://example.test/usage",
+            headers={},
+            proxy=None,
+            monitor=UsageUpstreamMonitor(),
+            transport_get=bad_request,
+        )
+        assert result.auth_required is False
+        assert result.response is not None
+        assert result.response.status_code == 400
+
+    async def test_success_leaves_auth_required_false(self) -> None:
+        async def ok(url: str, headers: dict[str, str]):
+            request = httpx.Request("GET", url)
+            return httpx.Response(200, request=request, json={"ok": True})
+
+        result = await fetch_usage_limits(
+            url="https://example.test/usage",
+            headers={},
+            proxy=None,
+            monitor=UsageUpstreamMonitor(),
+            transport_get=ok,
+        )
+        assert result.auth_required is False
+
+
+class TestReportUsageAuthRequired:
+    """Signed-out users leave a breadcrumb, never an error event."""
+
+    def test_does_not_capture_an_error_event(self) -> None:
+        fake_sdk = MagicMock()
+        with patch.dict("sys.modules", {"sentry_sdk": fake_sdk}):
+            report_usage_auth_required(_status_error(400))
+        fake_sdk.capture_message.assert_not_called()
+        fake_sdk.capture_exception.assert_not_called()
+        fake_sdk.add_breadcrumb.assert_called_once()
+
+    def test_survives_missing_sentry_sdk(self) -> None:
+        with patch.dict("sys.modules", {"sentry_sdk": None}):
+            report_usage_auth_required(_status_error(400))  # must not raise
+
+    def test_survives_breadcrumb_failure(self) -> None:
+        fake_sdk = MagicMock()
+        fake_sdk.add_breadcrumb.side_effect = RuntimeError("sdk broken")
+        with patch.dict("sys.modules", {"sentry_sdk": fake_sdk}):
+            report_usage_auth_required(_status_error(400))  # must not raise
 
 
 class TestBuildUsageNetworkErrorResponse:
@@ -69,13 +344,42 @@ class TestObtainUsageAccessToken:
         assert error.status_code == 503
         assert b"usage_upstream_unreachable" in error.body
 
-    async def test_value_error_propagates(self) -> None:
+    async def test_value_error_returns_auth_required_not_500(self) -> None:
+        """Unrecoverable refresh is a signed-out user, not a gateway bug.
+
+        ValueError used to propagate and surface as HTTP 500.
+        """
         auth = MagicMock()
         auth.get_access_token = AsyncMock(
             side_effect=ValueError("Token expired and refresh failed")
         )
-        with pytest.raises(ValueError, match="Token expired"):
-            await obtain_usage_access_token(auth, monitor=UsageUpstreamMonitor())
+        monitor = UsageUpstreamMonitor()
+        token, error = await obtain_usage_access_token(auth, monitor=monitor)
+        assert token is None
+        assert error is not None
+        assert error.status_code == 401
+        assert USAGE_AUTH_REQUIRED_CODE.encode() in error.body
+        assert b"login_required" in error.body
+        # Credential failures must not look like an outage streak.
+        assert monitor.consecutive_failures == 0
+
+    async def test_oidc_400_returns_auth_required_and_skips_outage_streak(self) -> None:
+        """The KIRO-GATEWAY-TRAY-D root cause: invalid_grant is not an outage."""
+        request = httpx.Request("POST", "https://oidc.ap-northeast-1.amazonaws.com/token")
+        response = httpx.Response(400, request=request, text="invalid_grant")
+        auth = MagicMock()
+        auth.get_access_token = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "Client error '400 Bad Request'", request=request, response=response
+            )
+        )
+        monitor = UsageUpstreamMonitor()
+        token, error = await obtain_usage_access_token(auth, monitor=monitor)
+        assert token is None
+        assert error is not None
+        assert error.status_code == 401
+        assert USAGE_AUTH_REQUIRED_CODE.encode() in error.body
+        assert monitor.consecutive_failures == 0
 
 
 @pytest.mark.asyncio
@@ -230,3 +534,31 @@ def test_report_usage_outage_captures_sentry_message() -> None:
         report_usage_outage(httpx.ConnectError("down"), consecutive=5, attempts=3)
     fake_sdk.capture_message.assert_called_once()
     scope.set_tag.assert_any_call("usage_outage", "true")
+
+
+@pytest.mark.parametrize(
+    "exc,expected_cause",
+    [
+        (httpx.ConnectError("[Errno 8] nodename nor servname provided"), "dns"),
+        (httpx.ConnectError("[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE]"), "tls"),
+        (httpx.ReadTimeout("slow"), "timeout"),
+        (httpx.ConnectError("All connection attempts failed"), "connect"),
+    ],
+)
+def test_report_usage_outage_fingerprints_by_cause(
+    exc: Exception, expected_cause: str
+) -> None:
+    """One shared fingerprint made DNS/TLS/timeout failures un-triageable."""
+    fake_sdk = MagicMock()
+    scope = MagicMock()
+    fake_sdk.new_scope.return_value.__enter__.return_value = scope
+    with patch.dict("sys.modules", {"sentry_sdk": fake_sdk}):
+        report_usage_outage(exc, consecutive=5, attempts=3)
+    assert scope.fingerprint == ["kiro-usage-upstream-outage", expected_cause]
+    scope.set_tag.assert_any_call("usage_outage_cause", expected_cause)
+
+
+def test_report_usage_outage_survives_missing_sentry_sdk() -> None:
+    """Reporter must never break /usage when the SDK is absent."""
+    with patch.dict("sys.modules", {"sentry_sdk": None}):
+        report_usage_outage(httpx.ConnectError("down"), consecutive=5, attempts=3)

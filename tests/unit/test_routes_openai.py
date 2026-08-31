@@ -253,9 +253,129 @@ class TestHealthEndpoint:
         """
         print("Action: GET /health without auth headers...")
         response = test_client.get("/health")
-        
+
         print(f"Status: {response.status_code}")
         assert response.status_code == 200
+
+
+class TestHealthAccountState:
+    """/health must tell "ready" from "needs re-login" without hitting /usage.
+
+    The tray polls /health already; exposing credential state here means a
+    signed-out user is detected without a single upstream call.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore_account_manager(self, test_client):
+        """Swap in fakes for the test only.
+
+        Lifespan shutdown awaits the real manager's _save_state(), so leaving a
+        MagicMock in app.state would break teardown for every later test.
+        """
+        state = test_client.app.state
+        had = hasattr(state, "account_manager")
+        original = getattr(state, "account_manager", None)
+        yield
+        if had:
+            state.account_manager = original
+        elif hasattr(state, "account_manager"):
+            delattr(state, "account_manager")
+
+    @staticmethod
+    def _manager(*, ready: bool, failure: dict | None = None):
+        manager = MagicMock()
+        manager.has_initialized_account.return_value = ready
+        manager.describe_init_failure.return_value = failure or {}
+        return manager
+
+    def test_ready_account_reports_healthy(self, test_client):
+        test_client.app.state.account_manager = self._manager(ready=True)
+        response = test_client.get("/health")
+
+        body = response.json()
+        assert response.status_code == 200
+        assert body["status"] == "healthy"
+        assert body["account"] == {"status": "ready", "login_required": False}
+
+    def test_expired_credentials_report_degraded_with_login_required(self, test_client):
+        test_client.app.state.account_manager = self._manager(
+            ready=False,
+            failure={
+                "code": "account_auth_required",
+                "message": "Kiro credentials are expired or invalid.",
+                "account_count": 1,
+                "errors": {},
+            },
+        )
+        response = test_client.get("/health")
+
+        body = response.json()
+        # 200 on purpose: non-200 tells supervisors to restart, which is the
+        # crash loop degraded mode exists to prevent.
+        assert response.status_code == 200
+        assert body["status"] == "degraded"
+        assert body["account"]["code"] == "account_auth_required"
+        assert body["account"]["login_required"] is True
+
+    def test_missing_credentials_also_require_login(self, test_client):
+        test_client.app.state.account_manager = self._manager(
+            ready=False,
+            failure={
+                "code": "account_not_configured",
+                "message": "No Kiro accounts are configured.",
+                "account_count": 0,
+                "errors": {},
+            },
+        )
+        body = test_client.get("/health").json()
+
+        assert body["status"] == "degraded"
+        assert body["account"]["code"] == "account_not_configured"
+        assert body["account"]["login_required"] is True
+
+    def test_transient_init_failure_does_not_ask_for_login(self, test_client):
+        """A proxy failure is not the user's login problem — do not prompt."""
+        test_client.app.state.account_manager = self._manager(
+            ready=False,
+            failure={
+                "code": "account_init_failed",
+                "message": "No Kiro account could be initialized.",
+                "account_count": 1,
+                "errors": {"a": "ConnectError: proxy down"},
+            },
+        )
+        body = test_client.get("/health").json()
+
+        assert body["status"] == "degraded"
+        assert body["account"]["code"] == "account_init_failed"
+        assert body["account"]["login_required"] is False
+
+    def test_health_state_is_recomputed_not_cached_from_startup(self, test_client):
+        """Signing in mid-session must flip /health back to healthy."""
+        manager = self._manager(
+            ready=False,
+            failure={
+                "code": "account_auth_required",
+                "message": "expired",
+                "account_count": 1,
+                "errors": {},
+            },
+        )
+        test_client.app.state.account_manager = manager
+        assert test_client.get("/health").json()["status"] == "degraded"
+
+        manager.has_initialized_account.return_value = True
+        assert test_client.get("/health").json()["status"] == "healthy"
+
+    def test_missing_account_manager_falls_back_to_plain_body(self, test_client):
+        """Health must not 500 before the account manager exists."""
+        if hasattr(test_client.app.state, "account_manager"):
+            delattr(test_client.app.state, "account_manager")
+        response = test_client.get("/health")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "healthy"
+        assert "account" not in response.json()
 
 
 # =============================================================================

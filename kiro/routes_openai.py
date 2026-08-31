@@ -34,6 +34,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
+from kiro.auth_state import (
+    ACCOUNT_AUTH_REQUIRED_CODE,
+    NO_CREDENTIALS_CODE,
+)
 from kiro.config import (
     PROXY_API_KEY,
     APP_VERSION,
@@ -113,18 +117,50 @@ async def root():
 
 
 @router.get("/health")
-async def health():
+async def health(request: Request):
     """
-    Detailed health check.
-    
+    Detailed health check, including Kiro credential state.
+
+    The HTTP status stays 200 even when no account is usable: the process *is*
+    serving, and supervisors treat non-200 as "restart me", which is exactly the
+    crash loop we avoid by starting in degraded mode. Clients read ``status`` and
+    ``account`` to tell "ready" from "needs re-login".
+
+    Args:
+        request: FastAPI request used to access application state.
+
     Returns:
-        Status, timestamp and version
+        Status, timestamp, version, and — when degraded — an ``account`` block
+        with a stable ``code``, an actionable ``message``, and ``login_required``.
     """
-    return {
+    body = {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": APP_VERSION
+        "version": APP_VERSION,
     }
+
+    account_manager = getattr(request.app.state, "account_manager", None)
+    if account_manager is None:
+        return body
+
+    if account_manager.has_initialized_account():
+        body["account"] = {"status": "ready", "login_required": False}
+        return body
+
+    # Re-describe rather than trusting the startup snapshot: lazy init may have
+    # recovered (user signed in) or newly failed since startup.
+    failure = account_manager.describe_init_failure()
+    body["status"] = "degraded"
+    body["account"] = {
+        "status": "unavailable",
+        "code": failure["code"],
+        "message": failure["message"],
+        "login_required": failure["code"] in (
+            ACCOUNT_AUTH_REQUIRED_CODE,
+            NO_CREDENTIALS_CODE,
+        ),
+    }
+    return body
 
 async def get_available_model_ids(request: Request) -> list[str]:
     """Return the shared on-demand model list for all API compatibility routes.

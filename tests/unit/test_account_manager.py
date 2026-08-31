@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import httpx
+
 from kiro.account_manager import (
     Account,
     AccountStats,
@@ -755,6 +757,87 @@ class TestAccountManagerInitializeAccount:
         assert "kiro-s-5" in account.model_resolver.get_available_models()
         assert "kiro-o-5" in account.model_resolver.get_available_models()
         assert "auto-kiro" not in account.model_resolver.get_available_models()
+        # A successful init must leave no stale failure reason behind.
+        assert account.last_init_error is None
+        assert account.last_init_auth_failure is False
+
+    @staticmethod
+    def _single_json_account(tmp_path) -> tuple[AccountManager, str]:
+        """Build a manager with one JSON-credential account, not yet initialized."""
+        test_json = tmp_path / "test.json"
+        test_json.write_text(json.dumps({
+            "refreshToken": "test_token",
+            "accessToken": "expired_access",
+            "expiresAt": "2000-01-01T00:00:00.000Z",
+            "region": "us-east-1",
+        }))
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "json", "path": str(test_json), "enabled": True}
+        ]))
+        manager = AccountManager(str(creds_file), str(tmp_path / "state.json"))
+        return manager, str(test_json.resolve())
+
+    @pytest.mark.asyncio
+    async def test_initialize_records_auth_failure_cause(self, tmp_path):
+        """An expired login must be recorded as an auth failure, with its cause.
+
+        Without this the startup path could only say "failed", which is why
+        Sentry KIRO-GATEWAY-TRAY-W was unactionable.
+        """
+        manager, account_id = self._single_json_account(tmp_path)
+        await manager.load_credentials()
+
+        request = httpx.Request("POST", "https://oidc.test/token")
+        response = httpx.Response(400, request=request, text="invalid_grant")
+        with patch.object(
+            KiroAuthManager,
+            "get_access_token",
+            new=AsyncMock(side_effect=httpx.HTTPStatusError(
+                "400", request=request, response=response
+            )),
+        ):
+            success = await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        assert success is False
+        assert account.last_init_auth_failure is True
+        assert "HTTPStatusError" in account.last_init_error
+
+    @pytest.mark.asyncio
+    async def test_initialize_records_transient_failure_as_non_auth(self, tmp_path):
+        """A proxy failure must not be blamed on the user's credentials."""
+        manager, account_id = self._single_json_account(tmp_path)
+        await manager.load_credentials()
+
+        with patch.object(
+            KiroAuthManager,
+            "get_access_token",
+            new=AsyncMock(side_effect=httpx.ConnectError("All connection attempts failed")),
+        ):
+            success = await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        assert success is False
+        assert account.last_init_auth_failure is False
+        assert "ConnectError" in account.last_init_error
+
+    @pytest.mark.asyncio
+    async def test_initialize_treats_unrecoverable_refresh_as_auth_failure(self, tmp_path):
+        """ValueError from get_access_token means refresh is exhausted."""
+        manager, account_id = self._single_json_account(tmp_path)
+        await manager.load_credentials()
+
+        with patch.object(
+            KiroAuthManager,
+            "get_access_token",
+            new=AsyncMock(side_effect=ValueError("Token expired and refresh failed")),
+        ):
+            success = await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        assert success is False
+        assert account.last_init_auth_failure is True
 
 
 
@@ -1150,6 +1233,112 @@ class TestAccountManagerGetFirstAccount:
         # Act & Assert
         with pytest.raises(RuntimeError, match="No initialized accounts available"):
             manager.get_first_account()
+
+
+class TestAccountManagerDescribeInitFailure:
+    """describe_init_failure() must separate the three failure causes.
+
+    Startup previously raised a single opaque "Failed to initialize any account",
+    so neither the user nor Sentry could tell an expired login from an empty
+    credentials file from a proxy failure (Sentry KIRO-GATEWAY-TRAY-W).
+    """
+
+    @staticmethod
+    def _manager(tmp_path) -> AccountManager:
+        return AccountManager(
+            credentials_file=str(tmp_path / "creds.json"),
+            state_file=str(tmp_path / "state.json"),
+        )
+
+    def test_no_accounts_reports_not_configured(self, tmp_path):
+        manager = self._manager(tmp_path)
+
+        result = manager.describe_init_failure()
+
+        assert result["code"] == "account_not_configured"
+        assert result["account_count"] == 0
+        assert result["errors"] == {}
+        assert "Sign in to Kiro" in result["message"]
+
+    def test_all_auth_failures_report_auth_required(self, tmp_path):
+        manager = self._manager(tmp_path)
+        for account_id in ("a", "b"):
+            account = Account(id=account_id)
+            account.last_init_error = "HTTPStatusError: 400 invalid_grant"
+            account.last_init_auth_failure = True
+            manager._accounts[account_id] = account
+
+        result = manager.describe_init_failure()
+
+        assert result["code"] == "account_auth_required"
+        assert result["account_count"] == 2
+        assert set(result["errors"]) == {"a", "b"}
+        assert "sign in again" in result["message"]
+
+    def test_transient_failure_is_not_auth_required(self, tmp_path):
+        manager = self._manager(tmp_path)
+        account = Account(id="a")
+        account.last_init_error = "ConnectError: proxy down"
+        account.last_init_auth_failure = False
+        manager._accounts["a"] = account
+
+        result = manager.describe_init_failure()
+
+        assert result["code"] == "account_init_failed"
+        assert "network/proxy" in result["message"]
+
+    def test_mixed_causes_do_not_blame_the_user(self, tmp_path):
+        """One transient failure means we must not claim credentials are bad."""
+        manager = self._manager(tmp_path)
+        auth_account = Account(id="auth")
+        auth_account.last_init_error = "HTTPStatusError: 400"
+        auth_account.last_init_auth_failure = True
+        net_account = Account(id="net")
+        net_account.last_init_error = "ConnectError: dns"
+        net_account.last_init_auth_failure = False
+        manager._accounts = {"auth": auth_account, "net": net_account}
+
+        result = manager.describe_init_failure()
+
+        assert result["code"] == "account_init_failed"
+        assert set(result["errors"]) == {"auth", "net"}
+
+    def test_accounts_never_attempted_are_not_reported_as_auth_failures(self, tmp_path):
+        """No attempt yet means no error text — must not imply a bad login."""
+        manager = self._manager(tmp_path)
+        manager._accounts["fresh"] = Account(id="fresh")
+
+        result = manager.describe_init_failure()
+
+        assert result["code"] == "account_init_failed"
+        assert result["errors"] == {}
+
+
+class TestAccountManagerHasInitializedAccount:
+    """has_initialized_account() backs the /health readiness flag."""
+
+    @staticmethod
+    def _manager(tmp_path) -> AccountManager:
+        return AccountManager(
+            credentials_file=str(tmp_path / "creds.json"),
+            state_file=str(tmp_path / "state.json"),
+        )
+
+    def test_false_with_no_accounts(self, tmp_path):
+        assert self._manager(tmp_path).has_initialized_account() is False
+
+    def test_false_when_accounts_lack_auth_manager(self, tmp_path):
+        manager = self._manager(tmp_path)
+        manager._accounts["a"] = Account(id="a")
+        assert manager.has_initialized_account() is False
+
+    def test_true_when_any_account_is_initialized(self, tmp_path):
+        manager = self._manager(tmp_path)
+        manager._accounts["a"] = Account(id="a")
+        ready = Account(id="b")
+        ready.auth_manager = Mock()
+        manager._accounts["b"] = ready
+        assert manager.has_initialized_account() is True
 
 
 class TestAccountManagerGetAllAvailableModels:

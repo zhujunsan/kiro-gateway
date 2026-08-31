@@ -614,14 +614,16 @@ class TestLifespanAccountManagerInit:
         print("✓ Full circle initialization was attempted")
     
     @pytest.mark.asyncio
-    async def test_lifespan_exit_if_no_accounts(self, tmp_path, monkeypatch):
+    async def test_lifespan_degrades_if_no_accounts(self, tmp_path, monkeypatch):
         """
-        Test 102: RuntimeError если нет аккаунтов в credentials.json
-        
-        What it does: Verifies application raises RuntimeError if no accounts configured
-        Purpose: Prevent startup with empty configuration
+        Test 102: Degraded start when credentials.json configures no accounts.
+
+        What it does: Starts lifespan with an empty account pool and asserts the
+            app serves anyway, exposing account_not_configured.
+        Purpose: Crashing here put the supervisor in a respawn loop and gave the
+            user no actionable reason. Serving keeps /health reachable.
         """
-        print("\n=== Test 102: RuntimeError if no accounts configured ===")
+        print("\n=== Test 102: Degraded start if no accounts configured ===")
         
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
@@ -638,30 +640,40 @@ class TestLifespanAccountManagerInit:
         mock_manager = AsyncMock()
         mock_manager._accounts = {}  # Empty accounts dict
         mock_manager._current_account_index = 0
-        
+        mock_manager.describe_init_failure = MagicMock(return_value={
+            "code": "account_not_configured",
+            "message": "No Kiro accounts are configured.",
+            "account_count": 0,
+            "errors": {},
+        })
+
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
                 mock_client = AsyncMock()
                 mock_client_class.return_value = mock_client
                 
                 from main import lifespan, app
-                
-                # Assert: RuntimeError is raised
-                with pytest.raises(RuntimeError, match="No accounts configured"):
-                    async with lifespan(app):
-                        pass
-                
-                print("✓ RuntimeError was raised for empty accounts")
-    
+
+                # Act: lifespan must complete without raising
+                async with lifespan(app):
+                    startup = app.state.account_startup
+
+                # Assert: degraded state recorded, not a crash
+                assert startup is not None
+                assert startup["code"] == "account_not_configured"
+                print("✓ Started degraded with account_not_configured")
+
     @pytest.mark.asyncio
-    async def test_lifespan_exit_if_all_failed(self, tmp_path, monkeypatch):
+    async def test_lifespan_degrades_if_all_failed(self, tmp_path, monkeypatch):
         """
-        Test 103: RuntimeError если все аккаунты не инициализировались
-        
-        What it does: Verifies application raises RuntimeError if all accounts fail to initialize
-        Purpose: Prevent startup without any working accounts
+        Test 103: Degraded start when every account fails to initialize.
+
+        What it does: All accounts fail init; asserts lifespan still yields and
+            records the auth-required reason from describe_init_failure().
+        Purpose: A signed-out user must get an actionable message, not a crash
+            loop (Sentry KIRO-GATEWAY-TRAY-W).
         """
-        print("\n=== Test 103: RuntimeError if all accounts failed ===")
+        print("\n=== Test 103: Degraded start if all accounts failed ===")
         
         # Arrange: Patch constants
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
@@ -682,20 +694,30 @@ class TestLifespanAccountManagerInit:
         }
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=False)  # All fail
-        
+        mock_manager.describe_init_failure = MagicMock(return_value={
+            "code": "account_auth_required",
+            "message": "Kiro credentials are expired or invalid.",
+            "account_count": 2,
+            "errors": {"account1": "HTTPStatusError: 400"},
+        })
+
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
                 mock_client = AsyncMock()
                 mock_client_class.return_value = mock_client
                 
                 from main import lifespan, app
-                
-                # Assert: RuntimeError is raised
-                with pytest.raises(RuntimeError, match="Failed to initialize any account"):
-                    async with lifespan(app):
-                        pass
-                
-                print("✓ RuntimeError was raised when all accounts failed")
+
+                # Act: lifespan must complete without raising
+                async with lifespan(app):
+                    startup = app.state.account_startup
+
+                # Assert: both accounts tried, degraded reason recorded
+                assert mock_manager._initialize_account.await_count == 2
+                assert startup is not None
+                assert startup["code"] == "account_auth_required"
+                print("✓ Started degraded with account_auth_required")
+
     
     @pytest.mark.asyncio
     async def test_lifespan_save_initial_state(self, tmp_path, monkeypatch):
