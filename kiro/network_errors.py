@@ -33,9 +33,11 @@ Architecture:
 import socket
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import httpx
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
 from loguru import logger
 
 
@@ -77,6 +79,226 @@ class NetworkErrorInfo:
     technical_details: str
     is_retryable: bool
     suggested_http_code: int
+
+
+ApiErrorFormat = Literal["openai", "anthropic"]
+
+
+class NetworkHTTPException(HTTPException):
+    """HTTP exception carrying a sanitized Kiro upstream network failure.
+
+    Attributes:
+        error_info: Original classified network information, when available.
+        error_code: Stable machine-readable network failure code.
+        user_message: Sanitized message safe to return to API clients.
+    """
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        error_code: str,
+        user_message: str,
+        error_info: Optional[NetworkErrorInfo] = None,
+    ) -> None:
+        """Initialize a client-safe upstream network exception.
+
+        Args:
+            status_code: HTTP 502 for connection failures or 504 for timeouts.
+            error_code: Stable machine-readable network failure code.
+            user_message: Sanitized, actionable message for API clients.
+            error_info: Optional detailed classification retained for internal use.
+        """
+        super().__init__(status_code=status_code, detail=user_message)
+        self.error_info = error_info
+        self.error_code = error_code
+        self.user_message = user_message
+
+
+def _client_network_message(error_info: NetworkErrorInfo) -> str:
+    """Build a concise, actionable message without technical details.
+
+    Args:
+        error_info: Classified network failure.
+
+    Returns:
+        Client-safe message identifying the Kiro upstream connection failure.
+    """
+    action = (
+        error_info.troubleshooting_steps[0]
+        if error_info.troubleshooting_steps
+        else "Check the gateway network and proxy settings, then try again"
+    )
+    return (
+        "Kiro Gateway could not connect to the Kiro upstream service: "
+        f"{error_info.user_message} {action}."
+    )
+
+
+def network_http_exception(error_info: NetworkErrorInfo) -> NetworkHTTPException:
+    """Create a typed HTTP exception from classified network information.
+
+    Args:
+        error_info: Classified network failure retained for failover and logging.
+
+    Returns:
+        Typed exception containing only client-safe response text.
+    """
+    return NetworkHTTPException(
+        status_code=error_info.suggested_http_code,
+        error_code=error_info.category.value,
+        user_message=_client_network_message(error_info),
+        error_info=error_info,
+    )
+
+
+def upstream_network_exception(
+    status_code: int,
+    error_code: str,
+    message: str,
+) -> NetworkHTTPException:
+    """Create a typed exception for an already-classified upstream failure.
+
+    Args:
+        status_code: HTTP 502 or 504 selected by the transport classifier.
+        error_code: Stable transport failure code.
+        message: Existing client-safe failure description.
+
+    Returns:
+        Typed exception suitable for shared JSON and SSE formatting.
+    """
+    prefix = "Kiro Gateway could not receive a response from the Kiro upstream service: "
+    clean_message = message.strip() or "The upstream request failed. Please try again."
+    if clean_message.startswith("Kiro Gateway could not"):
+        user_message = clean_message
+    else:
+        user_message = f"{prefix}{clean_message}"
+    return NetworkHTTPException(
+        status_code=status_code,
+        error_code=error_code,
+        user_message=user_message,
+    )
+
+
+def network_exception_from_exception(
+    error: BaseException,
+) -> Optional[NetworkHTTPException]:
+    """Extract or synthesize a typed network failure from an exception.
+
+    Args:
+        error: Exception raised by request, collect, or streaming code.
+
+    Returns:
+        A typed network exception for recognized upstream transport failures,
+        otherwise ``None`` so ordinary exceptions retain their original type.
+    """
+    if isinstance(error, NetworkHTTPException):
+        return error
+
+    if isinstance(error, HTTPException) and error.status_code in (502, 504):
+        code = "upstream_timeout" if error.status_code == 504 else "upstream_connection_error"
+        return upstream_network_exception(error.status_code, code, str(error.detail))
+
+    from kiro.collect_errors import collect_failure_or_none
+
+    failure = collect_failure_or_none(error)
+    if failure is None:
+        return None
+    return upstream_network_exception(
+        failure.status_code,
+        failure.code,
+        failure.message,
+    )
+
+
+def build_network_error_body(
+    error: NetworkHTTPException,
+    format_type: ApiErrorFormat = "openai",
+) -> Dict[str, Any]:
+    """Build a standards-compatible API error body for a network failure.
+
+    Args:
+        error: Typed network exception to expose to the client.
+        format_type: Target API protocol, ``openai`` or ``anthropic``.
+
+    Returns:
+        OpenAI- or Anthropic-compatible top-level error object.
+    """
+    if format_type == "anthropic":
+        return {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": error.user_message,
+            },
+        }
+    return {
+        "error": {
+            "message": error.user_message,
+            "type": "server_error",
+            "code": error.error_code,
+            "param": None,
+        }
+    }
+
+
+def build_stream_error_body(
+    error: BaseException,
+    format_type: ApiErrorFormat = "openai",
+) -> Dict[str, Any]:
+    """Build a protocol error body after an SSE response has started.
+
+    Args:
+        error: Exception raised while producing the stream.
+        format_type: Target API protocol, ``openai`` or ``anthropic``.
+
+    Returns:
+        Protocol-compatible error body. Recognized transport failures retain
+        their actionable message and stable code; other failures remain generic.
+    """
+    network_error = network_exception_from_exception(error)
+    if network_error is not None:
+        return build_network_error_body(network_error, format_type)
+
+    if isinstance(error, HTTPException):
+        message = str(error.detail)
+        code: Any = error.status_code
+    else:
+        message = str(error).strip() or type(error).__name__
+        code = type(error).__name__
+
+    if format_type == "anthropic":
+        return {
+            "type": "error",
+            "error": {"type": "api_error", "message": message},
+        }
+    return {
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "code": code,
+            "param": None,
+        }
+    }
+
+
+def build_network_error_response(
+    error: NetworkHTTPException,
+    format_type: ApiErrorFormat = "openai",
+) -> JSONResponse:
+    """Build an HTTP JSON response for a typed network failure.
+
+    Args:
+        error: Typed network exception to return.
+        format_type: Target API protocol, ``openai`` or ``anthropic``.
+
+    Returns:
+        JSON response preserving the exception's 502 or 504 status.
+    """
+    return JSONResponse(
+        status_code=error.status_code,
+        content=build_network_error_body(error, format_type),
+    )
 
 
 def classify_network_error(error: Exception) -> NetworkErrorInfo:
@@ -357,67 +579,31 @@ def _classify_timeout_error(error: httpx.TimeoutException, technical_details: st
 def format_error_for_user(
     error_info: NetworkErrorInfo,
     format_type: str = "openai",
-    include_troubleshooting: bool = True
+    include_troubleshooting: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Formats NetworkErrorInfo for API response.
-    
-    Converts structured error information into the appropriate format
-    for OpenAI or Anthropic API responses.
-    
-    Args:
-        error_info: The classified error information
-        format_type: "openai" or "anthropic" format
-        include_troubleshooting: Whether to include troubleshooting steps
-    
-    Returns:
-        Dictionary formatted for API response
-    
-    Example:
-        >>> error_info = classify_network_error(exception)
-        >>> response = format_error_for_user(error_info, format_type="openai")
-        >>> return JSONResponse(status_code=502, content=response)
-    """
-    # Build the message
-    message = error_info.user_message
-    
-    if include_troubleshooting and error_info.troubleshooting_steps:
-        message += "\n\nTroubleshooting steps:\n"
-        for i, step in enumerate(error_info.troubleshooting_steps, 1):
-            message += f"{i}. {step}\n"
-    
-    # Format for OpenAI API
-    if format_type == "openai":
-        return {
-            "error": {
-                "message": message.strip(),
-                "type": "connectivity_error",
-                "code": error_info.category.value,
-                "param": None
-            }
-        }
-    
-    # Format for Anthropic API
-    elif format_type == "anthropic":
-        return {
-            "type": "error",
-            "error": {
-                "type": "connectivity_error",
-                "message": message.strip()
-            }
-        }
-    
-    # Generic format (fallback)
-    else:
-        return {
-            "error": {
-                "type": "connectivity_error",
-                "category": error_info.category.value,
-                "message": message.strip(),
-                "technical_details": error_info.technical_details
-            }
-        }
+    """Format classified network information for an API response.
 
+    Args:
+        error_info: Classified network failure.
+        format_type: ``openai``, ``anthropic``, or the generic fallback.
+        include_troubleshooting: Retained for API compatibility. Client responses
+            always use one concise actionable suggestion.
+
+    Returns:
+        Standards-compatible error body without technical details.
+    """
+    del include_troubleshooting
+    error = network_http_exception(error_info)
+    if format_type in ("openai", "anthropic"):
+        return build_network_error_body(error, format_type)
+    return {
+        "error": {
+            "message": error.user_message,
+            "type": "server_error",
+            "code": error.error_code,
+            "param": None,
+        }
+    }
 
 def get_short_error_message(error_info: NetworkErrorInfo) -> str:
     """

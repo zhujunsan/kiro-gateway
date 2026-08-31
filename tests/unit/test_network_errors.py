@@ -13,9 +13,13 @@ import httpx
 from kiro.network_errors import (
     ErrorCategory,
     NetworkErrorInfo,
+    NetworkHTTPException,
+    build_network_error_body,
     classify_network_error,
     format_error_for_user,
-    get_short_error_message
+    get_short_error_message,
+    network_http_exception,
+    upstream_network_exception,
 )
 
 
@@ -520,10 +524,10 @@ class TestFormatErrorForUser:
         assert "message" in formatted["error"]
         assert "type" in formatted["error"]
         assert "code" in formatted["error"]
-        assert formatted["error"]["type"] == "connectivity_error"
+        assert formatted["error"]["type"] == "server_error"
         assert formatted["error"]["code"] == "dns_resolution"
         assert "Step 1" in formatted["error"]["message"]
-        assert "Step 2" in formatted["error"]["message"]
+        assert "Step 2" not in formatted["error"]["message"]
     
     def test_format_openai_without_troubleshooting(self):
         """
@@ -544,8 +548,9 @@ class TestFormatErrorForUser:
         formatted = format_error_for_user(error_info, format_type="openai", include_troubleshooting=False)
         
         print("Verification: No troubleshooting steps in message...")
-        assert "Step 1" not in formatted["error"]["message"]
-        assert formatted["error"]["message"] == "Connection timeout"
+        assert "Step 1" in formatted["error"]["message"]
+        assert "Kiro Gateway could not connect" in formatted["error"]["message"]
+        assert "Technical info" not in formatted["error"]["message"]
     
     def test_format_anthropic_structure(self):
         """
@@ -571,13 +576,10 @@ class TestFormatErrorForUser:
         assert "error" in formatted
         assert "type" in formatted["error"]
         assert "message" in formatted["error"]
-        assert formatted["error"]["type"] == "connectivity_error"
+        assert formatted["error"]["type"] == "api_error"
     
-    def test_format_generic_includes_technical_details(self):
-        """
-        What it does: Verifies generic format includes technical details.
-        Purpose: Ensure debugging information is available in generic format.
-        """
+    def test_format_generic_omits_technical_details(self):
+        """Verify no API formatting path leaks internal transport details."""
         print("Setup: Creating NetworkErrorInfo...")
         error_info = NetworkErrorInfo(
             category=ErrorCategory.SSL_ERROR,
@@ -591,9 +593,9 @@ class TestFormatErrorForUser:
         print("Action: Formatting with generic format...")
         formatted = format_error_for_user(error_info, format_type="generic")
         
-        print("Verification: Technical details present...")
-        assert "technical_details" in formatted["error"]
-        assert formatted["error"]["technical_details"] == "ConnectError: SSL handshake failed"
+        print("Verification: Technical details are not exposed...")
+        assert "technical_details" not in formatted["error"]
+        assert "ConnectError: SSL handshake failed" not in str(formatted)
 
 
 class TestGetShortErrorMessage:
@@ -669,3 +671,48 @@ class TestNetworkErrorInfoDataclass:
         assert error_info.technical_details == "Technical details"
         assert error_info.is_retryable is True
         assert error_info.suggested_http_code == 502
+
+
+class TestNetworkHTTPException:
+    """Tests for typed network exceptions and standard API response bodies."""
+
+    def test_network_exception_preserves_info_without_leaking_details(self):
+        """Keep classification internally while exposing only safe text."""
+        error_info = NetworkErrorInfo(
+            category=ErrorCategory.DNS_RESOLUTION,
+            user_message="DNS resolution failed",
+            troubleshooting_steps=["Check your DNS settings"],
+            technical_details="socket.gaierror: secret internal hostname",
+            is_retryable=True,
+            suggested_http_code=502,
+        )
+
+        error = network_http_exception(error_info)
+        body = build_network_error_body(error, "openai")
+
+        assert isinstance(error, NetworkHTTPException)
+        assert error.error_info is error_info
+        assert error.status_code == 502
+        assert body == {
+            "error": {
+                "message": error.user_message,
+                "type": "server_error",
+                "code": "dns_resolution",
+                "param": None,
+            }
+        }
+        assert "Kiro upstream" in error.user_message
+        assert "secret internal hostname" not in str(body)
+
+    def test_timeout_builds_standard_anthropic_body(self):
+        """Use Anthropic's documented api_error shape while retaining HTTP 504."""
+        error = upstream_network_exception(
+            504, "first_token_timeout", "Model did not respond. Please try again."
+        )
+
+        body = build_network_error_body(error, "anthropic")
+
+        assert error.status_code == 504
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "api_error"
+        assert "Kiro upstream" in body["error"]["message"]

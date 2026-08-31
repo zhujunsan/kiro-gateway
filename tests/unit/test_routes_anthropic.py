@@ -2587,3 +2587,86 @@ class TestInvalidModelExpectedResponse:
         assert error["type"] == "invalid_request_error"
         assert "GET /v1/models" in error["message"]
         assert client.request_with_retry.await_count == 1
+
+
+class TestAnthropicNetworkErrors:
+    """Anthropic network failures use the documented error envelope."""
+
+    def test_legacy_timeout_returns_standard_anthropic_error(
+        self, test_client, valid_proxy_api_key
+    ):
+        """Return HTTP 504 with Anthropic api_error and actionable text."""
+        from kiro.network_errors import NetworkHTTPException
+
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(
+            side_effect=NetworkHTTPException(
+                status_code=504,
+                error_code="timeout_read",
+                user_message="Kiro Gateway could not receive a response from the Kiro upstream service: read timeout. Try again.",
+            )
+        )
+        client.close = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = False
+        try:
+            with patch("kiro.routes_anthropic.KiroHttpClient", return_value=client):
+                response = test_client.post(
+                    "/v1/messages",
+                    headers={"x-api-key": valid_proxy_api_key},
+                    json={
+                        "model": "claude-sonnet-4-5",
+                        "max_tokens": 32,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+
+        assert response.status_code == 504
+        assert response.json()["type"] == "error"
+        assert response.json()["error"]["type"] == "api_error"
+        assert "Kiro upstream" in response.json()["error"]["message"]
+        assert "detail" not in response.json()
+
+    @patch("kiro.routes_anthropic.stream_with_first_token_retry_anthropic")
+    @patch("kiro.routes_anthropic.KiroHttpClient")
+    def test_streaming_network_error_emits_anthropic_error_event(
+        self, mock_client_class, mock_stream_retry, test_client, valid_proxy_api_key
+    ):
+        """Preserve a stable network message in Anthropic SSE error events."""
+        from kiro.network_errors import NetworkHTTPException
+
+        async def mock_stream(*args, **kwargs):
+            yield 'event: message_start\ndata: {"type":"message_start"}\n\n'
+            raise NetworkHTTPException(
+                status_code=502,
+                error_code="connection_reset",
+                user_message="Kiro Gateway could not connect to the Kiro upstream service: connection reset. Try again.",
+            )
+
+        mock_stream_retry.side_effect = mock_stream
+        upstream = AsyncMock()
+        upstream.status_code = 200
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(return_value=upstream)
+        client.close = AsyncMock()
+        client.client = AsyncMock()
+        mock_client_class.return_value = client
+
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        assert "event: error" in response.text
+        assert '"type": "api_error"' in response.text or '"type":"api_error"' in response.text
+        assert "connection reset" in response.text
+        assert "NetworkHTTPException" not in response.text

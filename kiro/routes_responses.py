@@ -58,6 +58,12 @@ from kiro.response_store import (
     should_store_response,
 )
 from kiro.http_client import KiroHttpClient
+from kiro.network_errors import (
+    NetworkHTTPException,
+    build_network_error_response,
+    build_stream_error_body,
+    upstream_network_exception,
+)
 from kiro.utils import generate_conversation_id
 from kiro.routes_openai import verify_api_key
 from kiro.kiro_errors import (
@@ -271,17 +277,8 @@ async def _handle_success_response(
                 # causes Starlette RuntimeError (TRAY-M). Align with Anthropic:
                 # emit SSE error and end the stream gracefully.
                 try:
-                    error_msg = (
-                        str(e.detail)
-                        if isinstance(e, HTTPException)
-                        else (str(e) if str(e) else "(empty message)")
-                    )
-                    error_type = type(e).__name__
-                    status = getattr(e, "status_code", None)
-                    yield (
-                        f"event: error\n"
-                        f"data: {json.dumps({'type': 'error', 'error': {'type': error_type, 'message': error_msg, 'code': status}})}\n\n"
-                    )
+                    error_body = build_stream_error_body(e, "openai")
+                    yield f"event: error\ndata: {json.dumps(error_body)}\n\n"
                 except Exception:
                     pass
             finally:
@@ -397,6 +394,7 @@ async def create_response(request: Request, request_data: ResponsesRequest):
         last_error_message = None
         last_error_status = None
         last_error_info = None
+        last_network_error: NetworkHTTPException | None = None
         tried_accounts = set()
 
         for _attempt in range(max_attempts):
@@ -423,6 +421,8 @@ async def create_response(request: Request, request_data: ResponsesRequest):
                     return _error_json_response(
                         last_error_status, last_error_message, last_error_info
                     )
+                if last_network_error is not None:
+                    return build_network_error_response(last_network_error, "openai")
                 if len(all_accounts) == 1:
                     raise HTTPException(
                         status_code=last_error_status or 503,
@@ -492,6 +492,7 @@ async def create_response(request: Request, request_data: ResponsesRequest):
                 error_reason = None
                 error_info = None
                 last_error_info = None
+                last_network_error = None
                 try:
                     error_json = json.loads(error_text)
                     from kiro.kiro_errors import enhance_kiro_error
@@ -544,22 +545,25 @@ async def create_response(request: Request, request_data: ResponsesRequest):
                     break
                 continue
 
+            except NetworkHTTPException as e:
+                await http_client.close()
+                await account_manager.report_failure(
+                    account.id, request_data.model, ErrorType.RECOVERABLE,
+                    e.status_code, e.error_code,
+                )
+                last_network_error = e
+                last_error_info = None
+                last_error_message = e.user_message
+                last_error_status = e.status_code
+                if len(all_accounts) == 1:
+                    break
+                logger.warning(
+                    f"Network error on account {account.id}, trying next account"
+                )
+                continue
+
             except HTTPException as e:
                 await http_client.close()
-                if e.status_code in (502, 504):
-                    await account_manager.report_failure(
-                        account.id, request_data.model, ErrorType.RECOVERABLE,
-                        e.status_code, None,
-                    )
-                    last_error_message = str(e.detail)
-                    last_error_status = e.status_code
-                    if len(all_accounts) == 1:
-                        break
-                    logger.warning(
-                        f"Network error on account {account.id}, trying next account"
-                    )
-                    continue
-
                 logger.error(f"HTTP {e.status_code} - POST /v1/responses - {e.detail}")
                 if debug_logger:
                     debug_logger.flush_on_error(
@@ -583,7 +587,11 @@ async def create_response(request: Request, request_data: ResponsesRequest):
                         account.id, request_data.model, ErrorType.RECOVERABLE,
                         failure.status_code, failure.code,
                     )
-                    last_error_message = failure.message
+                    last_network_error = upstream_network_exception(
+                        failure.status_code, failure.code, failure.message
+                    )
+                    last_error_info = None
+                    last_error_message = last_network_error.user_message
                     last_error_status = failure.status_code
                     logger.warning(
                         f"HTTP {failure.status_code} - POST /v1/responses "
@@ -612,6 +620,9 @@ async def create_response(request: Request, request_data: ResponsesRequest):
                         phase=failure.phase,
                     )
                 raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+        if last_network_error is not None:
+            return build_network_error_response(last_network_error, "openai")
 
         if (
             last_error_info is not None
@@ -728,6 +739,19 @@ async def create_response(request: Request, request_data: ResponsesRequest):
             build_result=build_result,
         )
 
+    except NetworkHTTPException as e:
+        await http_client.close()
+        logger.warning("Network error (legacy mode, no failover available)")
+        logger.error(
+            f"HTTP {e.status_code} - upstream network error - {e.error_code}"
+        )
+        if debug_logger:
+            debug_logger.flush_on_error(
+                e.status_code, e.user_message, source="network",
+                code=e.error_code, phase="connect",
+            )
+        return build_network_error_response(e, "openai")
+
     except HTTPException as e:
         await http_client.close()
         if e.status_code in (502, 504):
@@ -760,7 +784,10 @@ async def create_response(request: Request, request_data: ResponsesRequest):
                     failure.status_code, failure.message,
                     source=failure.source, code=failure.code, phase=failure.phase,
                 )
-            raise HTTPException(status_code=failure.status_code, detail=failure.message)
+            network_error = upstream_network_exception(
+                failure.status_code, failure.code, failure.message
+            )
+            return build_network_error_response(network_error, "openai")
 
         logger.error(f"Internal error: {e}", exc_info=True)
         logger.error(f"HTTP 500 - POST /v1/responses - {str(e)[:100]}")

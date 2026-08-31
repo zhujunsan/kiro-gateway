@@ -2109,7 +2109,96 @@ class TestChatCompletionsStreamingErrorAfterStarted:
         body = response.text
         assert "did not respond within" in body
         assert '"type": "server_error"' in body or '"type":"server_error"' in body
+        assert "upstream_timeout" in body
+        assert '"param": null' in body or '"param":null' in body
         assert "data: [DONE]" in body
         # Must not surface Starlette's catch-all after yield+raise
         assert "RuntimeError" not in body
         assert "Unexpected message" not in body
+
+
+class TestChatCompletionsNetworkErrors:
+    """Network failures keep OpenAI structure across legacy and failover paths."""
+
+    @pytest.mark.parametrize(
+        ("status_code", "code"),
+        [(502, "dns_resolution"), (504, "timeout_connect")],
+    )
+    def test_legacy_network_error_returns_top_level_openai_error(
+        self, test_client, valid_proxy_api_key, status_code, code
+    ):
+        """Return a top-level OpenAI error instead of FastAPI detail."""
+        from kiro.network_errors import NetworkHTTPException
+
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(
+            side_effect=NetworkHTTPException(
+                status_code=status_code,
+                error_code=code,
+                user_message="Kiro Gateway could not connect to the Kiro upstream service. Try again.",
+            )
+        )
+        client.close = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = False
+        try:
+            with patch("kiro.routes_openai.KiroHttpClient", return_value=client):
+                response = test_client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                    json={
+                        "model": "claude-sonnet-4-5",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+
+        assert response.status_code == status_code
+        assert "detail" not in response.json()
+        assert response.json()["error"]["type"] == "server_error"
+        assert response.json()["error"]["code"] == code
+        assert response.json()["error"]["param"] is None
+
+    def test_multi_account_last_network_failure_is_not_generalized(
+        self, test_client, valid_proxy_api_key
+    ):
+        """Preserve the last network error after every account fails."""
+        from kiro.network_errors import NetworkHTTPException
+
+        manager = test_client.app.state.account_manager
+        account = manager.get_first_account()
+        manager._accounts["second-network-test"] = account
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(
+            side_effect=NetworkHTTPException(
+                status_code=502,
+                error_code="connection_refused",
+                user_message="Kiro Gateway could not connect to the Kiro upstream service: connection refused. Try again.",
+            )
+        )
+        client.close = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = True
+        try:
+            with patch.object(
+                manager, "get_next_account",
+                new=AsyncMock(side_effect=[account, account, None]),
+            ), patch.object(
+                manager, "report_failure", new=AsyncMock()
+            ), patch("kiro.routes_openai.KiroHttpClient", return_value=client):
+                response = test_client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                    json={
+                        "model": "claude-sonnet-4-5",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+            manager._accounts.pop("second-network-test", None)
+
+        assert response.status_code == 502
+        assert response.json()["error"]["code"] == "connection_refused"
+        assert "All accounts failed" not in response.text

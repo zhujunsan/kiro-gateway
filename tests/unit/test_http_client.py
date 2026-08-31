@@ -908,7 +908,8 @@ class TestKiroHttpClientStreamingTimeout:
         
         print(f"Verification: HTTPException with code 504...")
         assert exc_info.value.status_code == 504
-        assert str(FIRST_TOKEN_MAX_RETRIES) in exc_info.value.detail
+        assert exc_info.value.error_code == "timeout_read"
+        assert "Kiro upstream" in exc_info.value.detail
         
         print(f"Verification: Attempt count = FIRST_TOKEN_MAX_RETRIES ({FIRST_TOKEN_MAX_RETRIES})...")
         assert mock_client.send.call_count == FIRST_TOKEN_MAX_RETRIES
@@ -1108,7 +1109,9 @@ class TestKiroHttpClientStreamingTimeout:
         assert exc_info.value.status_code == 504
         print(f"Comparing detail: Expected timeout message with troubleshooting in '{exc_info.value.detail}'")
         assert "timeout" in exc_info.value.detail.lower()
-        assert "Troubleshooting" in exc_info.value.detail or "Technical details" in exc_info.value.detail
+        assert "Kiro upstream" in exc_info.value.detail
+        assert "Technical details" not in exc_info.value.detail
+        assert exc_info.value.error_code == "timeout_read"
     
     @pytest.mark.asyncio
     async def test_non_streaming_timeout_returns_502(self, mock_auth_manager_for_http):

@@ -408,6 +408,8 @@ class TestResponsesStreaming:
         assert "response.created" in body
         assert "event: error" in body
         assert "did not respond within" in body
+        assert "upstream_timeout" in body
+        assert '"type": "server_error"' in body or '"type":"server_error"' in body
         assert "RuntimeError" not in body
         assert "Unexpected message" not in body
 
@@ -488,3 +490,39 @@ class TestInvalidModelExpectedResponse:
         assert error["param"] == "model"
         assert "GET /v1/models" in error["message"]
         assert client.request_with_retry.await_count == 1
+
+
+class TestResponsesNetworkErrors:
+    """Responses uses OpenAI network error bodies before and after SSE starts."""
+
+    def test_legacy_502_returns_top_level_openai_error(
+        self, test_client, valid_proxy_api_key
+    ):
+        """Avoid FastAPI detail for a typed network exception."""
+        from kiro.network_errors import NetworkHTTPException
+
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(
+            side_effect=NetworkHTTPException(
+                status_code=502,
+                error_code="proxy_error",
+                user_message="Kiro Gateway could not connect to the Kiro upstream service through the proxy. Check proxy settings.",
+            )
+        )
+        client.close = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = False
+        try:
+            with patch("kiro.routes_responses.KiroHttpClient", return_value=client):
+                response = test_client.post(
+                    "/v1/responses",
+                    headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                    json={"model": "claude-sonnet-4-5", "input": "hello"},
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+
+        assert response.status_code == 502
+        assert "detail" not in response.json()
+        assert response.json()["error"]["type"] == "server_error"
+        assert response.json()["error"]["code"] == "proxy_error"

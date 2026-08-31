@@ -56,6 +56,12 @@ from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response
 from kiro.streaming_core import collect_with_first_token_retry
 from kiro.collect_errors import classify_collect_exception
 from kiro.http_client import KiroHttpClient
+from kiro.network_errors import (
+    NetworkHTTPException,
+    build_network_error_response,
+    build_stream_error_body,
+    upstream_network_exception,
+)
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
@@ -349,6 +355,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         last_error_message = None
         last_error_status = None
         last_error_info = None
+        last_network_error: NetworkHTTPException | None = None
         tried_accounts = set()  # Track tried accounts in current failover loop
         
         for attempt in range(MAX_ATTEMPTS):
@@ -379,6 +386,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         last_error_info, last_error_status
                     )
                     return JSONResponse(status_code=status, content=body)
+                if last_network_error is not None:
+                    return build_network_error_response(last_network_error, "openai")
                 if len(all_accounts) == 1:
                     # Single account - return original error with original status code
                     raise HTTPException(
@@ -483,18 +492,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                 # (TRAY-M). Align with Anthropic: emit SSE error
                                 # and end the stream gracefully.
                                 try:
-                                    error_msg = (
-                                        str(e.detail)
-                                        if isinstance(e, HTTPException)
-                                        else (str(e) if str(e) else "(empty message)")
-                                    )
-                                    error_payload = {
-                                        "error": {
-                                            "message": error_msg,
-                                            "type": "server_error",
-                                            "code": getattr(e, "status_code", None),
-                                        }
-                                    }
+                                    error_payload = build_stream_error_body(e, "openai")
                                     yield f"data: {json.dumps(error_payload)}\n\n"
                                     yield "data: [DONE]\n\n"
                                 except Exception:
@@ -572,6 +570,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     error_reason = None
                     error_info = None
                     last_error_info = None
+                    last_network_error = None
                     try:
                         error_json = json.loads(error_text)
                         from kiro.kiro_errors import enhance_kiro_error
@@ -643,28 +642,25 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         
                         continue  # Next iteration
             
+            except NetworkHTTPException as e:
+                await http_client.close()
+                await account_manager.report_failure(
+                    account.id, request_data.model, ErrorType.RECOVERABLE,
+                    e.status_code, e.error_code,
+                )
+                last_network_error = e
+                last_error_info = None
+                last_error_message = e.user_message
+                last_error_status = e.status_code
+                if len(all_accounts) == 1:
+                    break
+                logger.warning(
+                    f"Network error on account {account.id}, trying next account"
+                )
+                continue
+
             except HTTPException as e:
                 await http_client.close()
-                
-                # Network errors (502/504 from request_with_retry) = RECOVERABLE
-                # These are thrown ONLY for network-level issues (timeouts, connection errors)
-                # NOT for HTTP-level errors (which are returned as response objects)
-                if e.status_code in (502, 504):
-                    # Network error → try next account
-                    await account_manager.report_failure(
-                        account.id, request_data.model, ErrorType.RECOVERABLE,
-                        e.status_code, None
-                    )
-                    
-                    last_error_message = str(e.detail)
-                    last_error_status = e.status_code
-                    
-                    # Single account - no point in failover, break immediately
-                    if len(all_accounts) == 1:
-                        break
-                    
-                    logger.warning(f"Network error on account {account.id}, trying next account")
-                    continue  # Try next account
                 
                 # All other HTTPException (400, 500, etc.) = application errors
                 # These come from build_kiro_payload() or other places → re-raise immediately
@@ -688,7 +684,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         account.id, request_data.model, ErrorType.RECOVERABLE,
                         failure.status_code, failure.code
                     )
-                    last_error_message = failure.message
+                    last_network_error = upstream_network_exception(
+                        failure.status_code, failure.code, failure.message
+                    )
+                    last_error_info = None
+                    last_error_message = last_network_error.user_message
                     last_error_status = failure.status_code
                     logger.warning(
                         f"HTTP {failure.status_code} - POST /v1/chat/completions "
@@ -718,6 +718,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 )
                 raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
         
+        if last_network_error is not None:
+            return build_network_error_response(last_network_error, "openai")
+
         # All attempts exhausted. Model availability is expected client/account
         # feedback, not a gateway outage, and keeps its original HTTP 400.
         if (
@@ -915,18 +918,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     # HTTPException causes Starlette RuntimeError (TRAY-M).
                     # Align with Anthropic: emit SSE error and end the stream.
                     try:
-                        error_msg = (
-                            str(e.detail)
-                            if isinstance(e, HTTPException)
-                            else (str(e) if str(e) else "(empty message)")
-                        )
-                        error_payload = {
-                            "error": {
-                                "message": error_msg,
-                                "type": "server_error",
-                                "code": getattr(e, "status_code", None),
-                            }
-                        }
+                        error_payload = build_stream_error_body(e, "openai")
                         yield f"data: {json.dumps(error_payload)}\n\n"
                         yield "data: [DONE]\n\n"
                     except Exception:
@@ -995,6 +987,19 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             
             return JSONResponse(content=openai_response)
     
+    except NetworkHTTPException as e:
+        await http_client.close()
+        logger.warning("Network error (legacy mode, no failover available)")
+        logger.error(
+            f"HTTP {e.status_code} - upstream network error - {e.error_code}"
+        )
+        if debug_logger:
+            debug_logger.flush_on_error(
+                e.status_code, e.user_message, source="network",
+                code=e.error_code, phase="connect",
+            )
+        return build_network_error_response(e, "openai")
+
     except HTTPException as e:
         await http_client.close()
         
@@ -1030,7 +1035,10 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     failure.status_code, failure.message,
                     source=failure.source, code=failure.code, phase=failure.phase,
                 )
-            raise HTTPException(status_code=failure.status_code, detail=failure.message)
+            network_error = upstream_network_exception(
+                failure.status_code, failure.code, failure.message
+            )
+            return build_network_error_response(network_error, "openai")
 
         logger.error(f"Internal error: {e}", exc_info=True)
         # Log access log for internal error

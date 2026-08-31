@@ -37,7 +37,6 @@ import random
 from typing import Optional, Tuple
 
 import httpx
-from fastapi import HTTPException
 from loguru import logger
 
 from kiro.config import (
@@ -50,7 +49,13 @@ from kiro.config import (
 )
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
-from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
+from kiro.network_errors import (
+    NetworkErrorInfo,
+    NetworkHTTPException,
+    classify_network_error,
+    get_short_error_message,
+    network_http_exception,
+)
 from kiro.proxy import resolve_proxy
 from kiro.kiro_errors import INSUFFICIENT_MODEL_CAPACITY_REASON
 
@@ -279,7 +284,7 @@ class KiroHttpClient:
             httpx.Response with successful response
         
         Raises:
-            HTTPException: On failure after all attempts (502/504)
+            NetworkHTTPException: On network failure after all retry attempts.
         """
         # Determine the number of retry attempts
         # FIRST_TOKEN_TIMEOUT is used in streaming_openai.py, not here
@@ -427,36 +432,29 @@ class KiroHttpClient:
             )
             return last_response
         
-        # All attempts exhausted - provide detailed, user-friendly error message
-        if last_error_info:
-            # Use classified error information
-            error_message = last_error_info.user_message
-            
-            # Add troubleshooting steps
-            if last_error_info.troubleshooting_steps:
-                error_message += "\n\nTroubleshooting:\n"
-                for i, step in enumerate(last_error_info.troubleshooting_steps, 1):
-                    error_message += f"{i}. {step}\n"
-            
-            # Add technical details for debugging
-            error_message += f"\nTechnical details: {last_error_info.technical_details}"
-            
-            raise HTTPException(
-                status_code=last_error_info.suggested_http_code,
-                detail=error_message.strip()
+        # All attempts exhausted. Keep technical details in logs only and raise a
+        # typed exception so every API route can preserve the protocol shape.
+        if last_error_info is not None:
+            logger.error(
+                "Network retries exhausted [{}]: {}",
+                last_error_info.category.value,
+                last_error_info.technical_details,
             )
-        else:
-            # Fallback if no error was captured (shouldn't happen)
-            if stream:
-                raise HTTPException(
-                    status_code=504,
-                    detail=f"Streaming failed after {max_retries} attempts. Unknown error."
-                )
-            else:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Request failed after {max_retries} attempts. Unknown error."
-                )
+            raise network_http_exception(last_error_info)
+
+        # Defensive fallback: the retry loop should always capture a classified
+        # error before reaching here. Keep it typed and client-safe regardless.
+        status_code = 504 if stream else 502
+        error_code = "timeout" if stream else "connection_error"
+        raise NetworkHTTPException(
+            status_code=status_code,
+            error_code=error_code,
+            user_message=(
+                "Kiro Gateway could not connect to the Kiro upstream service "
+                f"after {max_retries} attempts. Check the gateway network and "
+                "proxy settings, then try again."
+            ),
+        )
     
     async def __aenter__(self) -> "KiroHttpClient":
         """Async context manager support."""
