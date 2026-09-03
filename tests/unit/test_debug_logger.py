@@ -792,6 +792,7 @@ class TestDebugSessionIsolation:
                 set_error_snapshot_callback(None)
 
     def test_classify_streaming_exception(self):
+        import httpx
         from kiro.debug_logger import classify_streaming_exception
 
         class FirstTokenTimeoutError(Exception):
@@ -841,6 +842,16 @@ class TestDebugSessionIsolation:
 
         src, code, phase, st = classify_streaming_exception(RuntimeError("boom"))
         assert src == "gateway" and code == "streaming_error"
+
+        src, code, phase, st = classify_streaming_exception(httpx.PoolTimeout("full"))
+        assert (src, code, phase, st) == ("network", "pool_exhausted", "connect", 503)
+
+        request = httpx.Request("POST", "https://oidc.test/token")
+        response = httpx.Response(400, request=request)
+        src, code, phase, st = classify_streaming_exception(
+            httpx.HTTPStatusError("invalid_grant", request=request, response=response)
+        )
+        assert (src, code, phase, st) == ("auth", "login_required", "auth", 401)
 
     def test_callback_failure_does_not_raise(self, tmp_path):
         def bad_cb(_snap):

@@ -26,6 +26,14 @@ import httpx
 USAGE_AUTH_REQUIRED_CODE = "usage_auth_required"
 ACCOUNT_AUTH_REQUIRED_CODE = "account_auth_required"
 NO_CREDENTIALS_CODE = "account_not_configured"
+LOGIN_REQUIRED_CODE = "login_required"
+
+# Shared by /usage, chat, messages, and responses so every surface tells the
+# user the same next step instead of a generic 500.
+LOGIN_REQUIRED_MESSAGE = (
+    "Kiro credentials are expired or missing. Open Kiro (or run "
+    "'kiro-cli login') and sign in again, then retry."
+)
 
 # HTTP statuses the IdP uses for "these credentials are no longer valid".
 # 400 is what AWS SSO OIDC returns for invalid_grant / invalid_client.

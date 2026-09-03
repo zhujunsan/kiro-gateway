@@ -51,7 +51,7 @@ from kiro.streaming_responses import (
     collect_stream_response,
 )
 from kiro.streaming_core import collect_with_first_token_retry
-from kiro.collect_errors import classify_collect_exception
+from kiro.collect_errors import classify_collect_exception, immediate_collect_response
 from kiro.response_store import (
     chain_input_with_previous,
     get_response_store,
@@ -62,6 +62,7 @@ from kiro.network_errors import (
     NetworkHTTPException,
     build_network_error_response,
     build_stream_error_body,
+    should_failover_network_error,
     upstream_network_exception,
 )
 from kiro.utils import generate_conversation_id
@@ -455,12 +456,9 @@ async def create_response(request: Request, request_data: ResponsesRequest):
             url = f"{auth_manager.api_host}/generateAssistantResponse"
             logger.debug(f"Kiro API URL: {url} (account: {account.id})")
 
-            if request_data.stream:
-                http_client = KiroHttpClient(auth_manager, shared_client=None)
-            else:
-                http_client = KiroHttpClient(
-                    auth_manager, shared_client=request.app.state.http_client
-                )
+            # Always per-request: generateAssistantResponse is streamed to Kiro
+            # (stream=True) even when the client asked for JSON.
+            http_client = KiroHttpClient(auth_manager, shared_client=None)
 
             try:
                 response = await http_client.request_with_retry(
@@ -547,6 +545,17 @@ async def create_response(request: Request, request_data: ResponsesRequest):
 
             except NetworkHTTPException as e:
                 await http_client.close()
+                if not should_failover_network_error(e):
+                    logger.error(
+                        f"HTTP {e.status_code} - POST /v1/responses - "
+                        f"[{e.error_code}] {e.user_message[:100]}"
+                    )
+                    if debug_logger:
+                        debug_logger.flush_on_error(
+                            e.status_code, e.user_message, source="network",
+                            code=e.error_code, phase="connect",
+                        )
+                    return build_network_error_response(e, "openai")
                 await account_manager.report_failure(
                     account.id, request_data.model, ErrorType.RECOVERABLE,
                     e.status_code, e.error_code,
@@ -579,6 +588,19 @@ async def create_response(request: Request, request_data: ResponsesRequest):
             except Exception as e:
                 await http_client.close()
                 failure = classify_collect_exception(e)
+                immediate = immediate_collect_response(failure, "openai")
+                if immediate is not None:
+                    logger.warning(
+                        f"HTTP {failure.status_code} - POST /v1/responses "
+                        f"- [{failure.code}] {failure.message[:100]}"
+                    )
+                    if debug_logger:
+                        debug_logger.flush_on_error(
+                            failure.status_code, failure.message,
+                            source=failure.source, code=failure.code,
+                            phase=failure.phase,
+                        )
+                    return immediate
 
                 if failure.is_upstream:
                     # Upstream transport failure (stall / cut stream): recoverable,
@@ -676,12 +698,7 @@ async def create_response(request: Request, request_data: ResponsesRequest):
     url = f"{auth_manager.api_host}/generateAssistantResponse"
     logger.debug(f"Kiro API URL: {url}")
 
-    if request_data.stream:
-        http_client = KiroHttpClient(auth_manager, shared_client=None)
-    else:
-        http_client = KiroHttpClient(
-            auth_manager, shared_client=request.app.state.http_client
-        )
+    http_client = KiroHttpClient(auth_manager, shared_client=None)
 
     try:
         response = await http_client.request_with_retry(
@@ -771,6 +788,18 @@ async def create_response(request: Request, request_data: ResponsesRequest):
     except Exception as e:
         await http_client.close()
         failure = classify_collect_exception(e)
+        immediate = immediate_collect_response(failure, "openai")
+        if immediate is not None:
+            logger.warning(
+                f"HTTP {failure.status_code} - POST /v1/responses "
+                f"- [{failure.code}] {failure.message[:100]}"
+            )
+            if debug_logger:
+                debug_logger.flush_on_error(
+                    failure.status_code, failure.message,
+                    source=failure.source, code=failure.code, phase=failure.phase,
+                )
+            return immediate
 
         if failure.is_upstream:
             # Upstream stalled or cut the response: report as a network incident

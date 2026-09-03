@@ -416,6 +416,99 @@ class TestKiroHttpClientRequestWithRetry:
         assert response.status_code == 200
     
     @pytest.mark.asyncio
+    async def test_pool_timeout_fails_fast_without_retry(self, mock_auth_manager_for_http):
+        """
+        What it does: PoolTimeout is not retried with exponential backoff.
+        Purpose: TRAY-1B retried pool waits 30s×3 and took the whole host down.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(side_effect=httpx.PoolTimeout("pool timed out"))
+
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+                    with pytest.raises(HTTPException) as exc_info:
+                        await http_client.request_with_retry(
+                            "POST",
+                            "https://api.example.com/test",
+                            {"data": "value"},
+                        )
+
+        mock_sleep.assert_not_called()
+        assert mock_client.request.call_count == 1
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.error_code == "pool_exhausted"
+        assert "pool" in exc_info.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_stream_pool_timeout_fails_fast_without_retry(
+        self, mock_auth_manager_for_http
+    ):
+        """
+        What it does: stream=True PoolTimeout also fails on the first wait.
+        Purpose: Chat/messages always use stream=True against Kiro.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        mock_request = Mock()
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.build_request = Mock(return_value=mock_request)
+        mock_client.send = AsyncMock(side_effect=httpx.PoolTimeout("pool timed out"))
+
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+                    with pytest.raises(HTTPException) as exc_info:
+                        await http_client.request_with_retry(
+                            "POST",
+                            "https://api.example.com/test",
+                            {"data": "value"},
+                            stream=True,
+                        )
+
+        mock_sleep.assert_not_called()
+        assert mock_client.send.call_count == 1
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.error_code == "pool_exhausted"
+    
+    @pytest.mark.asyncio
+    async def test_oidc_400_from_get_access_token_is_not_swallowed(
+        self, mock_auth_manager_for_http
+    ):
+        """
+        What it does: Propagates HTTPStatusError from get_access_token().
+        Purpose: If this is caught as RequestError and retried as 502, chat
+                 cannot return 401 login_required (TRAY-1F).
+        """
+        request = httpx.Request("POST", "https://oidc.us-east-1.amazonaws.com/token")
+        response = httpx.Response(400, request=request, json={"error": "invalid_grant"})
+        mock_auth_manager_for_http.get_access_token = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "400 invalid_grant", request=request, response=response
+            )
+        )
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock()
+
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+                with pytest.raises(httpx.HTTPStatusError) as exc_info:
+                    await http_client.request_with_retry(
+                        "POST",
+                        "https://api.example.com/test",
+                        {"data": "value"},
+                    )
+
+        mock_sleep.assert_not_called()
+        mock_client.request.assert_not_called()
+        assert mock_auth_manager_for_http.get_access_token.await_count == 1
+        assert exc_info.value.response.status_code == 400
+    
+    @pytest.mark.asyncio
     async def test_request_error_triggers_backoff(self, mock_auth_manager_for_http):
         """
         What it does: Verifies exponential backoff on request error.
@@ -1208,12 +1301,58 @@ class TestKiroHttpClientSharedClient:
         
         print("Action: Getting client...")
         with patch('kiro.http_client.httpx.AsyncClient') as mock_async_client:
-            client = await http_client._get_client(stream=True)
+            client = await http_client._get_client(stream=False)
             
             print("Verification: Shared client returned, no new client created...")
             print(f"Comparing client: Expected mock_shared, Got {client}")
             assert client is mock_shared
             mock_async_client.assert_not_called()
+    
+    @pytest.mark.asyncio
+    async def test_get_client_stream_true_ignores_shared_client(self, mock_auth_manager_for_http):
+        """
+        What it does: stream=True creates a dedicated client even if a shared pool was injected.
+        Purpose: TRAY-1B — streamed Kiro calls must not borrow the shared pool.
+        """
+        mock_shared = AsyncMock()
+        mock_shared.is_closed = False
+        http_client = KiroHttpClient(mock_auth_manager_for_http, shared_client=mock_shared)
+
+        with patch('kiro.http_client.httpx.AsyncClient') as mock_async_client:
+            mock_dedicated = AsyncMock()
+            mock_dedicated.is_closed = False
+            mock_async_client.return_value = mock_dedicated
+            client = await http_client._get_client(stream=True)
+
+        assert client is mock_dedicated
+        assert client is not mock_shared
+        mock_async_client.assert_called_once()
+        timeout_arg = mock_async_client.call_args.kwargs.get('timeout')
+        assert timeout_arg is not None
+        assert timeout_arg.read == STREAMING_READ_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_close_closes_dedicated_stream_client_not_shared(
+        self, mock_auth_manager_for_http
+    ):
+        """
+        What it does: close() tears down the dedicated stream client only.
+        Purpose: Shared pool stays owned by lifespan; stream clients must not leak.
+        """
+        mock_shared = AsyncMock()
+        mock_shared.is_closed = False
+        mock_shared.aclose = AsyncMock()
+        http_client = KiroHttpClient(mock_auth_manager_for_http, shared_client=mock_shared)
+
+        mock_dedicated = AsyncMock()
+        mock_dedicated.is_closed = False
+        mock_dedicated.aclose = AsyncMock()
+        with patch('kiro.http_client.httpx.AsyncClient', return_value=mock_dedicated):
+            await http_client._get_client(stream=True)
+
+        await http_client.close()
+        mock_dedicated.aclose.assert_called_once()
+        mock_shared.aclose.assert_not_called()
     
     @pytest.mark.asyncio
     async def test_close_does_not_close_shared_client(self, mock_auth_manager_for_http):

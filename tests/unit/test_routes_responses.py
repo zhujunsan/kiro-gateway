@@ -526,3 +526,69 @@ class TestResponsesNetworkErrors:
         assert "detail" not in response.json()
         assert response.json()["error"]["type"] == "server_error"
         assert response.json()["error"]["code"] == "proxy_error"
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_oidc_400_returns_401_login_required(
+        self, test_client, valid_proxy_api_key, stream
+    ):
+        """OIDC invalid_grant on /v1/responses must be 401, not 500."""
+        import httpx
+
+        request = httpx.Request("POST", "https://oidc.us-east-1.amazonaws.com/token")
+        oidc_response = httpx.Response(400, request=request, json={"error": "invalid_grant"})
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "400 invalid_grant", request=request, response=oidc_response
+            )
+        )
+        client.close = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = False
+        try:
+            with patch("kiro.routes_responses.KiroHttpClient", return_value=client):
+                response = test_client.post(
+                    "/v1/responses",
+                    headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                    json={
+                        "model": "claude-sonnet-4-5",
+                        "input": "hello",
+                        "stream": stream,
+                    },
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+
+        assert response.status_code == 401
+        body = response.json()
+        assert body["error"]["login_required"] is True
+        assert body["error"]["code"] == "login_required"
+        assert "Internal Server Error" not in response.text
+
+    def test_pool_exhausted_returns_503(self, test_client, valid_proxy_api_key):
+        """PoolTimeout on /v1/responses is 503 pool_exhausted."""
+        from kiro.network_errors import NetworkHTTPException
+
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(
+            side_effect=NetworkHTTPException(
+                status_code=503,
+                error_code="pool_exhausted",
+                user_message="Kiro Gateway could not connect to the Kiro upstream service: Connection pool exhausted. Retry shortly.",
+            )
+        )
+        client.close = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = False
+        try:
+            with patch("kiro.routes_responses.KiroHttpClient", return_value=client):
+                response = test_client.post(
+                    "/v1/responses",
+                    headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                    json={"model": "claude-sonnet-4-5", "input": "hello"},
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "pool_exhausted"

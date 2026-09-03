@@ -54,6 +54,7 @@ class ErrorCategory(str, Enum):
     NETWORK_UNREACHABLE = "network_unreachable"
     TIMEOUT_CONNECT = "timeout_connect"
     TIMEOUT_READ = "timeout_read"
+    POOL_EXHAUSTED = "pool_exhausted"
     SSL_ERROR = "ssl_error"
     PROXY_ERROR = "proxy_error"
     TOO_MANY_REDIRECTS = "too_many_redirects"
@@ -104,7 +105,8 @@ class NetworkHTTPException(HTTPException):
         """Initialize a client-safe upstream network exception.
 
         Args:
-            status_code: HTTP 502 for connection failures or 504 for timeouts.
+            status_code: HTTP 502 for connection failures, 503 for local pool
+                exhaustion, or 504 for timeouts.
             error_code: Stable machine-readable network failure code.
             user_message: Sanitized, actionable message for API clients.
             error_info: Optional detailed classification retained for internal use.
@@ -195,8 +197,13 @@ def network_exception_from_exception(
     if isinstance(error, NetworkHTTPException):
         return error
 
-    if isinstance(error, HTTPException) and error.status_code in (502, 504):
-        code = "upstream_timeout" if error.status_code == 504 else "upstream_connection_error"
+    if isinstance(error, HTTPException) and error.status_code in (502, 503, 504):
+        if error.status_code == 504:
+            code = "upstream_timeout"
+        elif error.status_code == 503:
+            code = getattr(error, "error_code", None) or "pool_exhausted"
+        else:
+            code = "upstream_connection_error"
         return upstream_network_exception(error.status_code, code, str(error.detail))
 
     from kiro.collect_errors import collect_failure_or_none
@@ -247,15 +254,48 @@ def build_stream_error_body(
     format_type: ApiErrorFormat = "openai",
 ) -> Dict[str, Any]:
     """Build a protocol error body after an SSE response has started.
-
+    
     Args:
         error: Exception raised while producing the stream.
         format_type: Target API protocol, ``openai`` or ``anthropic``.
 
     Returns:
         Protocol-compatible error body. Recognized transport failures retain
-        their actionable message and stable code; other failures remain generic.
+        their actionable message and stable code; credential failures include
+        ``login_required``; other failures remain generic.
     """
+    from kiro.auth_state import (
+        LOGIN_REQUIRED_CODE,
+        LOGIN_REQUIRED_MESSAGE,
+        auth_failure_reason,
+        build_auth_required_payload,
+        is_auth_failure,
+    )
+
+    if is_auth_failure(error):
+        payload = build_auth_required_payload(
+            code=LOGIN_REQUIRED_CODE,
+            message=LOGIN_REQUIRED_MESSAGE,
+            reason=auth_failure_reason(error),
+        )
+        if format_type == "anthropic":
+            error_body = payload["error"]
+            return {
+                "type": "error",
+                "error": {
+                    "type": "authentication_error",
+                    "message": error_body["message"],
+                    "code": LOGIN_REQUIRED_CODE,
+                    "login_required": True,
+                    **(
+                        {"reason": error_body["reason"]}
+                        if "reason" in error_body
+                        else {}
+                    ),
+                },
+            }
+        return payload
+
     network_error = network_exception_from_exception(error)
     if network_error is not None:
         return build_network_error_body(network_error, format_type)
@@ -293,7 +333,7 @@ def build_network_error_response(
         format_type: Target API protocol, ``openai`` or ``anthropic``.
 
     Returns:
-        JSON response preserving the exception's 502 or 504 status.
+        JSON response preserving the exception's 502, 503, or 504 status.
     """
     return JSONResponse(
         status_code=error.status_code,
@@ -518,6 +558,22 @@ def _classify_connect_error(error: httpx.ConnectError, technical_details: str) -
     )
 
 
+def should_failover_network_error(error: NetworkHTTPException) -> bool:
+    """Return whether a typed network failure is worth trying on another account.
+
+    Local connection-pool exhaustion is process-wide: every account shares the
+    same httpx pool, so failover would wait on the same exhausted pool and turn
+    one slow upstream into a machine-wide 504 avalanche (TRAY-1B).
+
+    Args:
+        error: Typed network exception raised by ``request_with_retry``.
+
+    Returns:
+        False for ``pool_exhausted`` (fail fast with 503); True otherwise.
+    """
+    return error.error_code != ErrorCategory.POOL_EXHAUSTED.value
+
+
 def _classify_timeout_error(error: httpx.TimeoutException, technical_details: str) -> NetworkErrorInfo:
     """
     Classifies httpx.TimeoutException into specific subcategories.
@@ -529,6 +585,25 @@ def _classify_timeout_error(error: httpx.TimeoutException, technical_details: st
     Returns:
         NetworkErrorInfo with specific classification
     """
+    # PoolTimeout: waiting for a free connection from the local httpx pool.
+    # This is gateway capacity, not upstream slowness — do not retry or failover.
+    if isinstance(error, httpx.PoolTimeout):
+        return NetworkErrorInfo(
+            category=ErrorCategory.POOL_EXHAUSTED,
+            user_message=(
+                "Connection pool exhausted - too many requests are waiting "
+                "for a free upstream connection."
+            ),
+            troubleshooting_steps=[
+                "Retry shortly; this is a local gateway capacity limit, not an upstream outage",
+                "Reduce concurrent requests to the gateway",
+                "Restart the gateway if the pool stays exhausted",
+            ],
+            technical_details=technical_details,
+            is_retryable=False,
+            suggested_http_code=503,
+        )
+
     # ConnectTimeout: TCP handshake timeout
     if isinstance(error, httpx.ConnectTimeout):
         return NetworkErrorInfo(

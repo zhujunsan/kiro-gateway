@@ -26,9 +26,11 @@ response is reported as a network incident (502/504). The non-streaming path use
 to funnel every exception into a generic ``500 / source="gateway"`` bucket, which
 mislabels upstream problems as gateway bugs and hides them from network dashboards:
 
+* ``is_auth_failure``          -> 401 ``login_required`` (OIDC 400 / expired creds)
 * ``FirstTokenTimeoutError``   -> 504 ``first_token_timeout``  (upstream never spoke)
 * ``httpx.RemoteProtocolError`` -> 502 ``incomplete_upstream_response`` (stream cut)
-* ``httpx.TimeoutException``   -> 504 ``timeout``
+* ``httpx.PoolTimeout``        -> 503 ``pool_exhausted`` (local pool; do not retry)
+* other ``httpx.TimeoutException`` -> 504 ``timeout``
 * other ``httpx.TransportError`` -> 502 ``connection_error``
 * anything else                -> 500 ``gateway`` (a real gateway bug)
 
@@ -42,6 +44,15 @@ from dataclasses import dataclass
 from typing import Optional
 
 import httpx
+from fastapi.responses import JSONResponse
+
+from kiro.auth_state import (
+    LOGIN_REQUIRED_CODE,
+    LOGIN_REQUIRED_MESSAGE,
+    auth_failure_reason,
+    build_auth_required_payload,
+    is_auth_failure,
+)
 
 
 @dataclass(frozen=True)
@@ -56,6 +67,8 @@ class CollectFailure:
         message: User-facing message describing the failure.
         is_upstream: Whether the failure originates upstream rather than in the
             gateway itself. Callers use it to pick log severity / failover.
+        login_required: True when the user must re-authenticate (HTTP 401).
+        reason: Optional short cause tag from :func:`auth_failure_reason`.
     """
 
     status_code: int
@@ -64,6 +77,8 @@ class CollectFailure:
     phase: str
     message: str
     is_upstream: bool
+    login_required: bool = False
+    reason: Optional[str] = None
 
 
 def _exception_detail(exc: BaseException) -> str:
@@ -101,6 +116,18 @@ def classify_collect_exception(exc: BaseException) -> CollectFailure:
     # module scope would create a cycle for callers that import this first.
     from kiro.streaming_core import FirstTokenTimeoutError
 
+    if is_auth_failure(exc):
+        return CollectFailure(
+            status_code=401,
+            source="auth",
+            code=LOGIN_REQUIRED_CODE,
+            phase="auth",
+            message=LOGIN_REQUIRED_MESSAGE,
+            is_upstream=False,
+            login_required=True,
+            reason=auth_failure_reason(exc),
+        )
+
     if isinstance(exc, FirstTokenTimeoutError):
         return CollectFailure(
             status_code=504,
@@ -122,6 +149,21 @@ def classify_collect_exception(exc: BaseException) -> CollectFailure:
                 f"{_exception_detail(exc)}. Please try again."
             ),
             is_upstream=True,
+        )
+
+    if isinstance(exc, httpx.PoolTimeout):
+        return CollectFailure(
+            status_code=503,
+            source="network",
+            code="pool_exhausted",
+            phase="connect",
+            message=(
+                "The gateway connection pool is exhausted: "
+                f"{_exception_detail(exc)}. Retry shortly; if this persists, "
+                "reduce concurrent requests or restart the gateway."
+            ),
+            is_upstream=True,
+            login_required=False,
         )
 
     if isinstance(exc, httpx.TimeoutException):
@@ -174,8 +216,81 @@ def collect_failure_or_none(exc: BaseException) -> Optional[CollectFailure]:
     return failure if failure.is_upstream else None
 
 
+def login_required_json_response(
+    format_type: str,
+    *,
+    reason: Optional[str] = None,
+) -> JSONResponse:
+    """Build a 401 JSON body that tells the client to re-authenticate.
+
+    Args:
+        format_type: ``openai`` / Responses envelope, or ``anthropic``.
+        reason: Optional short cause from :func:`auth_failure_reason`.
+
+    Returns:
+        HTTP 401 with ``login_required: True`` and an actionable message.
+    """
+    payload = build_auth_required_payload(
+        code=LOGIN_REQUIRED_CODE,
+        message=LOGIN_REQUIRED_MESSAGE,
+        reason=reason,
+    )
+    if format_type == "anthropic":
+        error_body = payload["error"]
+        content = {
+            "type": "error",
+            "error": {
+                "type": "authentication_error",
+                "message": error_body["message"],
+                "code": LOGIN_REQUIRED_CODE,
+                "login_required": True,
+            },
+        }
+        if reason:
+            content["error"]["reason"] = reason
+        return JSONResponse(status_code=401, content=content)
+    return JSONResponse(status_code=401, content=payload)
+
+
+def immediate_collect_response(
+    failure: CollectFailure,
+    format_type: str,
+) -> Optional[JSONResponse]:
+    """Return a client response for failures that must not become HTTP 500.
+
+    Auth failures are 401 ``login_required``. Local pool exhaustion is 503
+    ``pool_exhausted``. Upstream transport failures return ``None`` so the
+    caller can failover; genuine gateway bugs also return ``None`` for 500.
+
+    Args:
+        failure: Classification from :func:`classify_collect_exception`.
+        format_type: ``openai`` or ``anthropic``.
+
+    Returns:
+        A JSON response to return immediately, or ``None``.
+    """
+    if failure.login_required:
+        return login_required_json_response(format_type, reason=failure.reason)
+    if failure.code == "pool_exhausted":
+        from kiro.network_errors import (
+            build_network_error_response,
+            upstream_network_exception,
+        )
+
+        api_format = "anthropic" if format_type == "anthropic" else "openai"
+        return build_network_error_response(
+            upstream_network_exception(
+                failure.status_code, failure.code, failure.message
+            ),
+            api_format,
+        )
+    return None
+
+
 __all__ = [
     "CollectFailure",
     "classify_collect_exception",
     "collect_failure_or_none",
+    "immediate_collect_response",
+    "login_required_json_response",
 ]

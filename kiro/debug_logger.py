@@ -79,6 +79,15 @@ def get_current_session() -> Optional["DebugSession"]:
 
 def classify_streaming_exception(exc: BaseException) -> tuple[str, str, str, int]:
     """Map a streaming-path exception to (source, code, phase, gateway_status)."""
+    import httpx
+
+    from kiro.auth_state import is_auth_failure
+
+    if is_auth_failure(exc):
+        return "auth", "login_required", "auth", 401
+    if isinstance(exc, httpx.PoolTimeout):
+        return "network", "pool_exhausted", "connect", 503
+
     name = type(exc).__name__
     msg = str(exc).lower()
     detail = getattr(exc, "detail", None)

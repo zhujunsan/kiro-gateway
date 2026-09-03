@@ -1068,17 +1068,18 @@ class TestAnthropicHTTPClientSelection:
         print("✅ Anthropic streaming correctly uses per-request client")
     
     @patch('kiro.routes_anthropic.KiroHttpClient')
-    def test_non_streaming_uses_shared_client(
+    def test_non_streaming_uses_per_request_client(
         self,
         mock_kiro_http_client_class,
         test_client,
         valid_proxy_api_key
     ):
         """
-        What it does: Verifies non-streaming requests use shared HTTP client.
-        Purpose: Ensure connection pooling for non-streaming requests.
+        What it does: Verifies JSON /v1/messages still uses a per-request client.
+        Purpose: Kiro is always called with stream=True; shared-pool streaming
+                 caused TRAY-1B PoolTimeout 504s.
         """
-        print("\n--- Test: Anthropic non-streaming uses shared client ---")
+        print("\n--- Test: Anthropic non-streaming uses per-request client ---")
         
         # Setup mock
         mock_client_instance = AsyncMock()
@@ -1103,13 +1104,13 @@ class TestAnthropicHTTPClientSelection:
         except Exception:
             pass
         
-        print("Checking: KiroHttpClient(shared_client=app.state.http_client)...")
+        print("Checking: KiroHttpClient(shared_client=None)...")
         assert mock_kiro_http_client_class.called
         call_args = mock_kiro_http_client_class.call_args
         print(f"Call args: {call_args}")
-        assert call_args[1]['shared_client'] is not None, \
-            "Non-streaming should use shared client"
-        print("✅ Anthropic non-streaming correctly uses shared client")
+        assert call_args[1]['shared_client'] is None, \
+            "Non-streaming messages still stream Kiro and must not use the shared pool"
+        print("✅ Anthropic non-streaming correctly uses per-request client")
 
 
 # =============================================================================
@@ -2670,3 +2671,76 @@ class TestAnthropicNetworkErrors:
         assert '"type": "api_error"' in response.text or '"type":"api_error"' in response.text
         assert "connection reset" in response.text
         assert "NetworkHTTPException" not in response.text
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_oidc_400_returns_401_login_required(
+        self, test_client, valid_proxy_api_key, stream
+    ):
+        """OIDC invalid_grant must be Anthropic 401, not a gateway 500."""
+        import httpx
+
+        request = httpx.Request("POST", "https://oidc.us-east-1.amazonaws.com/token")
+        oidc_response = httpx.Response(400, request=request, json={"error": "invalid_grant"})
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "400 invalid_grant", request=request, response=oidc_response
+            )
+        )
+        client.close = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = False
+        try:
+            with patch("kiro.routes_anthropic.KiroHttpClient", return_value=client):
+                response = test_client.post(
+                    "/v1/messages",
+                    headers={"x-api-key": valid_proxy_api_key},
+                    json={
+                        "model": "claude-sonnet-4-5",
+                        "max_tokens": 32,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": stream,
+                    },
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+
+        assert response.status_code == 401
+        body = response.json()
+        assert body["type"] == "error"
+        assert body["error"]["login_required"] is True
+        assert body["error"]["type"] == "authentication_error"
+        assert "Internal Server Error" not in response.text
+
+    def test_pool_exhausted_returns_503(self, test_client, valid_proxy_api_key):
+        """PoolTimeout surfaces as 503 pool_exhausted on /v1/messages."""
+        from kiro.network_errors import NetworkHTTPException
+
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(
+            side_effect=NetworkHTTPException(
+                status_code=503,
+                error_code="pool_exhausted",
+                user_message="Kiro Gateway could not connect to the Kiro upstream service: Connection pool exhausted. Retry shortly.",
+            )
+        )
+        client.close = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = False
+        try:
+            with patch("kiro.routes_anthropic.KiroHttpClient", return_value=client):
+                response = test_client.post(
+                    "/v1/messages",
+                    headers={"x-api-key": valid_proxy_api_key},
+                    json={
+                        "model": "claude-sonnet-4-5",
+                        "max_tokens": 32,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+
+        assert response.status_code == 503
+        assert response.json()["type"] == "error"
+        assert "pool" in response.json()["error"]["message"].lower()

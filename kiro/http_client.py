@@ -26,6 +26,7 @@ Handles:
 - 5xx: exponential backoff
 - 400 + INVALID_MODEL_ID: short same-account backoff (intermittent upstream)
 - Timeouts: exponential backoff
+- PoolTimeout: fail fast (local capacity; retrying starves the pool)
 
 Supports both per-request clients and shared application-level client
 with connection pooling for better resource management.
@@ -177,13 +178,18 @@ class KiroHttpClient:
         self._shared_client = shared_client
         self._owns_client = shared_client is None
         self.client: Optional[httpx.AsyncClient] = shared_client
+        # Dedicated client used when stream=True so streamed Kiro calls never
+        # borrow the shared pool (CLOSE_WAIT leaks + TRAY-1B pool avalanche).
+        self._stream_client: Optional[httpx.AsyncClient] = None
     
     async def _get_client(self, stream: bool = False) -> httpx.AsyncClient:
         """
         Returns or creates an HTTP client with proper timeouts.
-        
-        If a shared client was provided at initialization, it is returned as-is.
-        Otherwise, creates a new client with appropriate timeout configuration.
+
+        ``stream=True`` always creates (or reuses) a dedicated client and never
+        borrows ``shared_client``. Non-streaming calls still use the shared
+        pool when one was provided at initialization.
+
         
         httpx timeouts:
         - connect: TCP handshake (DNS + TCP SYN/ACK)
@@ -201,30 +207,39 @@ class KiroHttpClient:
         Returns:
             Active HTTP client
         """
+        # Streaming Kiro calls (AWS event stream) must never sit on the shared
+        # pool. Non-streaming chat/messages still use stream=True against Kiro;
+        # borrowing keepalive slots is what turned one slow upstream into a
+        # machine-wide PoolTimeout/504 avalanche (TRAY-1B).
+        if stream:
+            if self._stream_client is not None and not self._stream_client.is_closed:
+                self.client = self._stream_client
+                return self._stream_client
+            timeout_config = httpx.Timeout(
+                connect=30.0,
+                read=STREAMING_READ_TIMEOUT,
+                write=30.0,
+                pool=30.0,
+            )
+            logger.debug(
+                f"Creating dedicated streaming HTTP client "
+                f"(read_timeout={STREAMING_READ_TIMEOUT}s); ignoring shared pool"
+            )
+            self._stream_client = httpx.AsyncClient(
+                timeout=timeout_config, follow_redirects=True, proxy=resolve_proxy()
+            )
+            self.client = self._stream_client
+            return self._stream_client
+
         # If using shared client, return it directly
         # Shared client should be pre-configured with appropriate timeouts
         if self._shared_client is not None:
             return self._shared_client
         
-        # Create new client if needed (per-request mode)
+        # Create new client if needed (per-request non-streaming mode)
         if self.client is None or self.client.is_closed:
-            if stream:
-                # For streaming:
-                # - connect: 30 sec (TCP connection, usually < 1 sec)
-                # - read: STREAMING_READ_TIMEOUT (300 sec) - model may "think" between chunks
-                # - write/pool: standard values
-                timeout_config = httpx.Timeout(
-                    connect=30.0,
-                    read=STREAMING_READ_TIMEOUT,
-                    write=30.0,
-                    pool=30.0
-                )
-                logger.debug(f"Creating streaming HTTP client (read_timeout={STREAMING_READ_TIMEOUT}s)")
-            else:
-                # For regular requests: single timeout of 300 sec
-                timeout_config = httpx.Timeout(timeout=300.0)
-                logger.debug("Creating non-streaming HTTP client (timeout=300s)")
-            
+            timeout_config = httpx.Timeout(timeout=300.0)
+            logger.debug("Creating non-streaming HTTP client (timeout=300s)")
             self.client = httpx.AsyncClient(
                 timeout=timeout_config, follow_redirects=True, proxy=resolve_proxy()
             )
@@ -240,6 +255,17 @@ class KiroHttpClient:
         Uses graceful exception handling to prevent errors during cleanup
         from masking the original exception in finally blocks.
         """
+        stream_client = self._stream_client
+        if stream_client is not None:
+            self._stream_client = None
+            if not stream_client.is_closed:
+                try:
+                    await stream_client.aclose()
+                except Exception as e:
+                    logger.warning(f"Error closing dedicated streaming HTTP client: {e}")
+            if self.client is stream_client:
+                self.client = self._shared_client
+
         # Don't close shared clients - they're managed by the application
         if not self._owns_client:
             return
@@ -269,6 +295,7 @@ class KiroHttpClient:
         - 5xx: waits with exponential backoff
         - 400 + INVALID_MODEL_ID: linear same-account backoff (0.5s..2.5s by default)
         - Timeouts: waits with exponential backoff
+        - PoolTimeout: fails immediately with 503 ``pool_exhausted`` (not retried)
         
         For streaming, STREAMING_READ_TIMEOUT is used for waiting between chunks.
         First token timeout is controlled separately in streaming_openai.py via asyncio.wait_for().
@@ -387,6 +414,20 @@ class KiroHttpClient:
                 # Other errors - return as is
                 return response
                 
+            except httpx.PoolTimeout as e:
+                # Local pool wait is not an upstream timeout. Retrying holds the
+                # waiter for another 30s×N and starves every other request.
+                last_error = e
+                error_info = classify_network_error(e)
+                last_error_info = error_info
+                logger.error(
+                    "{} - failing fast without retry (attempt {}/{})",
+                    get_short_error_message(error_info),
+                    attempt + 1,
+                    max_retries,
+                )
+                break
+
             except httpx.TimeoutException as e:
                 last_error = e
                 

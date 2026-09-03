@@ -1092,17 +1092,18 @@ class TestHTTPClientSelection:
         print("✅ Streaming correctly uses per-request client")
     
     @patch('kiro.routes_openai.KiroHttpClient')
-    def test_non_streaming_uses_shared_client(
+    def test_non_streaming_uses_per_request_client(
         self,
         mock_kiro_http_client_class,
         test_client,
         valid_proxy_api_key
     ):
         """
-        What it does: Verifies non-streaming requests use shared HTTP client.
-        Purpose: Ensure connection pooling for non-streaming requests.
+        What it does: Verifies JSON chat still uses a per-request HTTP client.
+        Purpose: Kiro is always called with stream=True; shared-pool streaming
+                 caused TRAY-1B PoolTimeout 504s.
         """
-        print("\n--- Test: Non-streaming uses shared client ---")
+        print("\n--- Test: Non-streaming uses per-request client ---")
         
         # Setup mock
         mock_client_instance = AsyncMock()
@@ -1126,13 +1127,13 @@ class TestHTTPClientSelection:
         except Exception:
             pass
         
-        print("Checking: KiroHttpClient(shared_client=app.state.http_client)...")
+        print("Checking: KiroHttpClient(shared_client=None)...")
         assert mock_kiro_http_client_class.called
         call_args = mock_kiro_http_client_class.call_args
         print(f"Call args: {call_args}")
-        assert call_args[1]['shared_client'] is not None, \
-            "Non-streaming should use shared client"
-        print("✅ Non-streaming correctly uses shared client")
+        assert call_args[1]['shared_client'] is None, \
+            "Non-streaming chat still streams Kiro and must not use the shared pool"
+        print("✅ Non-streaming correctly uses per-request client")
 
 
 # =============================================================================
@@ -2202,3 +2203,86 @@ class TestChatCompletionsNetworkErrors:
         assert response.status_code == 502
         assert response.json()["error"]["code"] == "connection_refused"
         assert "All accounts failed" not in response.text
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_oidc_400_returns_401_login_required(
+        self, test_client, valid_proxy_api_key, stream
+    ):
+        """OIDC invalid_grant must be 401 JSON, including when the client asked to stream."""
+        import httpx
+
+        request = httpx.Request("POST", "https://oidc.us-east-1.amazonaws.com/token")
+        response = httpx.Response(400, request=request, json={"error": "invalid_grant"})
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "400 invalid_grant", request=request, response=response
+            )
+        )
+        client.close = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = False
+        try:
+            with patch("kiro.routes_openai.KiroHttpClient", return_value=client):
+                http_response = test_client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                    json={
+                        "model": "claude-sonnet-4-5",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": stream,
+                    },
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+
+        assert http_response.status_code == 401
+        body = http_response.json()
+        assert body["error"]["login_required"] is True
+        assert body["error"]["code"] == "login_required"
+        assert "500" not in str(http_response.status_code)
+        assert "Internal Server Error" not in http_response.text
+
+    def test_pool_exhausted_does_not_failover(
+        self, test_client, valid_proxy_api_key
+    ):
+        """Local pool exhaustion must 503 immediately, not hop accounts."""
+        from kiro.network_errors import NetworkHTTPException
+
+        manager = test_client.app.state.account_manager
+        account = manager.get_first_account()
+        manager._accounts["second-pool-test"] = account
+        client = AsyncMock()
+        client.request_with_retry = AsyncMock(
+            side_effect=NetworkHTTPException(
+                status_code=503,
+                error_code="pool_exhausted",
+                user_message="Kiro Gateway could not connect to the Kiro upstream service: Connection pool exhausted. Retry shortly.",
+            )
+        )
+        client.close = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = True
+        try:
+            with patch.object(
+                manager, "get_next_account",
+                new=AsyncMock(side_effect=[account, account, None]),
+            ) as mock_next, patch.object(
+                manager, "report_failure", new=AsyncMock()
+            ) as mock_fail, patch("kiro.routes_openai.KiroHttpClient", return_value=client):
+                response = test_client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                    json={
+                        "model": "claude-sonnet-4-5",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+            manager._accounts.pop("second-pool-test", None)
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "pool_exhausted"
+        assert mock_next.await_count == 1
+        mock_fail.assert_not_called()

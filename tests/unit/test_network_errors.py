@@ -15,6 +15,7 @@ from kiro.network_errors import (
     NetworkErrorInfo,
     NetworkHTTPException,
     build_network_error_body,
+    build_stream_error_body,
     classify_network_error,
     format_error_for_user,
     get_short_error_message,
@@ -327,6 +328,47 @@ class TestClassifyNetworkErrorTimeout:
         assert error_info.category == ErrorCategory.TIMEOUT_READ
         assert "timeout" in error_info.user_message.lower()
         assert error_info.is_retryable is True
+
+    def test_pool_timeout_is_not_a_read_timeout(self):
+        """
+        What it does: Classifies PoolTimeout separately from ReadTimeout.
+        Purpose: TRAY-1B treated pool waits as 504 and retried them for ~93s.
+        """
+        error_info = classify_network_error(httpx.PoolTimeout("pool timed out"))
+        assert error_info.category == ErrorCategory.POOL_EXHAUSTED
+        assert error_info.is_retryable is False
+        assert error_info.suggested_http_code == 503
+        assert "pool" in error_info.user_message.lower()
+
+    def test_pool_timeout_code_is_pool_exhausted(self):
+        """
+        What it does: Verifies the machine-readable code clients switch on.
+        Purpose: Tray and dashboards key off pool_exhausted, not timeout_read.
+        """
+        error_info = classify_network_error(httpx.PoolTimeout("full"))
+        error = network_http_exception(error_info)
+        assert error.status_code == 503
+        assert error.error_code == "pool_exhausted"
+
+
+class TestShouldFailoverNetworkError:
+    """Local pool exhaustion must not hop to another account."""
+
+    def test_pool_exhausted_does_not_failover(self):
+        error = network_http_exception(
+            classify_network_error(httpx.PoolTimeout("full"))
+        )
+        from kiro.network_errors import should_failover_network_error
+
+        assert should_failover_network_error(error) is False
+
+    def test_connect_timeout_still_failovers(self):
+        error = network_http_exception(
+            classify_network_error(httpx.ConnectTimeout("slow"))
+        )
+        from kiro.network_errors import should_failover_network_error
+
+        assert should_failover_network_error(error) is True
 
 
 class TestClassifyNetworkErrorSSL:
@@ -716,3 +758,20 @@ class TestNetworkHTTPException:
         assert body["type"] == "error"
         assert body["error"]["type"] == "api_error"
         assert "Kiro upstream" in body["error"]["message"]
+
+    def test_stream_error_body_for_oidc_400_includes_login_required(self):
+        """Mid-stream credential failure must still tell the client to re-login."""
+        request = httpx.Request("POST", "https://oidc.test/token")
+        response = httpx.Response(400, request=request)
+        exc = httpx.HTTPStatusError("invalid_grant", request=request, response=response)
+        openai_body = build_stream_error_body(exc, "openai")
+        anthropic_body = build_stream_error_body(exc, "anthropic")
+        assert openai_body["error"]["login_required"] is True
+        assert openai_body["error"]["code"] == "login_required"
+        assert anthropic_body["error"]["login_required"] is True
+        assert anthropic_body["error"]["type"] == "authentication_error"
+
+    def test_stream_error_body_for_pool_timeout_uses_pool_exhausted(self):
+        """SSE error events must not relabel PoolTimeout as a generic timeout."""
+        body = build_stream_error_body(httpx.PoolTimeout("full"), "openai")
+        assert body["error"]["code"] == "pool_exhausted"

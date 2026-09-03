@@ -51,12 +51,13 @@ from kiro.streaming_anthropic import (
     stream_with_first_token_retry_anthropic,
 )
 from kiro.streaming_core import collect_with_first_token_retry
-from kiro.collect_errors import classify_collect_exception
+from kiro.collect_errors import classify_collect_exception, immediate_collect_response
 from kiro.http_client import KiroHttpClient
 from kiro.network_errors import (
     NetworkHTTPException,
     build_network_error_response,
     build_stream_error_body,
+    should_failover_network_error,
     upstream_network_exception,
 )
 from kiro.utils import generate_conversation_id
@@ -451,11 +452,10 @@ async def messages(
             url = f"{auth_manager.api_host}/generateAssistantResponse"
             logger.debug(f"Kiro API URL: {url} (account: {account.id})")
             
-            if request_data.stream:
-                http_client = KiroHttpClient(auth_manager, shared_client=None)
-            else:
-                shared_client = request.app.state.http_client
-                http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+            # Always per-request: generateAssistantResponse is streamed to Kiro
+            # (stream=True) even when the client asked for JSON. Shared-pool
+            # streaming is the TRAY-1B CLOSE_WAIT / PoolTimeout avalanche.
+            http_client = KiroHttpClient(auth_manager, shared_client=None)
             
             # Prepare data for token counting
             messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
@@ -665,6 +665,17 @@ async def messages(
             
             except NetworkHTTPException as e:
                 await http_client.close()
+                if not should_failover_network_error(e):
+                    logger.error(
+                        f"HTTP {e.status_code} - POST /v1/messages - "
+                        f"[{e.error_code}] {e.user_message[:100]}"
+                    )
+                    if debug_logger:
+                        debug_logger.flush_on_error(
+                            e.status_code, e.user_message, source="network",
+                            code=e.error_code, phase="connect",
+                        )
+                    return build_network_error_response(e, "anthropic")
                 await account_manager.report_failure(
                     account.id, request_data.model, ErrorType.RECOVERABLE,
                     e.status_code, e.error_code,
@@ -697,6 +708,19 @@ async def messages(
             except Exception as e:
                 await http_client.close()
                 failure = classify_collect_exception(e)
+                immediate = immediate_collect_response(failure, "anthropic")
+                if immediate is not None:
+                    logger.warning(
+                        f"HTTP {failure.status_code} - POST /v1/messages "
+                        f"- [{failure.code}] {failure.message[:100]}"
+                    )
+                    if debug_logger:
+                        debug_logger.flush_on_error(
+                            failure.status_code, failure.message,
+                            source=failure.source, code=failure.code,
+                            phase=failure.phase,
+                        )
+                    return immediate
 
                 if failure.is_upstream:
                     # Upstream transport failure (stall / cut stream): recoverable,
@@ -860,20 +884,12 @@ async def messages(
     except Exception as e:
         logger.warning(f"Failed to log Kiro request: {e}")
     
-    # Create HTTP client with retry logic
-    # For streaming: use per-request client to avoid CLOSE_WAIT leak on VPN disconnect (issue #54)
-    # For non-streaming: use shared client for connection pooling
+    # Always per-request: Kiro generateAssistantResponse is streamed (stream=True)
+    # even for JSON collect. Shared-pool streaming caused TRAY-1B PoolTimeout 504s.
     url = f"{auth_manager.api_host}/generateAssistantResponse"
     logger.debug(f"Kiro API URL: {url}")
     
-    if request_data.stream:
-        # Streaming mode: per-request client prevents orphaned connections
-        # when network interface changes (VPN disconnect/reconnect)
-        http_client = KiroHttpClient(auth_manager, shared_client=None)
-    else:
-        # Non-streaming mode: shared client for efficient connection reuse
-        shared_client = request.app.state.http_client
-        http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+    http_client = KiroHttpClient(auth_manager, shared_client=None)
     
     # Prepare data for token counting
     # Convert Pydantic models to dicts for tokenizer
@@ -1091,6 +1107,18 @@ async def messages(
     except Exception as e:
         await http_client.close()
         failure = classify_collect_exception(e)
+        immediate = immediate_collect_response(failure, "anthropic")
+        if immediate is not None:
+            logger.warning(
+                f"HTTP {failure.status_code} - POST /v1/messages "
+                f"- [{failure.code}] {failure.message[:100]}"
+            )
+            if debug_logger:
+                debug_logger.flush_on_error(
+                    failure.status_code, failure.message,
+                    source=failure.source, code=failure.code, phase=failure.phase,
+                )
+            return immediate
 
         if failure.is_upstream:
             # Upstream stalled or cut the response: report as a network incident
