@@ -20,7 +20,7 @@ import asyncio
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from fastapi.responses import JSONResponse
@@ -40,8 +40,25 @@ USAGE_UPSTREAM_BASE_DELAY_S = 0.4
 USAGE_UPSTREAM_MAX_DELAY_S = 2.5
 
 # Escalate to Sentry only after a sustained failure streak, then cooldown.
+#
+# Both gates below must hold at once (AND) — see
+# :meth:`UsageUpstreamMonitor.note_failure` for why. The tray polls ``/usage``
+# roughly once per minute, which is what drives these values:
+#
+# * 5 consecutive failures rules out single-poll blips and, just as importantly,
+#   sparse polling. A laptop that suspends between two polls can span hours with
+#   only 2 failures; that is a suspended machine, not an Amazon Q outage.
+# * 300s (5 minutes) of continuous failure rules out the transient causes that
+#   resolve on their own within a poll or two: Wi-Fi roaming, VPN/proxy restart,
+#   sleep/wake, DHCP renewal, and short Amazon Q gateway blips. Quota display
+#   going stale for under five minutes is not worth a Sentry Issue.
+#
+# At ~60s polling the pair escalates on the 6th failure (~5 minutes in). Faster
+# callers (e.g. the credit sampler) hit the count gate early and are held back by
+# the duration gate instead, so escalation stays time-based for everyone.
 USAGE_OUTAGE_CONSECUTIVE_THRESHOLD = 5
-USAGE_OUTAGE_DURATION_S = 120.0
+USAGE_OUTAGE_DURATION_S = 300.0
+# While an outage persists, report at most once per 15 minutes per process.
 USAGE_OUTAGE_REPORT_COOLDOWN_S = 900.0
 
 # Upstream HTTP statuses worth retrying (capacity / gateway blips).
@@ -69,9 +86,23 @@ class UsageFetchResult:
 
 
 class UsageUpstreamMonitor:
-    """Track consecutive /usage upstream failures and gate Sentry reports."""
+    """Track consecutive /usage upstream failures and gate Sentry reports.
 
-    def __init__(self) -> None:
+    Outage escalation is time-sensitive (see :meth:`note_failure`), so the clock
+    is a constructor dependency. Callers that go through
+    :func:`finalize_usage_transport_failure` or :func:`fetch_usage_limits` cannot
+    pass ``now`` down per call; injecting the clock lets tests exercise those
+    paths across simulated minutes without patching the global ``time`` module.
+    """
+
+    def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
+        """Initialize an empty failure streak.
+
+        Args:
+            clock: Zero-arg callable returning wall-clock seconds. Overridden in
+                tests to simulate tray polling intervals.
+        """
+        self._clock = clock
         self._consecutive_failures = 0
         self._first_failure_at: Optional[float] = None
         self._last_report_at: Optional[float] = None
@@ -110,24 +141,62 @@ class UsageUpstreamMonitor:
     async def note_failure(self, *, now: Optional[float] = None) -> bool:
         """Record a soft failure and decide whether to report an outage.
 
+        A failure counts as sustained only when the streak clears **both** the
+        count gate and the duration gate. The two conditions are ANDed, not ORed.
+
+        Why AND (do not change this back to OR): with ``or``, the duration gate
+        alone escalated on the *second* consecutive failure. The tray polls
+        ``/usage`` about once per minute, so the wall-clock gap between failure #1
+        and failure #2 already exceeded the duration threshold, which made the
+        count gate dead code. Production evidence from release 0.4.44, Sentry
+        project ``kiro-gateway-tray``: Issues ``KIRO-GATEWAY-TRAY-20``
+        (cause=connect) and ``KIRO-GATEWAY-TRAY-22`` (cause=timeout) both fired
+        with ``consecutive=2`` and ``consecutive_failures=2`` in the event extras,
+        never with the intended 5. Two failed polls is ordinary network jitter
+        (Wi-Fi roaming, VPN restart, sleep/wake) and must not open an Issue.
+
+        ANDing also makes the gates complementary rather than redundant: the count
+        gate rejects sparse polling (a suspended laptop can span hours with two
+        failures) and the duration gate rejects bursty callers that would
+        otherwise reach five failures within seconds.
+
         Args:
-            now: Optional monotonic-ish timestamp (``time.time()``); injectable
-                for tests.
+            now: Optional wall-clock timestamp (``time.time()`` semantics);
+                injectable for tests. Non-monotonic values are tolerated: a
+                backwards jump clamps the measured duration to zero instead of
+                producing a negative window.
 
         Returns:
-            ``True`` when this failure should trigger a Sentry/outage report.
+            ``True`` when this failure should trigger a Sentry/outage report,
+            i.e. both thresholds are met (``>=``, inclusive) and the previous
+            report is older than ``USAGE_OUTAGE_REPORT_COOLDOWN_S``.
         """
-        ts = time.time() if now is None else now
+        ts = self._clock() if now is None else now
         async with self._lock:
-            if self._consecutive_failures == 0:
+            if self._consecutive_failures == 0 or self._first_failure_at is None:
                 self._first_failure_at = ts
             self._consecutive_failures += 1
-            duration = 0.0 if self._first_failure_at is None else ts - self._first_failure_at
-            sustained = (
+            elapsed = ts - self._first_failure_at
+            if elapsed < 0.0:
+                logger.debug(
+                    "GET /usage outage clock moved backwards ({}s); "
+                    "treating failure window as 0s",
+                    elapsed,
+                )
+                elapsed = 0.0
+            enough_failures = (
                 self._consecutive_failures >= USAGE_OUTAGE_CONSECUTIVE_THRESHOLD
-                or duration >= USAGE_OUTAGE_DURATION_S
             )
-            if not sustained:
+            long_enough = elapsed >= USAGE_OUTAGE_DURATION_S
+            if not (enough_failures and long_enough):
+                logger.debug(
+                    "GET /usage soft failure {} over {:.1f}s not sustained yet "
+                    "(need {} failures and {:.0f}s)",
+                    self._consecutive_failures,
+                    elapsed,
+                    USAGE_OUTAGE_CONSECUTIVE_THRESHOLD,
+                    USAGE_OUTAGE_DURATION_S,
+                )
                 return False
             if (
                 self._last_report_at is not None
