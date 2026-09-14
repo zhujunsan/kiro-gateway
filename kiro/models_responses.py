@@ -42,6 +42,9 @@ SUPPORTED_INPUT_ITEM_TYPES = frozenset({
     "compaction",
     # Codex remote-compaction v2 transient marker (ignored by converters).
     "compaction_trigger",
+    # Codex Responses Lite: tools serialized as a leading input item
+    # instead of (or in addition to) the top-level ``tools`` array.
+    "additional_tools",
 })
 
 # Values that disable reasoning summary text emission (reasoning item may still exist).
@@ -306,7 +309,7 @@ def validate_responses_input_item(item: Any, index: Optional[int] = None) -> Non
         f"Unsupported {loc} type '{item_type}'. "
         f"Supported item types: {', '.join(sorted(SUPPORTED_INPUT_ITEM_TYPES))} "
         f"(message, function_call, function_call_output, reasoning, "
-        f"compaction, compaction_trigger). "
+        f"compaction, compaction_trigger, additional_tools). "
         f"Built-in tool items are not supported."
     )
 
@@ -334,6 +337,74 @@ def validate_responses_input(input_data: Union[str, List[Any], None]) -> None:
 
     for i, item in enumerate(input_data):
         validate_responses_input_item(item, index=i)
+
+
+def extract_additional_tools_from_input(
+    input_data: Union[str, List[Any], None],
+) -> List[Any]:
+    """
+    Collect nested tools from ``additional_tools`` input items.
+
+    Codex Responses Lite puts tools in a leading
+    ``{"type": "additional_tools", "role": "developer", "tools": [...]}``
+    item and omits the top-level ``tools`` array. Nested entries keep their
+    original shape (function / namespace / hosted) for the existing converters.
+
+    Kiro only has request-level tools, so every ``additional_tools`` item is
+    merged in appearance order.
+
+    Args:
+        input_data: Responses ``input`` (string, list, or None).
+
+    Returns:
+        Flat list of nested tool objects. Empty when none are present.
+
+    Raises:
+        ValueError: When an ``additional_tools`` item has a non-array ``tools``.
+    """
+    if not isinstance(input_data, list):
+        return []
+
+    collected: List[Any] = []
+    for i, item in enumerate(input_data):
+        if not isinstance(item, dict) or item.get("type") != "additional_tools":
+            continue
+        nested = item.get("tools")
+        if nested is None:
+            continue
+        if not isinstance(nested, list):
+            raise ValueError(
+                f"input[{i}]: additional_tools 'tools' must be an array"
+            )
+        collected.extend(nested)
+    return collected
+
+
+def merge_responses_tools(
+    top_level: Optional[Sequence[Any]],
+    input_data: Union[str, List[Any], None],
+) -> Optional[List[Any]]:
+    """
+    Merge top-level ``tools`` with tools from ``additional_tools`` input items.
+
+    Top-level entries come first so an explicit request-level list wins
+    duplicate-name collapse in converters. ``None`` when neither source
+    has any tools.
+
+    Args:
+        top_level: Request ``tools`` array (models or dicts).
+        input_data: Responses ``input`` that may contain ``additional_tools``.
+
+    Returns:
+        Combined tool list, or None when both sources are empty.
+    """
+    merged: List[Any] = []
+    if top_level:
+        merged.extend(list(top_level))
+    extra = extract_additional_tools_from_input(input_data)
+    if extra:
+        merged.extend(extra)
+    return merged or None
 
 
 def _validate_function_tool_dict(tool_dict: Dict[str, Any], loc: str) -> None:
@@ -772,7 +843,8 @@ def validate_responses_request(request: ResponsesRequest) -> None:
         background=request.background,
     )
     validate_responses_input(request.input)
-    validate_responses_tools(request.tools)
-    validate_responses_tool_choice(request.tool_choice, request.tools)
+    merged_tools = merge_responses_tools(request.tools, request.input)
+    validate_responses_tools(merged_tools)
+    validate_responses_tool_choice(request.tool_choice, merged_tools)
     resolve_responses_text_format(request.text)
     validate_responses_sampling_params(request)

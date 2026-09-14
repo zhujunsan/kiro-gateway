@@ -184,6 +184,59 @@ class TestResponsesValidation:
         assert "Unsupported tool type" not in detail
         assert "hosted_tools_not_supported" not in detail
 
+    def test_additional_tools_input_does_not_400(
+        self, test_client, valid_proxy_api_key
+    ):
+        """Codex Responses Lite sends tools as a leading additional_tools item."""
+        with patch(
+            "kiro.routes_responses.KiroHttpClient"
+        ) as mock_cls:
+            mock_instance = AsyncMock()
+            mock_instance.request_with_retry = AsyncMock(
+                side_effect=Exception("Network blocked")
+            )
+            mock_instance.close = AsyncMock()
+            mock_cls.return_value = mock_instance
+
+            response = test_client.post(
+                "/v1/responses",
+                headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "input": [
+                        {
+                            "type": "additional_tools",
+                            "role": "developer",
+                            "tools": [
+                                {
+                                    "type": "namespace",
+                                    "name": "functions",
+                                    "tools": [
+                                        {
+                                            "type": "function",
+                                            "name": "exec",
+                                            "parameters": {"type": "object"},
+                                        }
+                                    ],
+                                },
+                                {"type": "web_search"},
+                            ],
+                        },
+                        {
+                            "type": "message",
+                            "role": "developer",
+                            "content": [{"type": "input_text", "text": "Be helpful."}],
+                        },
+                        {"type": "message", "role": "user", "content": "Hello"},
+                    ],
+                },
+            )
+
+        assert response.status_code not in (400, 422)
+        detail = str(response.json().get("detail", ""))
+        assert "additional_tools" not in detail
+        assert "hosted_tools_not_supported" not in detail
+
     def test_explicit_temperature_returns_400_sampling_not_supported(
         self, test_client, valid_proxy_api_key
     ):

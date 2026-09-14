@@ -37,6 +37,7 @@ from kiro.models_responses import (
     ResponsesRequestError,
     ResponsesUnprocessableError,
     classify_responses_tools,
+    merge_responses_tools,
     reasoning_summary_budget_factor,
     resolve_responses_text_format,
     should_emit_reasoning_summary,
@@ -546,6 +547,8 @@ def convert_responses_input_to_unified(
     - ``function_call_output`` → user ``tool_results`` (``call_id`` → tool_use_id)
     - ``reasoning`` → skipped for Kiro (use :func:`extract_reasoning_input_stubs`
       for multi-turn echo; encrypted_content is never forwarded)
+    - ``additional_tools`` → skipped for Kiro (tools are merged via
+      :func:`kiro.models_responses.merge_responses_tools`)
 
     Args:
         input_data: Responses input (string or list of items)
@@ -601,6 +604,10 @@ def convert_responses_input_to_unified(
 
         if item_type == "compaction_trigger":
             # Codex remote-compaction v2 transient marker — not forwarded.
+            continue
+
+        if item_type == "additional_tools":
+            # Codex Responses Lite tool list — collected separately.
             continue
 
         if item_type == "compaction":
@@ -681,7 +688,7 @@ def convert_responses_input_to_unified(
         raise ValueError(
             f"Unsupported input item type '{item_type}'. "
             f"Supported: message, function_call, function_call_output, "
-            f"reasoning, compaction, compaction_trigger."
+            f"reasoning, compaction, compaction_trigger, additional_tools."
         )
 
     _flush_pending_tool_calls(pending_tool_calls, processed)
@@ -1107,8 +1114,10 @@ def build_kiro_payload_from_responses(
     )
 
     # Hosted policy first so unsupported_features is available to routes.
+    # Codex Responses Lite may send tools only inside additional_tools items.
+    merged_tools = merge_responses_tools(request_data.tools, request_data.input)
     filtered_tools, unsupported_features = prepare_responses_tools_policy(
-        request_data.tools
+        merged_tools
     )
     unified_tools = convert_responses_tools_to_unified(filtered_tools)
 
@@ -1116,7 +1125,7 @@ def build_kiro_payload_from_responses(
         system_prompt,
         unified_tools,
         request_data.tool_choice,
-        raw_tools=request_data.tools,
+        raw_tools=merged_tools,
     )
     system_prompt = apply_parallel_tool_calls_constraint(
         system_prompt,

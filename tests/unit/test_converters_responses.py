@@ -34,6 +34,8 @@ from kiro.models_responses import (
     ResponsesRequest,
     ResponsesRequestError,
     ResponsesUnprocessableError,
+    extract_additional_tools_from_input,
+    merge_responses_tools,
     should_emit_reasoning_summary,
     validate_responses_input,
     validate_responses_request,
@@ -117,7 +119,45 @@ class TestValidateResponsesInput:
             {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "c1", "output": "ok"},
             {"type": "reasoning", "summary": []},
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{"type": "function", "name": "exec", "parameters": {}}],
+            },
         ])
+
+    def test_additional_tools_non_array_raises(self):
+        with pytest.raises(ValueError, match="additional_tools 'tools' must be an array"):
+            extract_additional_tools_from_input([
+                {"type": "additional_tools", "role": "developer", "tools": "nope"},
+            ])
+
+    def test_merge_responses_tools_top_level_then_input(self):
+        merged = merge_responses_tools(
+            [{"type": "function", "name": "Read", "parameters": {}}],
+            [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{"type": "function", "name": "exec", "parameters": {}}],
+                },
+                {"type": "message", "role": "user", "content": "hi"},
+            ],
+        )
+        assert merged is not None
+        assert [t["name"] for t in merged] == ["Read", "exec"]
+
+    def test_merge_responses_tools_input_only(self):
+        merged = merge_responses_tools(
+            None,
+            [{
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{"type": "function", "name": "exec", "parameters": {}}],
+            }],
+        )
+        assert merged is not None
+        assert merged[0]["name"] == "exec"
 
     def test_easy_input_message_without_type_ok(self):
         validate_responses_input([{"role": "user", "content": "hi"}])
@@ -433,6 +473,25 @@ class TestConvertResponsesInputToUnified:
     def test_unknown_item_raises_value_error(self):
         with pytest.raises(ValueError, match="Unsupported"):
             convert_responses_input_to_unified([{"type": "computer_call"}])
+
+    def test_additional_tools_not_forwarded_as_messages(self):
+        system, msgs = convert_responses_input_to_unified([
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{"type": "function", "name": "exec", "parameters": {}}],
+            },
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "Be concise."}],
+            },
+            {"type": "message", "role": "user", "content": "hi"},
+        ])
+        assert "Be concise." in system
+        assert len(msgs) == 1
+        assert msgs[0].role == "user"
+        assert msgs[0].content == "hi"
 
     def test_sanitizes_call_ids(self):
         raw_id = "call_ba9Q96rddtkJMtrrtZQXHWDr\nfc_08a8627642d75eb1016a182009cd9481a2bdbf6c0ae2e7d"
@@ -1121,6 +1180,139 @@ class TestBuildKiroPayloadFromResponses:
             input=[{"type": "web_search_call", "id": "w1"}],
         )
         with pytest.raises(ValueError, match="Unsupported"):
+            build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+
+    def test_additional_tools_only_are_forwarded_as_kiro_tools(self):
+        """Codex Responses Lite omits top-level tools and sends additional_tools."""
+        req = ResponsesRequest(
+            model="m",
+            input=[
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "functions",
+                            "description": "",
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "name": "exec",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {"cmd": {"type": "string"}},
+                                    },
+                                },
+                                {
+                                    "type": "function",
+                                    "name": "wait",
+                                    "parameters": {"type": "object"},
+                                },
+                            ],
+                        },
+                        {"type": "local_shell"},
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "test instructions"}],
+                },
+                {"type": "message", "role": "user", "content": "hello"},
+            ],
+        )
+        result = build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        payload = _payload_of(result)
+        ctx = (
+            payload["conversationState"]["currentMessage"]["userInputMessage"]
+            .get("userInputMessageContext") or {}
+        )
+        names = [
+            t.get("toolSpecification", {}).get("name")
+            for t in (ctx.get("tools") or [])
+        ]
+        assert "functions__exec" in names
+        assert "functions__wait" in names
+        assert "local_shell" not in names
+        assert "tool:local_shell" in result.unsupported_features
+        current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert "hello" in current["content"]
+        assert "additional_tools" not in current["content"]
+
+    def test_additional_tools_merge_with_top_level_tools(self):
+        req = ResponsesRequest(
+            model="m",
+            input=[
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{"type": "function", "name": "exec", "parameters": {}}],
+                },
+                {"type": "message", "role": "user", "content": "hi"},
+            ],
+            tools=[ResponsesFunctionTool(type="function", name="Read", parameters={})],
+        )
+        result = build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        payload = _payload_of(result)
+        ctx = (
+            payload["conversationState"]["currentMessage"]["userInputMessage"]
+            .get("userInputMessageContext") or {}
+        )
+        names = [
+            t.get("toolSpecification", {}).get("name")
+            for t in (ctx.get("tools") or [])
+        ]
+        assert "Read" in names
+        assert "exec" in names
+
+    def test_additional_tools_hosted_only_raises(self):
+        req = ResponsesRequest(
+            model="m",
+            input=[
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{"type": "web_search"}],
+                },
+                {"type": "message", "role": "user", "content": "hi"},
+            ],
+        )
+        with pytest.raises(ResponsesUnprocessableError) as exc_info:
+            build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        assert exc_info.value.code == "hosted_tools_not_supported"
+
+    def test_tool_choice_named_from_additional_tools(self):
+        req = ResponsesRequest(
+            model="m",
+            input=[
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {"type": "function", "name": "Read", "parameters": {}},
+                        {"type": "function", "name": "Write", "parameters": {}},
+                    ],
+                },
+                {"type": "message", "role": "user", "content": "hi"},
+            ],
+            tool_choice={"type": "function", "name": "Write"},
+        )
+        result = build_kiro_payload_from_responses(req, "c", "arn:aws:test")
+        assert result.tool_choice_mode == "function"
+        assert _TOOL_CHOICE_NAMED_PROMPT.format(name="Write") in _system_text_from_payload(
+            _payload_of(result)
+        )
+
+    def test_additional_tools_malformed_tools_raises(self):
+        req = ResponsesRequest(
+            model="m",
+            input=[
+                {"type": "additional_tools", "role": "developer", "tools": {"name": "x"}},
+                {"type": "message", "role": "user", "content": "hi"},
+            ],
+        )
+        with pytest.raises(ValueError, match="additional_tools 'tools' must be an array"):
             build_kiro_payload_from_responses(req, "c", "arn:aws:test")
 
     def test_strips_builtin_and_expands_namespace_tools(self):
