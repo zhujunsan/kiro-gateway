@@ -38,19 +38,20 @@ _CLAUDE_FAMILY_TO_CODE: Dict[str, str] = {
     "opus": "o",
     "sonnet": "s",
     "haiku": "h",
+    "fable": "f",
 }
 _CLAUDE_CODE_TO_FAMILY: Dict[str, str] = {
     code: family for family, code in _CLAUDE_FAMILY_TO_CODE.items()
 }
 
-# claude-{opus|sonnet|haiku}-{version} where version may include dots (4.5, 5).
+# claude-{opus|sonnet|haiku|fable}-{version} where version may include dots (4.5, 5.1).
 _CLAUDE_CANONICAL_RE = re.compile(
-    r"^claude-(opus|sonnet|haiku)-(.+)$",
+    r"^claude-(opus|sonnet|haiku|fable)-(.+)$",
     re.IGNORECASE,
 )
-# kiro-{o|s|h}-{version}
+# kiro-{o|s|h|f}-{version}
 _KIRO_CLAUDE_ALIAS_RE = re.compile(
-    r"^kiro-([osh])-(.+)$",
+    r"^kiro-([oshf])-(.+)$",
     re.IGNORECASE,
 )
 
@@ -61,7 +62,7 @@ def generate_model_alias(model_id: str) -> Optional[str]:
 
     Rules:
     - ``auto`` and ``gpt-*`` → ``None`` (native IDs, no alias)
-    - ``claude-{opus|sonnet|haiku}-{ver}`` → ``kiro-{o|s|h}-{ver}``
+    - ``claude-{opus|sonnet|haiku|fable}-{ver}`` → ``kiro-{o|s|h|f}-{ver}``
     - other non-empty IDs → ``kiro-{id}``
 
     Args:
@@ -76,6 +77,8 @@ def generate_model_alias(model_id: str) -> Optional[str]:
         'kiro-o-5'
         >>> generate_model_alias("claude-sonnet-5")
         'kiro-s-5'
+        >>> generate_model_alias("claude-fable-5.1")
+        'kiro-f-5.1'
         >>> generate_model_alias("deepseek-3.2")
         'kiro-deepseek-3.2'
         >>> generate_model_alias("auto")
@@ -111,7 +114,7 @@ def resolve_model_alias(
 
     Resolution order:
     1. Explicit ``aliases`` table (static config / custom mappings)
-    2. Syntactic reverse of ``kiro-o|s|h-*`` → ``claude-{opus|sonnet|haiku}-*``
+    2. Syntactic reverse of ``kiro-o|s|h|f-*`` → ``claude-{opus|sonnet|haiku|fable}-*``
     3. Syntactic reverse of ``kiro-*`` → strip the ``kiro-`` prefix
     4. Return ``name`` unchanged
 
@@ -125,6 +128,8 @@ def resolve_model_alias(
     Examples:
         >>> resolve_model_alias("kiro-o-5", {})
         'claude-opus-5'
+        >>> resolve_model_alias("kiro-f-5.1", {})
+        'claude-fable-5.1'
         >>> resolve_model_alias("kiro-deepseek-3.2", {})
         'deepseek-3.2'
         >>> resolve_model_alias("my-auto", {"my-auto": "auto"})

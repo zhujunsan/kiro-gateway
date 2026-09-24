@@ -310,7 +310,7 @@ def filter_codex_model_ids(model_ids: Sequence[str]) -> List[str]:
     gateway-only shortcut names.
 
     A slug is treated as an alias when it is a key of ``MODEL_ALIASES`` or when
-    ``resolve_model_alias`` rewrites it (syntactic ``kiro-o|s|h-*`` / ``kiro-*``).
+    ``resolve_model_alias`` rewrites it (syntactic ``kiro-o|s|h|f-*`` / ``kiro-*``).
 
     Args:
         model_ids: Full available-model list (may include aliases).
