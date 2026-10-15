@@ -30,6 +30,35 @@ from kiro.config import PROXY_API_KEY, APP_VERSION
 # Tests for verify_api_key function
 # =============================================================================
 
+class TestToolSchemaRejection:
+    """Verify lossy schema alternatives become actionable HTTP 400 responses."""
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("account_system", [False, True])
+    @pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
+    def test_rejects_root_alternatives_before_upstream_request(
+        self, test_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+        stream: bool, account_system: bool, keyword: str,
+    ) -> None:
+        """Reject both response modes in legacy and account-failover routing paths."""
+        monkeypatch.setattr(test_client.app.state, "account_system", account_system)
+        with patch("kiro.routes_openai.KiroHttpClient") as upstream:
+            response = test_client.post(
+                "/v1/chat/completions", headers={"Authorization": f"Bearer {PROXY_API_KEY}"},
+                json={"model": "claude-sonnet-5", "stream": stream,
+                      "messages": [{"role": "user", "content": "Hello"}],
+                      "tools": [{"type": "function", "function": {
+                          "name": "schema_tool", "parameters": {
+                              keyword: [{"required": ["x"]}, {"required": ["y"]}],
+                          },
+                      }}]},
+            )
+        assert response.status_code == 400
+        assert "schema_tool" in response.text
+        assert "expose separate tools" in response.text
+        upstream.assert_not_called()
+
+
 class TestVerifyApiKey:
     """Tests for the verify_api_key authentication function."""
     

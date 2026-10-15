@@ -33,6 +33,7 @@ to convert their formats to Kiro API format.
 import hashlib
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -598,54 +599,198 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
 # JSON Schema Sanitization
 # ==================================================================================================
 
-def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Sanitizes JSON Schema from fields that Kiro API doesn't accept.
-    
-    Kiro API returns 400 "Improperly formed request" error if:
-    - required is an empty array []
-    - additionalProperties is present in schema
-    
-    This function recursively processes the schema and removes problematic fields.
-    
+_SCHEMA_COMPOSITION_KEYS = frozenset({"allOf", "anyOf", "oneOf"})
+_SCHEMA_MAP_KEYS = frozenset({
+    "properties", "patternProperties", "$defs", "definitions", "dependentSchemas",
+})
+_SCHEMA_SINGLE_KEYS = frozenset({
+    "items", "additionalItems", "contains", "propertyNames", "not", "if", "then",
+    "else", "unevaluatedProperties", "unevaluatedItems", "contentSchema",
+})
+_SCHEMA_REFERENCE_KEYS = frozenset({
+    "$ref", "$dynamicRef", "$recursiveRef", "$id", "$anchor", "$dynamicAnchor",
+    "$recursiveAnchor",
+})
+# Flatten only independent object constraints and annotations. In particular,
+# references and evaluation-scoped keywords cannot safely be moved across allOf.
+_SCHEMA_FLATTENABLE_KEYS = frozenset({
+    "type", "properties", "required", "minProperties", "maxProperties", "enum",
+    "const", "title", "description", "$comment", "default", "examples",
+    "deprecated", "readOnly", "writeOnly",
+})
+_SCHEMA_COMPOSITION_GUIDANCE = (
+    "Bedrock does not support root allOf/anyOf/oneOf. "
+    "Declare a flat object schema with composition inside individual properties, "
+    "or expose separate tools for alternatives; the gateway will not discard branches."
+)
+
+
+def _sanitize_schema_node(schema: Any, relocating: bool) -> Any:
+    """Sanitize schema locations, leaving property names and instance data intact.
+
     Args:
-        schema: JSON Schema to sanitize
-    
+        schema: A schema object or a nested boolean schema.
+        relocating: Whether root composition expansion will move schema locations.
+
     Returns:
-        Sanitized copy of schema
+        A detached sanitized schema, preserving nested composition.
+
+    Raises:
+        ValueError: A schema is malformed or moving it could change references.
     """
-    if not schema:
-        return {}
-    
-    result = {}
-    
+    if isinstance(schema, bool):
+        return schema
+    if not isinstance(schema, dict):
+        raise ValueError("Tool input schema nodes must be objects or booleans.")
+
+    result: Dict[str, Any] = {}
     for key, value in schema.items():
-        # Skip empty required arrays
-        if key == "required" and isinstance(value, list) and len(value) == 0:
-            continue
-        
-        # Skip additionalProperties - Kiro API doesn't support it
+        if relocating and key in _SCHEMA_REFERENCE_KEYS:
+            raise ValueError(
+                f"Cannot safely flatten a tool schema containing {key}. "
+                + _SCHEMA_COMPOSITION_GUIDANCE
+            )
         if key == "additionalProperties":
+            # Existing Kiro compatibility workaround, also applied in subschemas.
             continue
-        
-        # Recursively process nested objects
-        if key == "properties" and isinstance(value, dict):
+        if key == "required":
+            if not isinstance(value, list) or not value:
+                logger.debug("Removing empty or non-array tool schema required value")
+                continue
+            if any(not isinstance(name, str) for name in value):
+                raise ValueError("Tool schema 'required' must contain only property name strings.")
+            result[key] = list(dict.fromkeys(value))
+        elif key in _SCHEMA_MAP_KEYS or key == "dependencies":
+            if not isinstance(value, dict):
+                raise ValueError(f"Tool schema '{key}' must be an object.")
             result[key] = {
-                prop_name: sanitize_json_schema(prop_value) if isinstance(prop_value, dict) else prop_value
-                for prop_name, prop_value in value.items()
+                name: deepcopy(child) if key == "dependencies" and isinstance(child, list)
+                else _sanitize_schema_node(child, relocating)
+                for name, child in value.items()
             }
-        elif isinstance(value, dict):
-            result[key] = sanitize_json_schema(value)
-        elif isinstance(value, list):
-            # Process lists (e.g., anyOf, oneOf)
-            result[key] = [
-                sanitize_json_schema(item) if isinstance(item, dict) else item
-                for item in value
-            ]
+        elif key in _SCHEMA_COMPOSITION_KEYS or key == "prefixItems":
+            if not isinstance(value, list) or (key in _SCHEMA_COMPOSITION_KEYS and not value):
+                raise ValueError(f"Tool schema '{key}' must be a non-empty array of schemas.")
+            result[key] = [_sanitize_schema_node(child, relocating) for child in value]
+        elif key in _SCHEMA_SINGLE_KEYS:
+            # Draft 4/7 also allow tuple validation through an items array.
+            result[key] = (
+                [_sanitize_schema_node(child, relocating) for child in value]
+                if key == "items" and isinstance(value, list)
+                else _sanitize_schema_node(value, relocating)
+            )
         else:
-            result[key] = value
-    
+            # enum/default/examples and extension values are instance data, not schemas.
+            result[key] = deepcopy(value)
     return result
+
+
+def _merge_root_schema_constraints(
+    left: Dict[str, Any], right: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Conjoin flat constraints without overwriting either schema's requirements.
+
+    Args:
+        left: Already merged sibling constraints.
+        right: One flat composition branch.
+
+    Returns:
+        A new schema retaining both inputs' constraints.
+
+    Raises:
+        ValueError: A root constraint cannot be conjoined without further rewriting.
+    """
+    merged = deepcopy(left)
+    for key, value in right.items():
+        if key == "required":
+            merged[key] = list(dict.fromkeys(merged.get(key, []) + value))
+        elif key == "properties":
+            properties = merged.setdefault(key, {})
+            for name, child in value.items():
+                if name in properties:
+                    # Nested allOf is accepted and expresses even conflicting
+                    # property constraints exactly; last-write-wins would not.
+                    properties[name] = {"allOf": [properties[name], deepcopy(child)]}
+                else:
+                    properties[name] = deepcopy(child)
+        elif key not in merged:
+            merged[key] = deepcopy(value)
+        elif json.dumps(merged[key], sort_keys=True) != json.dumps(value, sort_keys=True):
+            raise ValueError(
+                f"Cannot safely merge conflicting root tool schema '{key}' constraints. "
+                + _SCHEMA_COMPOSITION_GUIDANCE
+            )
+    return merged
+
+
+def _resolve_top_level_composition(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Expand only root compositions that have a conservative, lossless form.
+
+    Args:
+        schema: A sanitized schema whose nested composition must remain intact.
+
+    Returns:
+        A schema without root composition, retaining all representable constraints.
+
+    Raises:
+        ValueError: Alternatives or evaluation-sensitive constraints need client changes.
+    """
+    unsupported = set(schema) - _SCHEMA_COMPOSITION_KEYS - _SCHEMA_FLATTENABLE_KEYS
+    if unsupported:
+        raise ValueError(
+            f"Cannot safely flatten root tool schema keywords: {', '.join(sorted(unsupported))}. "
+            + _SCHEMA_COMPOSITION_GUIDANCE
+        )
+    resolved = {key: value for key, value in schema.items() if key not in _SCHEMA_COMPOSITION_KEYS}
+    for key in ("allOf", "anyOf", "oneOf"):
+        if key not in schema:
+            continue
+        variants = schema[key]
+        if key != "allOf" and len(variants) != 1:
+            raise ValueError(
+                f"Root tool schema '{key}' has multiple alternatives that cannot be flattened safely. "
+                + _SCHEMA_COMPOSITION_GUIDANCE
+            )
+        for variant in variants:
+            if variant is True:
+                continue
+            if variant is False:
+                raise ValueError(
+                    "Root tool schema composition forbids all inputs. "
+                    + _SCHEMA_COMPOSITION_GUIDANCE
+                )
+            branch = _resolve_top_level_composition(variant)
+            resolved = _merge_root_schema_constraints(resolved, branch)
+    logger.debug("Expanded root tool schema composition without discarding constraints")
+    return resolved
+
+
+def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return a detached, Kiro-compatible schema without choosing user alternatives.
+
+    Empty/non-array required values and additionalProperties are removed for
+    existing Kiro compatibility. Invalid required members are rejected rather
+    than losing valid requirements. Root allOf constraints and single-branch
+    alternatives are expanded only when this preserves their meaning; ambiguous
+    alternatives produce actionable conversion errors (HTTP 400 in all routes).
+    Nested compositions and instance values such as defaults are preserved.
+
+    Args:
+        schema: Tool input schema, or None for a parameterless tool.
+
+    Returns:
+        A sanitized copy with no root allOf/anyOf/oneOf.
+
+    Raises:
+        ValueError: The input is malformed or cannot be represented safely for Bedrock.
+    """
+    if schema is None:
+        return {}
+    if not isinstance(schema, dict):
+        raise ValueError("Tool input schema must be a JSON object.")
+    relocating = bool(_SCHEMA_COMPOSITION_KEYS.intersection(schema))
+    sanitized = _sanitize_schema_node(schema, relocating)
+    return _resolve_top_level_composition(sanitized) if relocating else sanitized
 
 
 # ==================================================================================================
@@ -854,7 +999,10 @@ def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dic
     kiro_tools = []
     for tool in tools:
         # Sanitize parameters from fields that Kiro API doesn't accept
-        sanitized_params = sanitize_json_schema(tool.input_schema)
+        try:
+            sanitized_params = sanitize_json_schema(tool.input_schema)
+        except ValueError as error:
+            raise ValueError(f"Invalid input schema for tool '{tool.name}': {error}") from error
         # Bedrock rejects the whole request when a tool schema is not an object
         sanitized_params = normalize_tool_input_schema(sanitized_params, tool.name)
         

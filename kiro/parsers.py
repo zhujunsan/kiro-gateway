@@ -28,6 +28,7 @@ Contains classes and functions for:
 """
 
 import json
+import math
 import re
 from typing import Any, Dict, List, Optional
 
@@ -303,7 +304,8 @@ class AwsEventStreamParser:
     - tool_start: Start of tool call (name, toolUseId)
     - tool_input: Continuation of input for tool call
     - tool_stop: End of tool call
-    - usage: Credit consumption information
+    - usage: Legacy numeric credits or upstream token usage dictionaries
+    - metering: Validated credit consumption, separate from token usage
     - context_usage: Context usage percentage
     
     Attributes:
@@ -320,16 +322,20 @@ class AwsEventStreamParser:
         ...         print(event["data"])
     """
     
-    # Patterns for finding JSON events
-    EVENT_PATTERNS = [
-        ('{"content":', 'content'),
-        ('{"name":', 'tool_start'),
-        ('{"input":', 'tool_input'),
-        ('{"stop":', 'tool_stop'),
-        ('{"followupPrompt":', 'followup'),
-        ('{"usage":', 'usage'),
-        ('{"contextUsagePercentage":', 'context_usage'),
-    ]
+    # Locate complete top-level objects, including unknown events, so a nested
+    # usage object cannot be mistaken for a standalone completion signal.
+    EVENT_START_PATTERN = re.compile(r'\{\s*"(?P<key>(?:[^"\\]|\\.)*)"\s*:')
+    EVENT_TYPES = {
+        'content': 'content',
+        'name': 'tool_start',
+        'input': 'tool_input',
+        'stop': 'tool_stop',
+        'followupPrompt': 'followup',
+        'usage': 'usage',
+        'unit': 'metering',
+        'unitPlural': 'metering',
+        'contextUsagePercentage': 'context_usage',
+    }
     
     def __init__(self):
         """Initializes the parser."""
@@ -348,26 +354,16 @@ class AwsEventStreamParser:
         Returns:
             List of events in {"type": str, "data": Any} format
         """
-        try:
-            self.buffer += chunk.decode('utf-8', errors='ignore')
-        except Exception:
-            return []
+        self.buffer += chunk.decode('utf-8', errors='ignore')
         
         events = []
         
         while True:
-            # Find nearest pattern
-            earliest_pos = -1
-            earliest_type = None
-            
-            for pattern, event_type in self.EVENT_PATTERNS:
-                pos = self.buffer.find(pattern)
-                if pos != -1 and (earliest_pos == -1 or pos < earliest_pos):
-                    earliest_pos = pos
-                    earliest_type = event_type
-            
-            if earliest_pos == -1:
+            match = self.EVENT_START_PATTERN.search(self.buffer)
+            if match is None:
                 break
+            earliest_pos = match.start()
+            earliest_type = self.EVENT_TYPES.get(match.group('key'))
             
             # Find JSON end
             json_end = find_matching_brace(self.buffer, earliest_pos)
@@ -380,7 +376,8 @@ class AwsEventStreamParser:
             
             try:
                 data = json.loads(json_str)
-                events.extend(self._process_event(data, earliest_type))
+                if earliest_type is not None:
+                    events.extend(self._process_event(data, earliest_type))
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse JSON: {json_str[:100]}")
         
@@ -407,13 +404,52 @@ class AwsEventStreamParser:
             return self._process_tool_input_event(data)
         elif event_type == 'tool_stop':
             return self._process_tool_stop_event(data)
-        elif event_type == 'usage':
-            return [{"type": "usage", "data": data.get('usage', 0)}]
+        elif event_type in ('usage', 'metering'):
+            return self._process_usage_event(data, event_type)
         elif event_type == 'context_usage':
             return [{"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}]
         
         return []
     
+    def _process_usage_event(
+        self, data: Dict[str, Any], event_type: str
+    ) -> List[Dict[str, Any]]:
+        """Validate metering without treating credits as token counts.
+
+        The PR #280 sample has unit/unitPlural before usage. Legacy scalar
+        usage remains supported; dictionaries are forwarded only as token usage.
+        Explicit unknown units must never fall back to legacy credit handling.
+
+        Args:
+            data: Complete upstream JSON object.
+            event_type: Event type inferred from the object's first key.
+
+        Returns:
+            One validated usage/metering event, or no events for invalid input.
+        """
+        has_unit = 'unit' in data or 'unitPlural' in data
+        if has_unit and data.get('unit') != 'credit':
+            logger.warning("Ignoring metering event with unsupported or missing unit")
+            return []
+
+        usage = data.get('usage')
+        if isinstance(usage, dict) and not has_unit and event_type == 'usage':
+            return [{"type": "usage", "data": usage}]
+        if isinstance(usage, bool) or not isinstance(usage, (int, float)):
+            logger.warning("Ignoring metering event without numeric credit usage")
+            return []
+        try:
+            credits = float(usage)
+        except OverflowError:
+            logger.warning("Ignoring metering event with out-of-range credit usage")
+            return []
+        if not math.isfinite(credits) or credits < 0:
+            logger.warning("Ignoring metering event with invalid credit usage")
+            return []
+        # Keep the legacy low-level event contract; the shared stream adapter
+        # normalizes scalar usage into the dedicated metering event.
+        return [{"type": "metering" if has_unit else "usage", "data": credits}]
+
     def _process_content_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes content event."""
         content = data.get('content', '')

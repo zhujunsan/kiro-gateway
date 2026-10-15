@@ -29,6 +29,7 @@ Reference: https://docs.anthropic.com/en/api/messages
 import time
 from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, model_validator
+from pydantic_core import PydanticCustomError
 
 
 # ==================================================================================================
@@ -63,6 +64,23 @@ class ThinkingContentBlock(BaseModel):
     type: Literal["thinking"] = "thinking"
     thinking: str
     signature: str = ""
+
+
+class RedactedThinkingContentBlock(BaseModel):
+    """
+    Opaque redacted thinking block replayed in Anthropic message history.
+
+    The data is preserved for request compatibility, but is not readable text
+    and must not be included in the prompt sent to Kiro. This block is specific
+    to the Anthropic API; OpenAI messages have no equivalent content block.
+
+    Attributes:
+        type: Always "redacted_thinking".
+        data: Opaque payload returned by Anthropic, preserved without decoding.
+    """
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str
 
 
 class ToolUseContentBlock(BaseModel):
@@ -166,6 +184,7 @@ class ImageContentBlock(BaseModel):
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
+    RedactedThinkingContentBlock,
     ImageContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
@@ -198,13 +217,20 @@ class AnthropicMessage(BaseModel):
 # ==================================================================================================
 
 
+# Only supported native tools may omit their name and input schema.
+ANTHROPIC_SERVER_TOOL_NAMES: Dict[str, str] = {
+    "web_search_20250305": "web_search",
+}
+
+
 class AnthropicTool(BaseModel):
     """
     Tool definition in Anthropic format.
     
     Supports both user-defined tools and server-side tools (Anthropic):
-    - User-defined tools: require input_schema
-    - Server-side tools: use type field (e.g., "web_search_20250305")
+    - User-defined tools: require name and input_schema
+    - Supported server-side tools: use type field (e.g., "web_search_20250305")
+      and receive a canonical name when omitted
     
     Attributes:
         type: Tool type for server-side tools (e.g., "web_search_20250305")
@@ -233,18 +259,41 @@ class AnthropicTool(BaseModel):
     
     model_config = {"extra": "allow"}  # Forward compatibility
     
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_server_tool_name(cls, data: Any) -> Any:
+        """Supply the canonical name only for supported, unnamed native tools.
+
+        Args:
+            data: Raw tool definition supplied to model validation.
+
+        Returns:
+            A copy with the canonical name, or the unchanged input.
+        """
+        if isinstance(data, dict) and "name" not in data:
+            tool_type = data.get("type")
+            if isinstance(tool_type, str) and tool_type in ANTHROPIC_SERVER_TOOL_NAMES:
+                return {**data, "name": ANTHROPIC_SERVER_TOOL_NAMES[tool_type]}
+        return data
+
     @model_validator(mode="after")
-    def validate_tool_consistency(self):
-        """Validate that user-defined tools have input_schema."""
-        is_server_side = self.type is not None
-        
-        if not is_server_side:
-            # User-defined tool: input_schema is required
-            if self.input_schema is None:
-                raise ValueError(
-                    "input_schema is required for user-defined tools "
-                    "(those without a 'type' field)"
-                )
+    def validate_tool_consistency(self) -> "AnthropicTool":
+        """Require nonblank names and schemas for tools without native support.
+
+        Returns:
+            The validated tool with a non-null string name.
+
+        Raises:
+            PydanticCustomError: If the name is blank or a non-native tool lacks a schema.
+        """
+        if not self.name.strip():
+            raise PydanticCustomError("tool_name_blank", "name must not be blank")
+        if self.type not in ANTHROPIC_SERVER_TOOL_NAMES and self.input_schema is None:
+            raise PydanticCustomError(
+                "tool_input_schema_missing",
+                "input_schema is required for user-defined tools "
+                "and unsupported server-side tool types",
+            )
         return self
 
 

@@ -127,7 +127,8 @@ async def stream_kiro_to_openai_internal(
     created_time = int(time.time())
     first_chunk = True
     
-    metering_data = None
+    upstream_usage = None
+    credits_used: Optional[float] = None
     context_usage_percentage = None
     full_content = ""
     full_thinking_content = ""  # Accumulated thinking content for non-streaming
@@ -428,13 +429,16 @@ async def stream_kiro_to_openai_internal(
                     next_tool_index += 1
             
             elif event.type == "usage" and event.usage:
-                metering_data = event.usage
+                upstream_usage = event.usage
+
+            elif event.type == "metering" and event.credits is not None:
+                credits_used = (credits_used or 0.0) + event.credits
             
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
         
         # Track completion signals for truncation detection
-        received_usage = metering_data is not None
+        received_usage = upstream_usage is not None or credits_used is not None
         received_context_usage = context_usage_percentage is not None
         stream_completed_normally = received_usage or received_context_usage
         
@@ -558,8 +562,9 @@ async def stream_kiro_to_openai_internal(
             }
         }
         
-        if metering_data:
-            final_chunk["usage"]["credits_used"] = metering_data
+        if credits_used is not None:
+            final_chunk["usage"]["credits_used"] = credits_used
+            logger.info(f"[Credit] req={completion_id} model={model} credits={credits_used}")
         
         # Log final token values being sent to client
         logger.debug(

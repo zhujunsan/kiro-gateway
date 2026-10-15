@@ -11,6 +11,8 @@ Tests for shared conversion logic used by both OpenAI and Anthropic adapters:
 - Thinking tag injection
 """
 
+from copy import deepcopy
+from typing import Any, Dict
 import os
 import re
 import pytest
@@ -2731,21 +2733,20 @@ class TestSanitizeJsonSchema:
         What it does: Verifies sanitization of items in lists (anyOf, oneOf).
         Purpose: Ensure list elements are also sanitized.
         """
-        print("Setup: Schema with anyOf...")
+        print("Setup: Schema with nested anyOf...")
         schema = {
-            "anyOf": [
+            "properties": {"value": {"anyOf": [
                 {"type": "string", "additionalProperties": False},
-                {"type": "number", "required": []}
-            ]
+                {"type": "number", "required": []},
+            ]}}
         }
-        
+
         print("Action: Sanitizing schema...")
         result = sanitize_json_schema(schema)
-        
-        print(f"Result: {result}")
-        print("Checking anyOf elements...")
-        assert "additionalProperties" not in result["anyOf"][0]
-        assert "required" not in result["anyOf"][1]
+
+        nested = result["properties"]["value"]
+        assert "additionalProperties" not in nested["anyOf"][0]
+        assert "required" not in nested["anyOf"][1]
     
     def test_preserves_non_dict_list_items(self):
         """
@@ -2789,6 +2790,236 @@ class TestSanitizeJsonSchema:
         assert "additionalProperties" not in result
         assert result["required"] == ["question", "options"]  # Non-empty required is preserved
         assert result["properties"]["question"]["type"] == "string"
+
+
+class TestToolSchemaCompatibility:
+    """Exercise malformed schemas and lossless root composition across all APIs."""
+
+    @pytest.mark.parametrize("required", [None, [], "name", {}, 0, 1, False, True])
+    def test_removes_invalid_required_values(self, required: Any) -> None:
+        """Remove non-array/empty required at root and nested schema locations."""
+        schema = {"required": required, "properties": {"child": {"required": required}}}
+        assert sanitize_json_schema(schema) == {"properties": {"child": {}}}
+
+    @pytest.mark.parametrize("required", [[None], [1], [True], [{}], [["x"]], ["x", 3]])
+    def test_rejects_invalid_required_members(self, required: Any) -> None:
+        """Reject malformed members instead of discarding valid requirements."""
+        with pytest.raises(ValueError, match="only property name strings"):
+            sanitize_json_schema({"required": required})
+
+    def test_required_union_preserves_names_and_order(self) -> None:
+        """Union root and branch requirements, including duplicate/undeclared names."""
+        schema = {"required": ["root", "root"], "allOf": [
+            {"required": ["a", "root"]}, {"required": ["b", "a"]},
+        ]}
+        assert sanitize_json_schema(schema) == {"required": ["root", "a", "b"]}
+
+    @pytest.mark.parametrize("schema", [False, True, [], [1], "", "schema", 0, 1])
+    def test_rejects_non_object_root(self, schema: Any) -> None:
+        """Give an actionable error rather than crashing or treating false as absent."""
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            sanitize_json_schema(schema)
+
+    @pytest.mark.parametrize("keyword", ["allOf", "anyOf", "oneOf"])
+    @pytest.mark.parametrize("variants", [None, [], {}, "object", [None], [0], ["object"]])
+    def test_rejects_malformed_composition(self, keyword: str, variants: Any) -> None:
+        """Reject malformed branches rather than silently stripping constraints."""
+        with pytest.raises(ValueError, match="Tool (input )?schema"):
+            sanitize_json_schema({keyword: variants})
+
+    @pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
+    def test_rejects_multiple_alternatives_without_mutation(self, keyword: str) -> None:
+        """Keep both object and scalar alternatives instead of selecting a branch."""
+        schema = {keyword: [
+            {"type": "string"},
+            {"type": "object", "properties": {"x": {"type": "number"}}},
+        ]}
+        before = deepcopy(schema)
+        with pytest.raises(ValueError, match="will not discard branches"):
+            sanitize_json_schema(schema)
+        assert schema == before
+
+    @pytest.mark.parametrize("keyword", ["allOf", "anyOf", "oneOf"])
+    def test_single_branch_preserves_siblings(self, keyword: str) -> None:
+        """Retain sibling bounds and property intersections when flattening one branch."""
+        schema = {
+            "description": "Keep me", "minProperties": 1,
+            "properties": {"x": {"minimum": 0}},
+            keyword: [{"type": "object", "maxProperties": 4,
+                       "properties": {"x": {"maximum": 10}}, "required": ["x"]}],
+        }
+        result = sanitize_json_schema(schema)
+        assert result == {
+            "description": "Keep me", "type": "object", "minProperties": 1,
+            "maxProperties": 4, "required": ["x"],
+            "properties": {"x": {"allOf": [{"minimum": 0}, {"maximum": 10}]}},
+        }
+
+    def test_allof_retains_conflicting_property_constraints(self) -> None:
+        """Conflicting property types remain an intersection, not last-write-wins."""
+        result = sanitize_json_schema({"allOf": [
+            {"properties": {"x": {"type": "string"}}},
+            {"properties": {"x": {"type": "integer"}, "y": True}},
+        ]})
+        assert result["properties"] == {
+            "x": {"allOf": [{"type": "string"}, {"type": "integer"}]}, "y": True,
+        }
+
+    @pytest.mark.parametrize("left,right", [
+        ({"type": "object"}, {"type": "string"}),
+        ({"minProperties": 1}, {"minProperties": 2}),
+        ({"enum": [True]}, {"enum": [1]}),
+        ({"description": "left"}, {"description": "right"}),
+    ])
+    def test_rejects_root_conflicts(self, left: dict, right: dict) -> None:
+        """Reject unsupported root intersections, including Python bool/int equality."""
+        with pytest.raises(ValueError, match="conflicting root"):
+            sanitize_json_schema({**left, "allOf": [right]})
+
+    @pytest.mark.parametrize("keyword", ["if", "then", "unevaluatedProperties", "$defs", "unknown"])
+    def test_rejects_evaluation_sensitive_root_keywords(self, keyword: str) -> None:
+        """Do not move conditional or unknown constraints into a different scope."""
+        with pytest.raises(ValueError, match="Cannot safely flatten"):
+            sanitize_json_schema({"allOf": [{keyword: {}}]})
+
+    @pytest.mark.parametrize("reference", ["$ref", "$id", "$anchor", "$dynamicRef"])
+    def test_rejects_moving_references(self, reference: str) -> None:
+        """Avoid breaking references to original composition locations or base URIs."""
+        with pytest.raises(ValueError, match="Cannot safely flatten"):
+            sanitize_json_schema({"allOf": [{"properties": {"x": {reference: "#/allOf/0"}}}]})
+
+    @pytest.mark.parametrize("keyword", ["allOf", "anyOf", "oneOf"])
+    def test_boolean_composition_branches(self, keyword: str) -> None:
+        """True is an identity for a single branch; false must not become unconstrained."""
+        assert sanitize_json_schema({keyword: [True]}) == {}
+        with pytest.raises(ValueError, match="forbids all inputs"):
+            sanitize_json_schema({keyword: [False]})
+
+    def test_multiple_and_recursive_root_compositions(self) -> None:
+        """Process every root keyword and recursively exposed root compositions."""
+        schema = {
+            "allOf": [{"allOf": [{"required": ["a"]}]}],
+            "anyOf": [{"required": ["b"]}], "oneOf": [{"required": ["c"]}],
+        }
+        assert sanitize_json_schema(schema) == {"required": ["a", "b", "c"]}
+        schema["oneOf"].append({"required": ["d"]})
+        with pytest.raises(ValueError, match="multiple alternatives"):
+            sanitize_json_schema(schema)
+
+    @pytest.mark.parametrize("keyword", ["allOf", "anyOf", "oneOf"])
+    def test_preserves_nested_composition(self, keyword: str) -> None:
+        """Keep nested alternatives and their constraints in every schema location."""
+        nested = {keyword: [{"type": "string", "required": None}, {"type": "number"}]}
+        clean = {keyword: [{"type": "string"}, {"type": "number"}]}
+        result = sanitize_json_schema({
+            "properties": {"x": nested}, "items": nested,
+            "$defs": {"named": nested}, "patternProperties": {".*": nested},
+        })
+        assert result == {"properties": {"x": clean}, "items": clean,
+                          "$defs": {"named": clean}, "patternProperties": {".*": clean}}
+
+    def test_keyword_property_names_and_instance_data_are_preserved(self) -> None:
+        """Never treat property/definition names or example/default values as keywords."""
+        names = ["required", "additionalProperties", "allOf", "anyOf", "oneOf", "$ref"]
+        data = {"required": None, "additionalProperties": False, "allOf": []}
+        schema = {
+            "allOf": [{"properties": {name: {"type": "string"} for name in names}}],
+            "default": data, "examples": [data], "enum": [data],
+        }
+        before = deepcopy(schema)
+        result = sanitize_json_schema(schema)
+        assert set(result["properties"]) == set(names)
+        assert result["default"] == result["enum"][0] == result["examples"][0] == data
+        assert schema == before
+        result["default"]["required"] = "changed"
+        result["properties"]["required"]["type"] = "integer"
+        assert schema == before
+
+    def test_schema_maps_and_arrays_preserve_boolean_and_named_schemas(self) -> None:
+        """Sanitize only actual schema children, including legacy tuple/dependency forms."""
+        schema = {
+            "definitions": {"required": {"required": None}, "additionalProperties": True},
+            "dependentSchemas": {"allOf": {"required": []}},
+            "dependencies": {"required": ["additionalProperties"], "x": {"required": None}},
+            "prefixItems": [True, {"required": None}],
+            "items": [False, {"required": []}], "not": {"required": None},
+        }
+        assert sanitize_json_schema(schema) == {
+            "definitions": {"required": {}, "additionalProperties": True},
+            "dependentSchemas": {"allOf": {}},
+            "dependencies": {"required": ["additionalProperties"], "x": {}},
+            "prefixItems": [True, {}], "items": [False, {}], "not": {},
+        }
+
+    @staticmethod
+    def _build_payload(api: str, stream: bool, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a real adapter payload for shared schema compatibility assertions.
+
+        Args:
+            api: OpenAI Chat, Anthropic Messages, or OpenAI Responses API.
+            stream: Requested response mode.
+            schema: Tool input schema supplied by a client.
+
+        Returns:
+            The adapter's Kiro payload.
+        """
+        if api == "openai":
+            from kiro.converters_openai import build_kiro_payload as build_openai
+            from kiro.models_openai import ChatCompletionRequest
+            request = ChatCompletionRequest(
+                model="claude-sonnet-4.5", stream=stream,
+                messages=[{"role": "user", "content": "Hello"}],
+                tools=[{"type": "function", "function": {
+                    "name": "schema_tool", "description": "Test", "parameters": schema,
+                }}],
+            )
+            return build_openai(request, "test-schema", "")
+        if api == "anthropic":
+            from kiro.converters_anthropic import anthropic_to_kiro
+            from kiro.models_anthropic import AnthropicMessagesRequest
+            request = AnthropicMessagesRequest(
+                model="claude-sonnet-4.5", max_tokens=100, stream=stream,
+                messages=[{"role": "user", "content": "Hello"}],
+                tools=[{"name": "schema_tool", "description": "Test", "input_schema": schema}],
+            )
+            return anthropic_to_kiro(request, "test-schema", "")
+        from kiro.converters_responses import build_kiro_payload_from_responses
+        from kiro.models_responses import ResponsesRequest
+        request = ResponsesRequest(
+            model="claude-sonnet-4.5", input="Hello", stream=stream,
+            tools=[{"type": "function", "name": "schema_tool", "description": "Test",
+                    "parameters": schema}],
+        )
+        return build_kiro_payload_from_responses(request, "test-schema", "").payload
+
+    @pytest.mark.parametrize("api", ["openai", "anthropic", "responses"])
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_api_payloads_share_lossless_schema_conversion(self, api: str, stream: bool) -> None:
+        """All API/mode combinations use the same sanitizer before upstream I/O."""
+        schema = {"type": "object", "required": None, "allOf": [
+            {"properties": {"x": {"anyOf": [{"type": "string"}, {"type": "number"}]}}},
+            {"properties": {"y": {"type": "string", "required": None}}, "required": ["y"]},
+        ]}
+        before = deepcopy(schema)
+        payload = self._build_payload(api, stream, schema)
+        context = payload["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]
+        converted = context["tools"][0]["toolSpecification"]["inputSchema"]["json"]
+        assert converted == {
+            "type": "object", "required": ["y"], "properties": {
+                "x": {"anyOf": [{"type": "string"}, {"type": "number"}]},
+                "y": {"type": "string"},
+            },
+        }
+        assert schema == before
+
+    @pytest.mark.parametrize("api", ["openai", "anthropic", "responses"])
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
+    def test_api_payloads_reject_lossy_alternatives(self, api: str, stream: bool, keyword: str) -> None:
+        """Conversion errors include tool context and client repair guidance for all modes."""
+        schema = {keyword: [{"properties": {"x": True}}, {"properties": {"y": True}}]}
+        with pytest.raises(ValueError, match="schema_tool.*expose separate tools"):
+            self._build_payload(api, stream, schema)
 
 
 # ==================================================================================================

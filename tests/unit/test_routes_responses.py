@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 from kiro.config import PROXY_API_KEY
 

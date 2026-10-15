@@ -12,13 +12,16 @@ Comprehensive tests for all Anthropic API models:
 - Error models
 """
 
+from typing import Any
+
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from kiro.models_anthropic import (
     # Content blocks
     TextContentBlock,
     ThinkingContentBlock,
+    RedactedThinkingContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
@@ -760,6 +763,118 @@ class TestThinkingContentBlock:
 
 
 # ==================================================================================================
+# Tests for RedactedThinkingContentBlock
+# ==================================================================================================
+
+class TestRedactedThinkingContentBlock:
+    """Validate opaque Anthropic history without interpreting its contents."""
+
+    @pytest.mark.parametrize(
+        "data", ["", "opaque+/payload==", " \nopaque\t\x00", "非文本载荷", "x" * 65536]
+    )
+    def test_preserves_opaque_string(self, data: str) -> None:
+        """
+        What it does: Round-trips arbitrary strings without normalization.
+        Purpose: Avoid decoding, trimming, or otherwise modifying opaque data.
+
+        Args:
+            data: Opaque string to preserve exactly.
+        """
+        block = RedactedThinkingContentBlock(data=data)
+
+        assert block.type == "redacted_thinking"
+        assert block.data == data
+        assert RedactedThinkingContentBlock.model_validate_json(block.model_dump_json()) == block
+
+    @pytest.mark.parametrize("data", [None, 7, 1.5, False, [], {}, {"text": "hidden"}])
+    def test_rejects_non_string_data(self, data: Any) -> None:
+        """
+        What it does: Rejects non-string opaque payloads.
+        Purpose: Keep the official required string schema intact.
+
+        Args:
+            data: Invalid payload value.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            RedactedThinkingContentBlock.model_validate({"data": data})
+
+        assert exc_info.value.errors()[0]["loc"] == ("data",)
+        assert exc_info.value.errors()[0]["type"] == "string_type"
+
+    def test_requires_data(self) -> None:
+        """What it does: Rejects missing data. Purpose: Prevent incomplete replay blocks."""
+        with pytest.raises(ValidationError) as exc_info:
+            RedactedThinkingContentBlock.model_validate({})
+
+        assert exc_info.value.errors()[0]["loc"] == ("data",)
+        assert exc_info.value.errors()[0]["type"] == "missing"
+
+    def test_rejects_wrong_block_type(self) -> None:
+        """What it does: Rejects an incorrect type. Purpose: Keep block dispatch unambiguous."""
+        with pytest.raises(ValidationError) as exc_info:
+            RedactedThinkingContentBlock.model_validate({"type": "thinking", "data": "opaque"})
+
+        assert exc_info.value.errors()[0]["loc"] == ("type",)
+        assert exc_info.value.errors()[0]["type"] == "literal_error"
+
+    def test_content_union_parses_redacted_thinking(self) -> None:
+        """What it does: Parses the actual union. Purpose: Exercise JSON block dispatch."""
+        block = TypeAdapter(ContentBlock).validate_python(
+            {"type": "redacted_thinking", "data": "opaque"}
+        )
+
+        assert isinstance(block, RedactedThinkingContentBlock)
+        assert block.data == "opaque"
+
+    def test_request_round_trip_preserves_mixed_history(self) -> None:
+        """What it does: Validates mixed history. Purpose: Preserve block ordering and data."""
+        content = [
+            {"type": "thinking", "thinking": "Visible reasoning", "signature": "sig"},
+            {"type": "redacted_thinking", "data": "opaque+/=="},
+            {"type": "text", "text": "Visible answer"},
+            {"type": "redacted_thinking", "data": "second opaque payload"},
+            {"type": "tool_use", "id": "tool_1", "name": "lookup", "input": {}},
+        ]
+        request = AnthropicMessagesRequest.model_validate({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 32,
+            "messages": [
+                {"role": "assistant", "content": content},
+                {"role": "user", "content": "Continue"},
+            ],
+        })
+
+        assert isinstance(request.messages[0].content[1], RedactedThinkingContentBlock)
+        assert request.model_dump()["messages"][0]["content"] == content
+        assert AnthropicMessagesRequest.model_validate_json(request.model_dump_json()) == request
+
+    @pytest.mark.parametrize("block", [
+        {"type": "redacted_thinking"},
+        {"type": "redacted_thinking", "data": None},
+        {"type": "redacted_thinking", "data": {"text": "hidden"}},
+        {"type": "redacted_thinking_typo", "data": "opaque"},
+    ])
+    def test_message_union_rejects_malformed_blocks(self, block: dict[str, Any]) -> None:
+        """
+        What it does: Rejects invalid blocks through the message union.
+        Purpose: Prevent unrelated union members from swallowing malformed data.
+
+        Args:
+            block: Invalid content block submitted in conversation history.
+        """
+        with pytest.raises(ValidationError):
+            AnthropicMessage.model_validate({"role": "assistant", "content": [block]})
+
+    def test_tool_result_does_not_accept_nested_redacted_thinking(self) -> None:
+        """What it does: Rejects nested redaction. Purpose: Preserve tool-result schema boundaries."""
+        with pytest.raises(ValidationError):
+            ToolResultContentBlock.model_validate({
+                "tool_use_id": "tool_1",
+                "content": [{"type": "redacted_thinking", "data": "opaque"}],
+            })
+
+
+# ==================================================================================================
 # Tests for ToolUseContentBlock
 # ==================================================================================================
 
@@ -1229,6 +1344,91 @@ class TestAnthropicTool:
         print(f"Comparing input_schema: Got {tool.input_schema}")
         assert tool.input_schema is not None
         assert "properties" in tool.input_schema
+
+
+class TestAnthropicToolServerSideValidation:
+    """Tests for safe name normalization and server-side schema exemptions."""
+
+    def test_type_only_web_search_normalizes_name_without_mutating_input(self) -> None:
+        """
+        What it does: Validates and serializes a type-only native search tool.
+        Purpose: Keep downstream tool names non-null without changing client input.
+        """
+        tool_data = {"type": "web_search_20250305"}
+
+        tool = AnthropicTool.model_validate(tool_data)
+
+        assert tool.name == "web_search"
+        assert tool.model_dump()["name"] == "web_search"
+        assert tool.input_schema is None
+        assert tool_data == {"type": "web_search_20250305"}
+        assert AnthropicTool.model_validate(tool.model_dump()) == tool
+
+    def test_explicit_server_tool_name_and_parameters_are_preserved(self) -> None:
+        """
+        What it does: Validates a named search tool with extra parameters.
+        Purpose: Normalize only omitted names and preserve explicit client fields.
+        """
+        tool = AnthropicTool.model_validate({
+            "type": "web_search_20250305",
+            "name": "custom_search",
+            "max_uses": 3,
+            "allowed_domains": ["example.com"],
+            "cache_control": {"type": "ephemeral"},
+        })
+
+        assert tool.name == "custom_search"
+        assert tool.max_uses == 3
+        assert tool.allowed_domains == ["example.com"]
+        assert tool.model_dump()["cache_control"] == {"type": "ephemeral"}
+
+    @pytest.mark.parametrize("tool_type", [None, "", "custom", "function", "web_fetch_20250910", "web_search_invalid"])
+    @pytest.mark.parametrize("fields", [{}, {"name": "custom_tool"}, {"input_schema": {}}])
+    def test_unrelated_types_do_not_bypass_required_fields(
+        self, tool_type: str | None, fields: dict[str, object]
+    ) -> None:
+        """
+        What it does: Rejects incomplete custom tools regardless of type field.
+        Purpose: Limit name and schema exemptions to supported native search.
+        """
+        with pytest.raises(ValidationError):
+            AnthropicTool.model_validate({"type": tool_type, **fields})
+
+    @pytest.mark.parametrize("tool_type", [None, "", "custom", "function"])
+    def test_complete_custom_tools_remain_valid(self, tool_type: str | None) -> None:
+        """
+        What it does: Accepts complete tool definitions with unrelated type fields.
+        Purpose: Preserve forward compatibility without weakening required fields.
+        """
+        tool = AnthropicTool.model_validate({
+            "type": tool_type, "name": "custom_tool", "input_schema": {},
+        })
+
+        assert tool.name == "custom_tool"
+        assert tool.input_schema == {}
+
+    @pytest.mark.parametrize("tool_type", [None, "web_search_20250305"])
+    @pytest.mark.parametrize("name", [None, "", "   ", 123, []])
+    def test_explicit_invalid_names_are_rejected(
+        self, tool_type: str | None, name: object
+    ) -> None:
+        """
+        What it does: Rejects null, blank, and non-string tool names.
+        Purpose: Avoid substituting defaults for malformed explicit names.
+        """
+        with pytest.raises(ValidationError):
+            AnthropicTool.model_validate({
+                "type": tool_type, "name": name, "input_schema": {},
+            })
+
+    @pytest.mark.parametrize("schema", [None, [], "object", 123])
+    def test_custom_tool_invalid_schema_is_rejected(self, schema: object) -> None:
+        """
+        What it does: Rejects null and non-object custom tool schemas.
+        Purpose: Keep the existing custom tool schema contract strict.
+        """
+        with pytest.raises(ValidationError):
+            AnthropicTool.model_validate({"name": "custom_tool", "input_schema": schema})
 
 
 # ==================================================================================================

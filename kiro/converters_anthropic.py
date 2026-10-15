@@ -55,6 +55,9 @@ def convert_anthropic_content_to_text(content: Any) -> str:
     - String: "Hello, world!"
     - List of content blocks: [{"type": "text", "text": "Hello"}]
 
+    Only text blocks contribute to the Kiro prompt. In particular, replayed
+    redacted_thinking blocks contain opaque data, not prompt text.
+
     Args:
         content: Anthropic message content
 

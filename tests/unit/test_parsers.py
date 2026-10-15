@@ -1242,6 +1242,97 @@ class TestAwsEventStreamParserEdgeCases:
         assert events == []
 
 
+class TestMeteringEvents:
+    """Validate the PR #280 sample and legacy usage without live requests."""
+
+    @pytest.mark.parametrize("payload", [
+        b'{"unit":"credit","unitPlural":"credits","usage":0.02730794364842454}',
+        b'{ "unit" : "credit", "usage" : 0.02730794364842454 }',
+        b'{"usage":0.02730794364842454,"unit":"credit"}',
+        b'{"unitPlural":"credits","usage":0.02730794364842454,"unit":"credit"}',
+    ])
+    def test_sample_and_key_order_at_every_split(self, payload: bytes) -> None:
+        """Parse supported metering layouts across every possible chunk split.
+
+        Args:
+            payload: Sample event or equivalent JSON key/whitespace layout.
+        """
+        for split in range(len(payload) + 1):
+            parser = AwsEventStreamParser()
+            events = parser.feed(payload[:split]) + parser.feed(payload[split:])
+            assert events == [{"type": "metering", "data": 0.02730794364842454}]
+
+    @pytest.mark.parametrize("payload", [
+        b'{"unit":"credit","usage":0}',
+        b'{"usage":0}',
+    ])
+    def test_zero_is_real_usage(self, payload: bytes) -> None:
+        """Retain free requests instead of dropping valid zero credit usage.
+
+        Args:
+            payload: Current or legacy zero-credit event.
+        """
+        events = AwsEventStreamParser().feed(payload)
+        assert len(events) == 1
+        assert events[0]["data"] == 0.0
+
+    @pytest.mark.parametrize("usage", [
+        "null", "true", "false", '"0.2"', '"invalid"', "[]", "-1",
+        "NaN", "Infinity", "-Infinity", "1e400", "9" * 400,
+    ])
+    @pytest.mark.parametrize("prefix", ['{"usage":', '{"unit":"credit","usage":'])
+    def test_invalid_usage_does_not_swallow_content(self, usage: str, prefix: str) -> None:
+        """Drop invalid numeric usage while retaining the subsequent event.
+
+        Args:
+            usage: Invalid JSON value for credit consumption.
+            prefix: Legacy or current metering event prefix.
+        """
+        payload = (prefix + usage + '}').encode() + b'{"content":"after"}'
+        assert AwsEventStreamParser().feed(payload) == [
+            {"type": "content", "data": "after"},
+        ]
+
+    @pytest.mark.parametrize("payload", [
+        b'{"unit":"token","usage":1234}',
+        b'{"usage":1234,"unit":"token"}',
+        b'{"unit":"credit"}',
+        b'{"unitPlural":"credits","usage":1}',
+        b'{"unit":"credit","usage":{"cacheReadInputTokens":12}}',
+        b'{"unit":"credit","usage":0.1,}',
+        b'{"unknown":{"usage":1}}',
+        b'{"unknown":{"unit":"credit","usage":1}}',
+    ])
+    def test_unsupported_or_malformed_event_is_ignored(self, payload: bytes) -> None:
+        """Reject fabricated metering without affecting following content.
+
+        Args:
+            payload: Unsupported, nested, incomplete-schema or malformed event.
+        """
+        assert AwsEventStreamParser().feed(payload + b'{"content":"after"}') == [
+            {"type": "content", "data": "after"},
+        ]
+
+    def test_escaped_usage_inside_content_is_not_metering(self) -> None:
+        """Preserve quoted sample JSON as user-visible text, never billing."""
+        text = 'Example: {"unit":"credit","usage":0.2}'
+        payload = json.dumps({"content": text}).encode()
+        assert AwsEventStreamParser().feed(payload) == [{"type": "content", "data": text}]
+
+    def test_truncated_metering_never_produces_usage(self) -> None:
+        """Leave an incomplete metering event buffered without fabricating zero."""
+        parser = AwsEventStreamParser()
+        assert parser.feed(b'{"unit":"credit","usage":0.') == []
+        assert parser.feed(b'') == []
+
+    def test_legacy_usage_dictionary_is_preserved(self) -> None:
+        """Forward supplied token fields without inventing cache metrics."""
+        usage = {"cacheReadInputTokens": 12, "cacheCreationInputTokens": 34}
+        assert AwsEventStreamParser().feed(json.dumps({"usage": usage}).encode()) == [
+            {"type": "usage", "data": usage},
+        ]
+
+
 class TestDiagnoseJsonTruncation:
     """
     Tests for _diagnose_json_truncation method for diagnosing truncated JSON.

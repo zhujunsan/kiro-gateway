@@ -329,7 +329,8 @@ OpenAI messages преобразуются в Kiro conversationState:
 | `tool_start` | Начало tool call (name, toolUseId) |
 | `tool_input` | Продолжение input для tool call |
 | `tool_stop` | Завершение tool call |
-| `usage` | Информация о потреблении кредитов |
+| `usage` | Устаревший числовой формат кредитов или словарь использования токенов |
+| `metering` | Проверенные кредиты из `{"unit":"credit",...,"usage":<число>}` |
 | `context_usage` | Процент использования контекста |
 
 #### Вспомогательные функции

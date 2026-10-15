@@ -329,8 +329,25 @@ Advanced AWS SSE format parser with support for:
 | `tool_start` | Start of tool call (name, toolUseId) |
 | `tool_input` | Continuation of input for tool call |
 | `tool_stop` | End of tool call |
-| `usage` | Credit consumption information |
+| `usage` | Legacy scalar credits or an upstream token-usage dictionary |
+| `metering` | Validated credits from `{"unit":"credit",...,"usage":<number>}` |
 | `context_usage` | Context usage percentage |
+
+#### Credit metering compatibility
+
+The wire sample reported in [upstream PR #280](https://github.com/jwadow/kiro-gateway/pull/280)
+is `{"unit":"credit","unitPlural":"credits","usage":0.02730794364842454}`.
+The parser accepts reordered keys, whitespace, fragmented objects, zero credits,
+and legacy `{"usage":<number>}` events. It rejects unknown units, negative or
+non-finite values, invalid types, and incomplete objects.
+
+The shared stream layer keeps credits separate from token/cache usage and sums
+multiple valid credit events within one consumed stream. Credits are neither
+currency nor token counts. OpenAI Chat Completions and Responses retain the
+existing `usage.credits_used` extension; Anthropic keeps its standard response
+shape and only logs observed credits. These formats are covered by
+network-isolated tests; the upstream PR's live capture has not been independently
+verified against a paid API.
 
 #### Helper Functions
 

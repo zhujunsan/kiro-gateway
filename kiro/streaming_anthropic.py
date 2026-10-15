@@ -203,6 +203,7 @@ async def stream_kiro_to_anthropic(
     # Track context usage for token calculation
     context_usage_percentage: Optional[float] = None
     upstream_cache_usage: Dict[str, int] = {}
+    credits_used: Optional[float] = None
     
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
@@ -657,6 +658,11 @@ async def stream_kiro_to_anthropic(
                 context_usage_percentage = event.context_usage_percentage
             elif event.type == "usage" and event.usage:
                 upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
+            elif event.type == "metering" and event.credits is not None:
+                credits_used = (credits_used or 0.0) + event.credits
+
+        if credits_used is not None:
+            logger.info(f"[Credit] req={message_id} model={model} credits={credits_used}")
         
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
@@ -902,6 +908,8 @@ async def collect_anthropic_response(
     # Collect stream result
     result = await collect_stream_to_result(response)
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
+    if result.credits is not None:
+        logger.info(f"[Credit] req={message_id} model={model} credits={result.credits}")
     
     # Build content blocks
     content_blocks = []

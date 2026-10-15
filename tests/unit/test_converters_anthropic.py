@@ -12,6 +12,8 @@ Tests for Anthropic Messages API to Kiro format conversion:
 - Full Anthropic → Kiro payload conversion
 """
 
+import json
+
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -32,6 +34,7 @@ from kiro.models_anthropic import (
     AnthropicMessage,
     AnthropicTool,
     TextContentBlock,
+    RedactedThinkingContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
     SystemContentBlock,
@@ -45,6 +48,38 @@ from kiro.models_anthropic import (
 
 class TestConvertAnthropicContentToText:
     """Tests for convert_anthropic_content_to_text function."""
+
+    @pytest.mark.parametrize("as_models", [False, True])
+    @pytest.mark.parametrize("only_redacted", [False, True])
+    def test_ignores_redacted_thinking_data(
+        self, as_models: bool, only_redacted: bool
+    ) -> None:
+        """
+        What it does: Ignores redacted blocks in raw and validated content lists.
+        Purpose: Keep opaque data out of prompts while preserving visible text.
+
+        Args:
+            as_models: Whether to use Pydantic blocks rather than dictionaries.
+            only_redacted: Whether the message contains no visible text.
+        """
+        blocks = [
+            {"type": "redacted_thinking", "data": "opaque-one"},
+            {"type": "redacted_thinking", "data": "opaque-two"},
+        ]
+        if not only_redacted:
+            blocks.insert(1, {"type": "text", "text": "Visible answer"})
+            blocks.append({"type": "text", "text": " continues"})
+        if as_models:
+            content = AnthropicMessage.model_validate({"role": "assistant", "content": blocks}).content
+            assert isinstance(content[0], RedactedThinkingContentBlock)
+        else:
+            # A non-text block must not become text even if extra keys resemble it.
+            blocks[0]["text"] = "opaque-spoofed-text"
+            content = blocks
+
+        assert convert_anthropic_content_to_text(content) == (
+            "" if only_redacted else "Visible answer continues"
+        )
 
     def test_extracts_from_string(self):
         """
@@ -1443,6 +1478,56 @@ class TestConvertAnthropicTools:
 
 class TestAnthropicToKiro:
     """Tests for anthropic_to_kiro function - main entry point."""
+
+    @pytest.mark.parametrize("only_redacted", [False, True])
+    def test_redacted_thinking_does_not_change_payload(self, only_redacted: bool) -> None:
+        """
+        What it does: Compares converted requests with and without redaction.
+        Purpose: Exclude opaque data without changing visible history or tool input.
+
+        Args:
+            only_redacted: Whether the assistant has no other content blocks.
+        """
+        nested_input = {"record": {"type": "redacted_thinking", "data": "user-owned-tool-data"}}
+        visible_blocks = [] if only_redacted else [
+            {"type": "text", "text": "Visible answer"},
+            {"type": "tool_use", "id": "tool_1", "name": "lookup", "input": nested_input},
+        ]
+        messages = [
+            {"role": "user", "content": "Start"},
+            {"role": "assistant", "content": visible_blocks},
+            {"role": "user", "content": "Continue" if only_redacted else [
+                {"type": "tool_result", "tool_use_id": "tool_1", "content": "Tool output"},
+                {"type": "text", "text": "Continue"},
+            ]},
+        ]
+        baseline = AnthropicMessagesRequest.model_validate({
+            "model": "claude-sonnet-4-5", "messages": messages, "max_tokens": 32,
+        })
+        replay_data = baseline.model_dump()
+        replay_data["messages"][1]["content"].insert(
+            0, {"type": "redacted_thinking", "data": "opaque-must-not-reach-kiro"}
+        )
+        replay = AnthropicMessagesRequest.model_validate(replay_data)
+        original = replay.model_dump()
+
+        unified = convert_anthropic_messages(replay.messages)
+        assert unified[1].content == ("" if only_redacted else "Visible answer")
+        if not only_redacted:
+            assert unified[1].tool_calls[0]["function"]["arguments"] == nested_input
+            assert unified[2].tool_results[0]["content"] == "Tool output"
+
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-sonnet-4.5"), patch(
+            "kiro.converters_core.FAKE_REASONING_ENABLED", False
+        ):
+            expected = anthropic_to_kiro(baseline, "conv-redacted", "arn:aws:test")
+            actual = anthropic_to_kiro(replay, "conv-redacted", "arn:aws:test")
+
+        assert actual == expected
+        assert "opaque-must-not-reach-kiro" not in json.dumps(actual)
+        if not only_redacted:
+            assert "user-owned-tool-data" in json.dumps(actual)
+        assert replay.model_dump() == original
 
     def test_builds_simple_payload(self):
         """

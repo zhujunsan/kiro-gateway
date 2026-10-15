@@ -1654,7 +1654,7 @@ class TestStreamingOpenaiMeteringData:
         
         async def mock_parse_kiro_stream(*args, **kwargs):
             yield KiroEvent(type="content", content="Hello")
-            yield KiroEvent(type="usage", usage={"credits": 0.001})
+            yield KiroEvent(type="metering", credits=0.001)
         
         print("Action: Streaming to OpenAI format...")
         chunks = []

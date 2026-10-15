@@ -15,6 +15,10 @@ Tests for:
 
 import pytest
 import asyncio
+import json
+from typing import Any, AsyncIterator, Dict, List, Optional
+
+import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import asdict
 
@@ -64,6 +68,236 @@ def mock_parser():
 # ==================================================================================================
 # Tests for KiroEvent dataclass
 # ==================================================================================================
+
+class TestMeteringConsumers:
+    """Exercise actual wire parsing in all six API/mode combinations."""
+
+    async def _render_wire(
+        self, api: str, streaming: bool, payload: bytes
+    ) -> Dict[str, Any]:
+        """Render mocked upstream bytes through a real public response formatter.
+
+        Args:
+            api: OpenAI, Anthropic, or fork-specific Responses API.
+            streaming: Whether to consume SSE or collect a JSON response.
+            payload: Synthetic upstream events; no network or credentials used.
+
+        Returns:
+            Normalized usage, finish status, and visible response text.
+        """
+        from kiro import streaming_anthropic, streaming_openai, streaming_responses
+
+        async def chunks() -> AsyncIterator[bytes]:
+            """Yield fragmented bytes, including event keys and numeric values."""
+            for index in range(0, len(payload), 7):
+                yield payload[index:index + 7]
+
+        response = MagicMock(spec=httpx.Response)
+        response.aiter_bytes = chunks
+        response.aclose = AsyncMock()
+        cache = MagicMock()
+        cache.get_max_input_tokens.return_value = 200000
+        client = AsyncMock()
+        auth = MagicMock()
+        modules = {
+            "openai": streaming_openai,
+            "anthropic": streaming_anthropic,
+            "responses": streaming_responses,
+        }
+        module = modules[api]
+        args = (response, "claude-sonnet-4", cache, auth)
+        if api != "anthropic":
+            args = (client,) + args
+
+        with patch("kiro.streaming_core.FAKE_REASONING_ENABLED", False):
+            if streaming:
+                stream_function = {
+                    "openai": streaming_openai.stream_kiro_to_openai,
+                    "anthropic": streaming_anthropic.stream_kiro_to_anthropic,
+                    "responses": streaming_responses.stream_kiro_to_responses,
+                }[api]
+                events: List[Dict[str, Any]] = []
+                async for chunk in stream_function(*args):
+                    for line in chunk.splitlines():
+                        if line.startswith("data:") and line[5:].strip() != "[DONE]":
+                            events.append(json.loads(line[5:]))
+                if api == "openai":
+                    terminal = events[-1]
+                    return {
+                        "usage": terminal["usage"],
+                        "finish": terminal["choices"][0]["finish_reason"],
+                        "text": "".join(
+                            event["choices"][0]["delta"].get("content", "")
+                            for event in events if event.get("choices")
+                        ),
+                    }
+                if api == "anthropic":
+                    terminal = next(event for event in events if event["type"] == "message_delta")
+                    return {
+                        "usage": terminal["usage"],
+                        "finish": terminal["delta"]["stop_reason"],
+                        "text": "".join(
+                            event["delta"].get("text", "")
+                            for event in events if event["type"] == "content_block_delta"
+                        ),
+                    }
+                result = events[-1]["response"]
+            elif api == "anthropic":
+                result = await module.collect_anthropic_response(*args)
+            else:
+                result = await module.collect_stream_response(*args)
+
+        if api == "openai":
+            return {
+                "usage": result["usage"],
+                "finish": result["choices"][0]["finish_reason"],
+                "text": result["choices"][0]["message"]["content"],
+            }
+        if api == "anthropic":
+            return {
+                "usage": result["usage"],
+                "finish": result["stop_reason"],
+                "text": "".join(block.get("text", "") for block in result["content"]),
+            }
+        return {
+            "usage": result["usage"],
+            "finish": result["status"],
+            "text": "".join(
+                part.get("text", "") for item in result["output"]
+                for part in item.get("content", [])
+            ),
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("api", ["openai", "anthropic", "responses"])
+    @pytest.mark.parametrize("streaming", [True, False])
+    @pytest.mark.parametrize("metering,expected", [
+        (b'{"unit":"credit","unitPlural":"credits","usage":0.02730794364842454}', 0.02730794364842454),
+        (b'{"unit":"credit","usage":0}', 0.0),
+        (b'{"usage":0}', 0.0),
+        (b'{"usage":0.1}{"unit":"credit","usage":0.2}', 0.3),
+    ])
+    async def test_credits_preserve_tokens_and_finish_policy(
+        self, api: str, streaming: bool, metering: bytes, expected: float
+    ) -> None:
+        """Keep credits separate from tokens and preserve API-specific completion.
+
+        Args:
+            api: API surface under test.
+            streaming: Streaming or collected response mode.
+            metering: Current, legacy, zero, or multiple metering events.
+            expected: Sum of valid credit events.
+        """
+        content = b'{"content":"Hello"}'
+        baseline = await self._render_wire(api, streaming, content)
+        result = await self._render_wire(api, streaming, content + metering)
+        assert result["text"] == "Hello"
+        expected_finish = {"openai": "stop", "responses": "completed", "anthropic": "max_tokens"}
+        assert result["finish"] == expected_finish[api]
+        usage = dict(result["usage"])
+        if api == "anthropic":
+            assert "credits_used" not in usage
+        else:
+            assert usage.pop("credits_used") == pytest.approx(expected)
+        assert usage == baseline["usage"]
+        assert not any("cache" in key for key in usage)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("api", ["openai", "anthropic", "responses"])
+    @pytest.mark.parametrize("streaming", [True, False])
+    @pytest.mark.parametrize("invalid", [
+        b'{"unit":"token","usage":1234}',
+        b'{"usage":1234,"unit":"token"}',
+        b'{"unit":"credit"}',
+        b'{"unit":"credit","usage":true}',
+        b'{"usage":true}',
+        b'{"usage":null}',
+        b'{"usage":"0.1"}',
+        b'{"unit":"credit","usage":NaN}',
+        b'{"usage":1e400}',
+        b'{"unit":"credit","usage":-1}',
+        b'{"unknown":{"usage":1}}',
+        b'{"unit":"credit","usage":0.1,}',
+        b'{"unit":"credit","usage":0.',
+    ])
+    async def test_invalid_or_truncated_usage_is_not_completion(
+        self, api: str, streaming: bool, invalid: bytes
+    ) -> None:
+        """Keep truncation visible instead of fabricating a terminal usage signal.
+
+        Args:
+            api: API surface under test.
+            streaming: Streaming or collected response mode.
+            invalid: Invalid, unsupported, nested, or truncated billing event.
+        """
+        result = await self._render_wire(api, streaming, b'{"content":"Hello"}' + invalid)
+        assert result["finish"] == {
+            "openai": "length", "responses": "incomplete", "anthropic": "max_tokens",
+        }[api]
+        assert result["text"] == "Hello"
+        assert "credits_used" not in result["usage"]
+        assert not any("cache" in key for key in result["usage"])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("api", ["openai", "anthropic", "responses"])
+    @pytest.mark.parametrize("streaming", [True, False])
+    @pytest.mark.parametrize("metering", [b'', b'{"unit":"credit","usage":0.1}'])
+    async def test_cache_dictionary_and_credits_do_not_overwrite_each_other(
+        self, api: str, streaming: bool, metering: bytes
+    ) -> None:
+        """Forward only real cache fields while preserving existing normal endings.
+
+        Args:
+            api: API surface under test.
+            streaming: Streaming or collected response mode.
+            metering: Optional credit event preceding the token usage dictionary.
+        """
+        result = await self._render_wire(
+            api, streaming,
+            b'{"content":"Hello"}' + metering +
+            b'{"usage":{"cacheReadInputTokens":12,"cacheCreationInputTokens":34}}'
+            b'{"contextUsagePercentage":1}',
+        )
+        assert result["finish"] == {
+            "openai": "stop", "responses": "completed", "anthropic": "end_turn",
+        }[api]
+        if api == "anthropic":
+            assert result["usage"]["cache_read_input_tokens"] == 12
+            assert result["usage"]["cache_creation_input_tokens"] == 34
+            assert "credits_used" not in result["usage"]
+        elif metering:
+            assert result["usage"]["credits_used"] == pytest.approx(0.1)
+        else:
+            assert "credits_used" not in result["usage"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("metering,expected", [
+        (b'', None),
+        (b'{"unit":"credit","usage":0}', 0.0),
+        (b'{"usage":0.1}{"unit":"credit","usage":0.2}', 0.3),
+    ])
+    async def test_shared_collector_keeps_optional_credit_sum(
+        self, metering: bytes, expected: Any
+    ) -> None:
+        """Store credit totals separately without replacing upstream token usage.
+
+        Args:
+            metering: Missing, zero, or multiple credit events.
+            expected: Expected optional credit total.
+        """
+        async def chunks() -> AsyncIterator[bytes]:
+            """Yield one mocked upstream event sequence."""
+            yield b'{"usage":{"cacheReadInputTokens":12}}' + metering
+
+        response = MagicMock(spec=httpx.Response)
+        response.aiter_bytes = chunks
+        result = await collect_stream_to_result(response, enable_thinking_parser=False)
+        assert result.usage == {"cacheReadInputTokens": 12}
+        if expected is None:
+            assert result.credits is None
+        else:
+            assert result.credits == pytest.approx(expected)
+
 
 class TestKiroEvent:
     """Tests for KiroEvent dataclass."""

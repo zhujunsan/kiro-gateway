@@ -265,7 +265,8 @@ async def stream_kiro_to_responses_internal(
     created_at = int(time.time())
     sequence_number = 0
 
-    metering_data = None
+    upstream_usage = None
+    credits_used: Optional[float] = None
     context_usage_percentage = None
     full_content = ""
     full_thinking_content = ""
@@ -710,7 +711,10 @@ async def stream_kiro_to_responses_internal(
                 tool_calls_from_stream.append(event.tool_use)
 
             elif event.type == "usage" and event.usage:
-                metering_data = event.usage
+                upstream_usage = event.usage
+
+            elif event.type == "metering" and event.credits is not None:
+                credits_used = (credits_used or 0.0) + event.credits
 
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
@@ -726,7 +730,7 @@ async def stream_kiro_to_responses_internal(
         for close_evt in close_reasoning_item_events():
             yield close_evt
 
-        received_usage = metering_data is not None
+        received_usage = upstream_usage is not None or credits_used is not None
         received_context_usage = context_usage_percentage is not None
         stream_completed_normally = received_usage or received_context_usage
 
@@ -783,8 +787,9 @@ async def stream_kiro_to_responses_internal(
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
         }
-        if metering_data:
-            usage["credits_used"] = metering_data
+        if credits_used is not None:
+            usage["credits_used"] = credits_used
+            logger.info(f"[Credit] req={response_id} model={model} credits={credits_used}")
 
         logger.debug(
             f"[Usage/Responses] {model}: "

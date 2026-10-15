@@ -10,6 +10,9 @@ Tests the following endpoint:
 For OpenAI API tests, see test_routes_openai.py.
 """
 
+from typing import Any
+from collections.abc import AsyncIterator
+
 import pytest
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
 from datetime import datetime, timezone
@@ -25,6 +28,34 @@ from kiro.config import PROXY_API_KEY
 # =============================================================================
 # Tests for verify_anthropic_api_key function
 # =============================================================================
+
+class TestToolSchemaRejection:
+    """Verify lossy schema alternatives become native Anthropic HTTP 400 errors."""
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("account_system", [False, True])
+    @pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
+    def test_rejects_root_alternatives_before_upstream_request(
+        self, test_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+        stream: bool, account_system: bool, keyword: str,
+    ) -> None:
+        """Reject both response modes in legacy and account-failover routing paths."""
+        monkeypatch.setattr(test_client.app.state, "account_system", account_system)
+        with patch("kiro.routes_anthropic.KiroHttpClient") as upstream:
+            response = test_client.post(
+                "/v1/messages", headers={"x-api-key": PROXY_API_KEY},
+                json={"model": "claude-sonnet-5", "max_tokens": 100, "stream": stream,
+                      "messages": [{"role": "user", "content": "Hello"}],
+                      "tools": [{"name": "schema_tool", "input_schema": {
+                          keyword: [{"required": ["x"]}, {"required": ["y"]}],
+                      }}]},
+            )
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "invalid_request_error"
+        assert "schema_tool" in response.text
+        assert "expose separate tools" in response.text
+        upstream.assert_not_called()
+
 
 class TestVerifyAnthropicApiKey:
     """Tests for the verify_anthropic_api_key authentication function."""
@@ -1703,6 +1734,104 @@ class TestWebSearchAutoInjection:
         assert web_search_count == 1
 
 
+class TestWebSearchServerToolValidation:
+    """Regression tests for native type-only tools at the HTTP boundary."""
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("auto_inject", [False, True])
+    @pytest.mark.parametrize("include_custom_tool", [False, True])
+    def test_type_only_web_search_reaches_native_handler(
+        self, test_client: TestClient, valid_proxy_api_key: str,
+        stream: bool, auto_inject: bool, include_custom_tool: bool,
+    ) -> None:
+        """
+        What it does: Sends type-only native search through real route and handler.
+        Purpose: Cover JSON/SSE responses and avoid duplicate auto-injected tools.
+        """
+        from kiro.mcp_tools import handle_native_web_search
+
+        tools = [{"type": "web_search_20250305"}]
+        if include_custom_tool:
+            tools.append({"name": "custom_tool", "input_schema": {}})
+        account = Mock(auth_manager=Mock())
+        search_results = {"results": [{
+            "title": "Example", "url": "https://example.com", "snippet": "Test result",
+        }]}
+        with (
+            patch("kiro.routes_anthropic.WEB_SEARCH_ENABLED", auto_inject),
+            patch.object(
+                test_client.app.state.account_manager, "ensure_first_account",
+                new=AsyncMock(return_value=account),
+            ),
+            patch(
+                "kiro.routes_anthropic.handle_native_web_search",
+                wraps=handle_native_web_search,
+            ) as native_handler,
+            patch(
+                "kiro.mcp_tools.call_kiro_mcp_api",
+                new=AsyncMock(return_value=("search_test_id", search_results)),
+            ) as mcp_call,
+        ):
+            response = test_client.post(
+                "/v1/messages",
+                headers={"x-api-key": valid_proxy_api_key},
+                json={
+                    "model": "claude-sonnet-4-5", "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": "Find current news"}],
+                    "stream": stream, "tools": tools,
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        native_handler.assert_awaited_once()
+        validated_request = native_handler.call_args.args[1]
+        assert [tool.name for tool in validated_request.tools] == (
+            ["web_search", "custom_tool"] if include_custom_tool else ["web_search"]
+        )
+        mcp_call.assert_awaited_once_with("Find current news", account.auth_manager)
+        if stream:
+            assert response.headers["content-type"].startswith("text/event-stream")
+            assert "event: message_stop" in response.text
+            assert '"name": "web_search"' in response.text
+        else:
+            assert response.json()["content"][0]["name"] == "web_search"
+            assert response.json()["stop_reason"] == "end_turn"
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("tool", [
+        {}, {"input_schema": {}}, {"name": "custom_tool"},
+        {"name": None, "input_schema": {}},
+        {"name": "custom_tool", "input_schema": None},
+        {"type": ""}, {"type": None}, {"type": "function"},
+        {"type": "unsupported"}, {"type": "web_search_invalid"},
+        {"type": "unsupported", "name": "custom_tool"},
+        {"type": "", "name": "custom_tool"},
+        {"type": "web_search_20250305", "name": None},
+        {"type": "web_search_20250305", "name": ""},
+    ])
+    def test_incomplete_tools_are_rejected_before_native_handler(
+        self, test_client: TestClient, valid_proxy_api_key: str,
+        stream: bool, tool: dict[str, object],
+    ) -> None:
+        """
+        What it does: Rejects malformed custom and unsupported type-only tools.
+        Purpose: Ensure the native-tool exemption does not broaden HTTP validation.
+        """
+        with patch("kiro.routes_anthropic.handle_native_web_search") as native_handler:
+            response = test_client.post(
+                "/v1/messages",
+                headers={"x-api-key": valid_proxy_api_key},
+                json={
+                    "model": "claude-sonnet-4-5", "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": stream, "tools": [tool],
+                },
+            )
+
+        assert response.status_code == 422, response.text
+        native_handler.assert_not_called()
+
+
 class TestWebSearchNativeDetection:
     """Tests for native Anthropic server-side tools detection (Path A)."""
     
@@ -2542,6 +2671,164 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print("✅ max_tokens is NOT required for count_tokens")
+
+class TestRedactedThinkingReplay:
+    """Exercise validated redacted history through mocked successful API requests."""
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("account_system", [False, True])
+    @pytest.mark.parametrize("only_redacted", [False, True])
+    def test_accepts_redacted_history_without_forwarding_opaque_data(
+        self,
+        test_client: TestClient,
+        valid_proxy_api_key: str,
+        monkeypatch: pytest.MonkeyPatch,
+        stream: bool,
+        account_system: bool,
+        only_redacted: bool,
+    ) -> None:
+        """
+        What it does: Completes both response modes and account-routing paths.
+        Purpose: Prove replay works, preserves validated data, and sends only text to Kiro.
+
+        Args:
+            test_client: Network-isolated application client.
+            valid_proxy_api_key: Test authentication key.
+            monkeypatch: Restores temporary application state after the test.
+            stream: Whether the client requests server-sent events.
+            account_system: Whether account failover routing is enabled.
+            only_redacted: Whether assistant history has no visible text.
+        """
+        from kiro.converters_anthropic import anthropic_to_kiro
+        from kiro.models_anthropic import RedactedThinkingContentBlock
+
+        async def stream_response(**kwargs: Any) -> AsyncIterator[str]:
+            """
+            Yield deterministic successful events without contacting upstream.
+
+            Args:
+                **kwargs: Arguments passed to the streaming response processor.
+
+            Yields:
+                Anthropic server-sent events.
+            """
+            yield 'event: message_start\ndata: {"type":"message_start"}\n\n'
+            yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+        manager = test_client.app.state.account_manager
+        account = manager.get_first_account()
+        assert account is not None
+        monkeypatch.setattr(test_client.app.state, "account_system", account_system)
+        monkeypatch.setattr(manager, "get_next_account", AsyncMock(return_value=account))
+        monkeypatch.setattr(manager, "ensure_first_account", AsyncMock(return_value=account))
+        monkeypatch.setattr(manager, "report_success", AsyncMock())
+        client = AsyncMock()
+        upstream = Mock(status_code=200)
+        client.request_with_retry.return_value = upstream
+        expected_response = {
+            "id": "msg_redacted", "type": "message", "role": "assistant",
+            "model": "claude-sonnet-4-5", "content": [{"type": "text", "text": "Accepted"}],
+            "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": 10, "output_tokens": 1},
+        }
+        content = [{"type": "redacted_thinking", "data": "opaque-replayed-payload"}]
+        if not only_redacted:
+            content.append({"type": "text", "text": "Previous answer"})
+
+        with patch("kiro.routes_anthropic.KiroHttpClient", return_value=client), patch(
+            "kiro.routes_anthropic.anthropic_to_kiro", wraps=anthropic_to_kiro
+        ) as convert, patch(
+            "kiro.routes_anthropic.collect_anthropic_response",
+            new=AsyncMock(return_value=expected_response),
+        ) as collect, patch(
+            "kiro.routes_anthropic.stream_with_first_token_retry_anthropic",
+            side_effect=stream_response,
+        ) as stream_processor:
+            response = test_client.post(
+                "/v1/messages",
+                headers={"x-api-key": valid_proxy_api_key},
+                json={
+                    "model": "claude-sonnet-4-5", "max_tokens": 32, "stream": stream,
+                    "messages": [
+                        {"role": "user", "content": "Start"},
+                        {"role": "assistant", "content": content},
+                        {"role": "user", "content": "Continue"},
+                    ],
+                },
+            )
+
+        assert response.status_code == 200
+        convert.assert_called_once()
+        validated_request = convert.call_args.args[0]
+        redacted = validated_request.messages[1].content[0]
+        assert isinstance(redacted, RedactedThinkingContentBlock)
+        assert redacted.data == "opaque-replayed-payload"
+        client.request_with_retry.assert_awaited_once()
+        payload = client.request_with_retry.await_args.args[2]
+        assert "opaque-replayed-payload" not in json.dumps(payload)
+        assert "Continue" in json.dumps(payload)
+        if not only_redacted:
+            assert "Previous answer" in json.dumps(payload)
+        client.close.assert_awaited_once()
+        if stream:
+            assert response.headers["content-type"].startswith("text/event-stream")
+            assert "event: message_start" in response.text
+            assert "event: message_stop" in response.text
+            assert "event: error" not in response.text
+            stream_processor.assert_called_once()
+            collect.assert_not_awaited()
+            processor_kwargs = stream_processor.call_args.kwargs
+        else:
+            assert response.json() == expected_response
+            collect.assert_awaited_once()
+            stream_processor.assert_not_called()
+            processor_kwargs = collect.await_args.kwargs
+        assert processor_kwargs["request_messages"][1]["content"] == content
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("block", [
+        {"type": "redacted_thinking"},
+        {"type": "redacted_thinking", "data": None},
+        {"type": "redacted_thinking", "data": 42},
+        {"type": "redacted_thinking", "data": {"text": "hidden"}},
+        {"type": "redacted_thinking_typo", "data": "opaque"},
+        {"type": "tool_result", "tool_use_id": "tool_1", "content": [
+            {"type": "redacted_thinking", "data": "opaque"},
+        ]},
+    ])
+    def test_rejects_malformed_redacted_history_before_upstream(
+        self,
+        test_client: TestClient,
+        valid_proxy_api_key: str,
+        stream: bool,
+        block: dict[str, Any],
+    ) -> None:
+        """
+        What it does: Rejects invalid or incorrectly nested redacted blocks.
+        Purpose: Preserve schema validation and avoid upstream calls on malformed requests.
+
+        Args:
+            test_client: Network-isolated application client.
+            valid_proxy_api_key: Test authentication key.
+            stream: Requested response mode.
+            block: Invalid replay block.
+        """
+        with patch("kiro.routes_anthropic.KiroHttpClient") as client_class:
+            response = test_client.post(
+                "/v1/messages",
+                headers={"x-api-key": valid_proxy_api_key},
+                json={
+                    "model": "claude-sonnet-4-5", "max_tokens": 32, "stream": stream,
+                    "messages": [
+                        {"role": "assistant", "content": [block]},
+                        {"role": "user", "content": "Continue"},
+                    ],
+                },
+            )
+
+        assert response.status_code == 422
+        client_class.assert_not_called()
+
 
 class TestInvalidModelExpectedResponse:
     """Anthropic model entitlement errors are client-actionable in both modes."""

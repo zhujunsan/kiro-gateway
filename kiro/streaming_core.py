@@ -68,13 +68,14 @@ class KiroEvent:
     This format is API-agnostic and can be converted to both OpenAI and Anthropic formats.
     
     Attributes:
-        type: Event type (content, thinking, tool lifecycle, usage, context_usage, error)
+        type: Event type (content, thinking, tool lifecycle, usage, metering, context_usage, error)
         content: Text content (for content events)
         thinking_content: Thinking/reasoning content (for thinking events)
         tool_use: Tool identity or finalized data (for tool lifecycle events)
         tool_call_id: Tool call identifier (for tool input events)
         tool_input_delta: Incremental JSON argument fragment
-        usage: Usage/metering data (for usage events)
+        usage: Upstream token usage dictionary (for usage events)
+        credits: Validated credit usage (for metering events), never tokens
         context_usage_percentage: Context usage percentage (for context_usage events)
         is_first_thinking_chunk: Whether this is the first thinking chunk
         is_last_thinking_chunk: Whether this is the last thinking chunk
@@ -89,6 +90,7 @@ class KiroEvent:
     context_usage_percentage: Optional[float] = None
     is_first_thinking_chunk: bool = False
     is_last_thinking_chunk: bool = False
+    credits: Optional[float] = None
 
 
 @dataclass
@@ -100,7 +102,8 @@ class StreamResult:
         content: Full text content
         thinking_content: Full thinking/reasoning content
         tool_calls: List of tool calls
-        usage: Usage information
+        usage: Upstream token usage dictionary
+        credits: Sum of credit events, or None if no metering was received
         context_usage_percentage: Context usage percentage from Kiro API
     """
     content: str = ""
@@ -108,6 +111,7 @@ class StreamResult:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
+    credits: Optional[float] = None
 
 
 class FirstTokenTimeoutError(Exception):
@@ -301,7 +305,14 @@ async def _process_parser_events(
                     yield KiroEvent(type="content", content=content)
         
         elif event["type"] == "usage":
-            yield KiroEvent(type="usage", usage=event["data"])
+            if isinstance(event["data"], dict):
+                yield KiroEvent(type="usage", usage=event["data"])
+            else:
+                # The parser validates legacy scalar usage as credits.
+                yield KiroEvent(type="metering", credits=event["data"])
+
+        elif event["type"] == "metering":
+            yield KiroEvent(type="metering", credits=event["data"])
         
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
@@ -358,6 +369,8 @@ async def collect_stream_to_result(
             result.tool_calls.append(event.tool_use)
         elif event.type == "usage" and event.usage:
             result.usage = event.usage
+        elif event.type == "metering" and event.credits is not None:
+            result.credits = (result.credits or 0.0) + event.credits
         elif event.type == "context_usage" and event.context_usage_percentage is not None:
             result.context_usage_percentage = event.context_usage_percentage
     
