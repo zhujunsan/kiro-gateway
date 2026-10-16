@@ -50,6 +50,12 @@ from kiro.config import (
 )
 from kiro.utils import get_machine_fingerprint
 from kiro.proxy import resolve_proxy
+from kiro.profile_discovery import (
+    ProfileDiscoveryError,
+    ProfileDiscoveryFailure,
+    discover_profile_arn,
+    profile_arn_region,
+)
 
 
 # Supported SQLite token keys (searched in priority order)
@@ -145,6 +151,12 @@ class KiroAuthManager:
         """
         self._refresh_token = refresh_token
         self._profile_arn = profile_arn
+        # True when the ARN comes from the account's own credential store
+        # (JSON file / kiro-cli SQLite) rather than an external override such as
+        # PROFILE_ARN. Only external ARNs need verification for SSO accounts.
+        self._profile_arn_from_credentials = False
+        # Set once ensure_profile_arn() has confirmed or discovered the ARN.
+        self._profile_arn_verified = False
         self._region = region
         self._creds_file = creds_file
         self._sqlite_db = sqlite_db
@@ -295,8 +307,9 @@ class KiroAuthManager:
                         self._access_token = token_data['access_token']
                     if 'refresh_token' in token_data:
                         self._refresh_token = token_data['refresh_token']
-                    if 'profile_arn' in token_data:
+                    if token_data.get('profile_arn'):
                         self._profile_arn = token_data['profile_arn']
+                        self._profile_arn_from_credentials = True
                     if 'region' in token_data:
                         # Store SSO region for OIDC token refresh
                         # Note: API region is determined separately (see __init__ for priority logic)
@@ -354,6 +367,7 @@ class KiroAuthManager:
                     if arn:
                         if not self._profile_arn:
                             self._profile_arn = arn
+                            self._profile_arn_from_credentials = True
                             logger.debug(f"Profile ARN from state table: {self._profile_arn}")
                         # ARN format: arn:aws:codewhisperer:REGION:account:profile/id
                         # Extract region from 4th component (index 3)
@@ -419,8 +433,9 @@ class KiroAuthManager:
                 self._refresh_token = data['refreshToken']
             if 'accessToken' in data:
                 self._access_token = data['accessToken']
-            if 'profileArn' in data:
+            if data.get('profileArn'):
                 self._profile_arn = data['profileArn']
+                self._profile_arn_from_credentials = True
             if 'region' in data:
                 # Store as SSO region for OIDC token refresh
                 self._sso_region = data['region']
@@ -522,7 +537,15 @@ class KiroAuthManager:
             existing_data['refreshToken'] = self._refresh_token
             if self._expires_at:
                 existing_data['expiresAt'] = self._expires_at.isoformat()
-            if self._profile_arn:
+            # For SSO accounts persist only an ARN that belongs to this login. An
+            # unverified external override (PROFILE_ARN) may belong to a previous
+            # account and must not be stamped into the shared Kiro credential
+            # file. Desktop refresh returns its own ARN, so it is unaffected.
+            if self._profile_arn and (
+                self._auth_type != AuthType.AWS_SSO_OIDC
+                or self._profile_arn_from_credentials
+                or self._profile_arn_verified
+            ):
                 existing_data['profileArn'] = self._profile_arn
             
             # Save to tmp file with restrictive permissions
@@ -766,6 +789,7 @@ class KiroAuthManager:
             self._refresh_token = new_refresh_token
         if new_profile_arn:
             self._profile_arn = new_profile_arn
+            self._profile_arn_from_credentials = True
         
         # Calculate expiration time with buffer (minus 60 seconds)
         self._expires_at = datetime.now(timezone.utc).replace(microsecond=0)
@@ -988,6 +1012,93 @@ class KiroAuthManager:
             await self._refresh_token_request()
             return self._access_token
     
+    async def ensure_profile_arn(self) -> Optional[str]:
+        """
+        Make sure an AWS SSO OIDC account has a profile ARN for its current token.
+
+        Enterprise credential files often omit ``profileArn`` and OIDC refresh
+        never returns one, yet the runtime API requires it. This method uses the
+        freshly obtained access token to call ``ListAvailableProfiles``:
+
+        - ARN already present in the credential store: trusted, no network.
+        - Kiro Desktop / social accounts: unchanged (refresh supplies the ARN).
+        - ARN missing or only supplied externally (``PROFILE_ARN``): discovered
+          or verified, then persisted to the JSON credential file.
+
+        Failure policy:
+        - Token rejected by AWS: raises ``ValueError`` so the account is reported
+          as "sign in again" like any other credential failure.
+        - Other failures with an external ARN available: keep that ARN and log a
+          warning, so a flaky network does not block an otherwise working setup.
+        - Other failures without any ARN: raise ``ProfileDiscoveryError``.
+
+        Must be called after ``get_access_token()`` succeeded.
+
+        Returns:
+            The profile ARN to use (None only for non-SSO accounts without one).
+
+        Raises:
+            ValueError: AWS rejected the current login during discovery.
+            ProfileDiscoveryError: No usable ARN could be determined.
+        """
+        if self._auth_type != AuthType.AWS_SSO_OIDC:
+            return self._profile_arn
+        if self._profile_arn_verified:
+            return self._profile_arn
+        if self._profile_arn and self._profile_arn_from_credentials:
+            self._profile_arn_verified = True
+            return self._profile_arn
+        if not self._access_token:
+            raise ValueError("Failed to obtain access token")
+
+        external_arn = self._profile_arn
+        current_api_region = self._api_region_from_host()
+        try:
+            arn = await discover_profile_arn(
+                self._access_token, current_api_region, external_arn
+            )
+        except ProfileDiscoveryError as error:
+            if error.failure is ProfileDiscoveryFailure.AUTH_REJECTED:
+                raise ValueError(str(error)) from None
+            if external_arn:
+                logger.warning(
+                    f"Profile discovery failed ({error.failure.value}); "
+                    f"using configured PROFILE_ARN without verification"
+                )
+                return external_arn
+            raise
+
+        self._profile_arn = arn
+        self._profile_arn_verified = True
+        arn_region = profile_arn_region(arn)
+        if arn_region and arn_region != current_api_region:
+            # The SSO region is not always the profile region; follow the ARN.
+            self._api_host = get_kiro_api_host(arn_region)
+            self._q_host = get_kiro_q_host(arn_region)
+            logger.info(
+                f"API region switched to {arn_region} to match the discovered profile"
+            )
+        logger.info(
+            "Profile ARN "
+            + ("verified" if arn == external_arn else "discovered")
+            + " via ListAvailableProfiles"
+        )
+        # SQLite (kiro-cli) keeps its ARN in a separate state table owned by
+        # kiro-cli; only the JSON credential file is updated.
+        if self._creds_file and not self._sqlite_db:
+            self._save_credentials_to_file()
+        return arn
+
+    def _api_region_from_host(self) -> Optional[str]:
+        """
+        Recover the API region currently encoded in the Q host.
+
+        Returns:
+            Region string, or None if the host does not follow the template.
+        """
+        match = re.match(r"^https://q\.([a-z0-9-]+)\.amazonaws\.com", self._q_host or "")
+        return match.group(1) if match else None
+
     @property
     def profile_arn(self) -> Optional[str]:
         """AWS CodeWhisperer profile ARN."""

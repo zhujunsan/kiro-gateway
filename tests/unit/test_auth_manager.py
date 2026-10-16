@@ -4660,3 +4660,246 @@ class TestKiroAuthManagerSaveCredentialsToFileAtomic:
         print("Verification: No exception escaped...")
         assert tmp_file.exists()
 
+
+
+# =============================================================================
+# Profile ARN self-discovery for AWS SSO OIDC accounts
+# =============================================================================
+
+from kiro.profile_discovery import ProfileDiscoveryError, ProfileDiscoveryFailure
+
+_DISCOVERED_ARN = "arn:aws:codewhisperer:us-east-1:119004746410:profile/DISCOVERED"
+_EXTERNAL_ARN = "arn:aws:codewhisperer:us-east-1:111111111111:profile/EXTERNAL"
+
+
+def _write_enterprise_files(tmp_path: Path, **overrides) -> Path:
+    """
+    Create an enterprise (clientIdHash) credential file plus its device registration.
+
+    Args:
+        tmp_path: Directory used as the fake home.
+        **overrides: Fields merged into the credential JSON; a value of None removes the key.
+
+    Returns:
+        Path to kiro-auth-token.json.
+    """
+    creds = {
+        "accessToken": "enterprise_access_token",
+        "refreshToken": "enterprise_refresh_token",
+        "expiresAt": "2099-01-01T00:00:00.000Z",
+        "region": "ap-northeast-1",
+        "clientIdHash": "hash123",
+        "authMethod": "IdC",
+        "provider": "Enterprise",
+    }
+    for key, value in overrides.items():
+        if value is None:
+            creds.pop(key, None)
+        else:
+            creds[key] = value
+    cache = tmp_path / ".aws" / "sso" / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    (cache / "hash123.json").write_text(json.dumps({
+        "clientId": "cid", "clientSecret": "csecret", "region": "ap-northeast-1",
+    }))
+    path = tmp_path / "kiro-auth-token.json"
+    path.write_text(json.dumps(creds))
+    return path
+
+
+class TestKiroAuthManagerEnsureProfileArn:
+    """Tests for KiroAuthManager.ensure_profile_arn()."""
+
+    @pytest.fixture(autouse=True)
+    def _home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr('pathlib.Path.home', lambda: tmp_path)
+        monkeypatch.delenv("KIRO_API_REGION", raising=False)
+
+    @pytest.mark.asyncio
+    async def test_missing_arn_is_discovered_persisted_and_region_switched(self, tmp_path):
+        """
+        What it does: Enterprise file without profileArn, SSO region ap-northeast-1.
+        Purpose: Fresh users need no manual ARN; API host follows the profile region.
+        """
+        path = _write_enterprise_files(tmp_path, profileArn=None)
+        manager = KiroAuthManager(creds_file=str(path))
+        assert manager.auth_type == AuthType.AWS_SSO_OIDC
+        assert "ap-northeast-1" in manager.q_host
+
+        with patch("kiro.auth.discover_profile_arn", AsyncMock(return_value=_DISCOVERED_ARN)) as discover:
+            arn = await manager.ensure_profile_arn()
+
+        assert arn == _DISCOVERED_ARN
+        assert manager.profile_arn == _DISCOVERED_ARN
+        discover.assert_awaited_once_with("enterprise_access_token", "ap-northeast-1", None)
+        assert manager.q_host == "https://q.us-east-1.amazonaws.com"
+        assert manager.api_host == "https://runtime.us-east-1.kiro.dev"
+        saved = json.loads(path.read_text())
+        assert saved["profileArn"] == _DISCOVERED_ARN
+        # OIDC refresh must keep using the SSO region.
+        assert saved["region"] == "ap-northeast-1"
+        assert "ap-northeast-1" in manager._refresh_url
+
+    @pytest.mark.asyncio
+    async def test_discovery_runs_only_once(self, tmp_path):
+        """
+        What it does: Calls ensure_profile_arn twice.
+        Purpose: Discovery must not hit AWS on every request.
+        """
+        path = _write_enterprise_files(tmp_path, profileArn=None)
+        manager = KiroAuthManager(creds_file=str(path))
+        with patch("kiro.auth.discover_profile_arn", AsyncMock(return_value=_DISCOVERED_ARN)) as discover:
+            await manager.ensure_profile_arn()
+            await manager.ensure_profile_arn()
+        assert discover.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_arn_from_credentials_file_is_trusted_without_network(self, tmp_path):
+        """
+        What it does: File already carries profileArn.
+        Purpose: Common case stays offline and unchanged.
+        """
+        path = _write_enterprise_files(tmp_path, profileArn=_DISCOVERED_ARN)
+        before = path.read_bytes()
+        manager = KiroAuthManager(creds_file=str(path), profile_arn=_EXTERNAL_ARN)
+
+        with patch("kiro.auth.discover_profile_arn", AsyncMock(side_effect=AssertionError("network"))):
+            assert await manager.ensure_profile_arn() == _DISCOVERED_ARN
+        assert path.read_bytes() == before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("empty", ["", None])
+    async def test_empty_arn_in_file_does_not_override_or_count_as_trusted(self, tmp_path, empty):
+        """
+        What it does: profileArn present but empty/null.
+        Purpose: Empty values must trigger discovery, not erase the override.
+        """
+        path = _write_enterprise_files(tmp_path)
+        data = json.loads(path.read_text())
+        data["profileArn"] = empty
+        path.write_text(json.dumps(data))
+        manager = KiroAuthManager(creds_file=str(path), profile_arn=_EXTERNAL_ARN)
+        assert manager.profile_arn == _EXTERNAL_ARN
+
+        with patch("kiro.auth.discover_profile_arn", AsyncMock(return_value=_EXTERNAL_ARN)) as discover:
+            assert await manager.ensure_profile_arn() == _EXTERNAL_ARN
+        discover.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_external_arn_is_verified_and_replaced_when_account_changed(self, tmp_path):
+        """
+        What it does: PROFILE_ARN belongs to a previous account.
+        Purpose: New login must not reuse a stale ARN.
+        """
+        path = _write_enterprise_files(tmp_path, profileArn=None)
+        manager = KiroAuthManager(creds_file=str(path), profile_arn=_EXTERNAL_ARN)
+
+        with patch("kiro.auth.discover_profile_arn", AsyncMock(return_value=_DISCOVERED_ARN)) as discover:
+            assert await manager.ensure_profile_arn() == _DISCOVERED_ARN
+        discover.assert_awaited_once_with("enterprise_access_token", "ap-northeast-1", _EXTERNAL_ARN)
+        assert json.loads(path.read_text())["profileArn"] == _DISCOVERED_ARN
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        [ProfileDiscoveryFailure.UNAVAILABLE, ProfileDiscoveryFailure.NOT_FOUND, ProfileDiscoveryFailure.AMBIGUOUS],
+    )
+    async def test_non_auth_failure_falls_back_to_external_arn_without_persisting(self, tmp_path, failure):
+        """
+        What it does: Discovery fails but PROFILE_ARN is set.
+        Purpose: A flaky network must not block a working 0.4.x-style setup,
+                 and an unverified ARN must not be stamped into Kiro's file.
+        """
+        path = _write_enterprise_files(tmp_path, profileArn=None)
+        manager = KiroAuthManager(creds_file=str(path), profile_arn=_EXTERNAL_ARN)
+        error = ProfileDiscoveryError("lookup failed", failure)
+
+        with patch("kiro.auth.discover_profile_arn", AsyncMock(side_effect=error)):
+            assert await manager.ensure_profile_arn() == _EXTERNAL_ARN
+        assert "profileArn" not in json.loads(path.read_text())
+
+        # A later token refresh must not persist the unverified ARN either.
+        manager._save_credentials_to_file()
+        assert "profileArn" not in json.loads(path.read_text())
+
+    @pytest.mark.asyncio
+    async def test_non_auth_failure_without_any_arn_raises(self, tmp_path):
+        """
+        What it does: Discovery unavailable and nothing to fall back to.
+        Purpose: Never serve with an empty ARN; surface an actionable error.
+        """
+        path = _write_enterprise_files(tmp_path, profileArn=None)
+        manager = KiroAuthManager(creds_file=str(path))
+        error = ProfileDiscoveryError("Could not reach Kiro", ProfileDiscoveryFailure.UNAVAILABLE)
+
+        with patch("kiro.auth.discover_profile_arn", AsyncMock(side_effect=error)):
+            with pytest.raises(ProfileDiscoveryError, match="Could not reach"):
+                await manager.ensure_profile_arn()
+        assert manager.profile_arn is None
+        assert manager._profile_arn_verified is False
+
+    @pytest.mark.asyncio
+    async def test_auth_rejected_becomes_value_error_even_with_external_arn(self, tmp_path):
+        """
+        What it does: AWS rejects the token during discovery.
+        Purpose: Classified as a login failure so the tray prompts re-login.
+        """
+        path = _write_enterprise_files(tmp_path, profileArn=None)
+        manager = KiroAuthManager(creds_file=str(path), profile_arn=_EXTERNAL_ARN)
+        error = ProfileDiscoveryError("sign in again", ProfileDiscoveryFailure.AUTH_REJECTED)
+
+        with patch("kiro.auth.discover_profile_arn", AsyncMock(side_effect=error)):
+            with pytest.raises(ValueError, match="sign in again"):
+                await manager.ensure_profile_arn()
+
+    @pytest.mark.asyncio
+    async def test_kiro_desktop_account_never_discovers(self, tmp_path):
+        """
+        What it does: Desktop/social credentials without profileArn.
+        Purpose: Desktop refresh supplies the ARN; no extra AWS call.
+        """
+        path = tmp_path / "desktop.json"
+        path.write_text(json.dumps({"refreshToken": "r", "accessToken": "a"}))
+        manager = KiroAuthManager(creds_file=str(path))
+        assert manager.auth_type == AuthType.KIRO_DESKTOP
+
+        with patch("kiro.auth.discover_profile_arn", AsyncMock(side_effect=AssertionError("network"))):
+            assert await manager.ensure_profile_arn() is None
+
+    @pytest.mark.asyncio
+    async def test_missing_access_token_is_auth_failure(self, tmp_path):
+        """
+        What it does: Called without a token.
+        Purpose: Defensive; treated as a login problem, not a crash.
+        """
+        path = _write_enterprise_files(tmp_path, profileArn=None, accessToken=None)
+        manager = KiroAuthManager(creds_file=str(path))
+        with pytest.raises(ValueError):
+            await manager.ensure_profile_arn()
+
+    @pytest.mark.asyncio
+    async def test_sqlite_account_discovers_without_touching_json(self, tmp_path):
+        """
+        What it does: kiro-cli SQLite SSO account without a profile row.
+        Purpose: Discovery works for kiro-cli; SQLite state table stays owned by kiro-cli.
+        """
+        import sqlite3
+        db = tmp_path / "data.sqlite3"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO auth_kv VALUES (?, ?)", ("kirocli:odic:token", json.dumps({
+            "access_token": "sqlite_access", "refresh_token": "sqlite_refresh",
+            "expires_at": "2099-01-01T00:00:00Z", "region": "us-east-1",
+        })))
+        conn.execute("INSERT INTO auth_kv VALUES (?, ?)", ("kirocli:odic:device-registration", json.dumps({
+            "client_id": "cid", "client_secret": "csecret", "region": "us-east-1",
+        })))
+        conn.commit()
+        conn.close()
+        manager = KiroAuthManager(sqlite_db=str(db))
+        assert manager.auth_type == AuthType.AWS_SSO_OIDC
+
+        with patch("kiro.auth.discover_profile_arn", AsyncMock(return_value=_DISCOVERED_ARN)), \
+                patch.object(manager, "_save_credentials_to_file") as save_json:
+            assert await manager.ensure_profile_arn() == _DISCOVERED_ARN
+        save_json.assert_not_called()

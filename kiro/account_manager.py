@@ -47,6 +47,7 @@ from fastapi import HTTPException
 from loguru import logger
 
 from kiro.auth import KiroAuthManager, AuthType
+from kiro.profile_discovery import ProfileDiscoveryError
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver, normalize_model_name
 from kiro.config import (
@@ -139,6 +140,8 @@ class Account:
             *why* an account is unusable instead of a bare "failed" flag
         last_init_auth_failure: Whether ``last_init_error`` was a credential
             problem (user must sign in again) rather than a transient one
+        last_init_hint: Actionable user-facing message for failures that have
+            a specific fix (e.g. profile discovery), else None
         stats: Usage statistics
     """
     id: str
@@ -152,6 +155,7 @@ class Account:
     model_discovery_succeeded: bool = False
     last_init_error: Optional[str] = None
     last_init_auth_failure: bool = False
+    last_init_hint: Optional[str] = None
     initialization_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock, repr=False, compare=False
     )
@@ -548,6 +552,9 @@ class AccountManager:
                 return False
 
             await auth_manager.get_access_token()
+            # Enterprise SSO credentials may lack profileArn, which the runtime
+            # API requires. Discover it with the fresh token before serving.
+            await auth_manager.ensure_profile_arn()
 
             model_cache = ModelInfoCache()
             await model_cache.update(FALLBACK_MODELS)
@@ -576,14 +583,25 @@ class AccountManager:
             )
             account.last_init_error = None
             account.last_init_auth_failure = False
+            account.last_init_hint = None
             self._dirty = True
             return True
-        except (OSError, ValueError, json.JSONDecodeError, httpx.HTTPError) as error:
+        except (
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+            httpx.HTTPError,
+            ProfileDiscoveryError,
+        ) as error:
             # Keep the cause on the account. Startup used to raise a bare
             # "Failed to initialize any account", which told neither the user nor
             # Sentry whether it was an expired login, an empty file, or a proxy.
             account.last_init_error = f"{type(error).__name__}: {error}"
             account.last_init_auth_failure = is_auth_failure(error)
+            # Profile discovery messages already tell the user what to do.
+            account.last_init_hint = (
+                str(error) if isinstance(error, ProfileDiscoveryError) else None
+            )
             if account.last_init_auth_failure:
                 logger.error(
                     f"Account {account_id} needs re-login "
@@ -1014,6 +1032,20 @@ class AccountManager:
                     "up the refreshed credentials on the next request."
                 ),
                 "account_count": len(self._accounts),
+                "errors": errors,
+            }
+        hints = [
+            account.last_init_hint
+            for account in self._accounts.values()
+            if account.last_init_hint
+        ]
+        if len(self._accounts) == 1 and hints:
+            # A single account with a specific, actionable cause: surface it
+            # instead of the generic "check network" text.
+            return {
+                "code": "account_init_failed",
+                "message": hints[0],
+                "account_count": 1,
                 "errors": errors,
             }
         return {

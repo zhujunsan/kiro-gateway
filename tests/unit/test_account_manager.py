@@ -839,6 +839,92 @@ class TestAccountManagerInitializeAccount:
         assert success is False
         assert account.last_init_auth_failure is True
 
+    @pytest.mark.asyncio
+    async def test_initialize_runs_profile_discovery_after_token(self, tmp_path):
+        """Account init must resolve the ARN after obtaining the token.
+
+        Enterprise SSO files may lack profileArn; without discovery every chat
+        request fails with "profileArn is required".
+        """
+        manager, account_id = self._single_json_account(tmp_path)
+        await manager.load_credentials()
+        calls: list = []
+
+        async def token(self):
+            calls.append("token")
+            return "tok"
+
+        async def ensure(self):
+            calls.append("profile")
+            return "arn"
+
+        with patch.object(KiroAuthManager, "get_access_token", new=token), \
+                patch.object(KiroAuthManager, "ensure_profile_arn", new=ensure):
+            assert await manager._initialize_account(account_id) is True
+
+        assert calls == ["token", "profile"]
+        account = manager._accounts[account_id]
+        assert account.last_init_error is None
+        assert account.last_init_hint is None
+
+    @pytest.mark.asyncio
+    async def test_profile_discovery_failure_is_recorded_with_actionable_hint(self, tmp_path):
+        """A non-auth discovery failure keeps the gateway up and explains the fix."""
+        from kiro.profile_discovery import ProfileDiscoveryError, ProfileDiscoveryFailure
+
+        manager, account_id = self._single_json_account(tmp_path)
+        await manager.load_credentials()
+        error = ProfileDiscoveryError(
+            "This Kiro account has multiple profiles. Set PROFILE_ARN.",
+            ProfileDiscoveryFailure.AMBIGUOUS,
+        )
+
+        with patch.object(KiroAuthManager, "get_access_token", new=AsyncMock(return_value="tok")), \
+                patch.object(KiroAuthManager, "ensure_profile_arn", new=AsyncMock(side_effect=error)):
+            assert await manager._initialize_account(account_id) is False
+
+        account = manager._accounts[account_id]
+        assert account.auth_manager is None  # never serve with an unresolved ARN
+        assert account.last_init_auth_failure is False
+        assert "multiple profiles" in account.last_init_hint
+        failure = manager.describe_init_failure()
+        assert failure["code"] == "account_init_failed"
+        assert "multiple profiles" in failure["message"]
+
+    @pytest.mark.asyncio
+    async def test_profile_discovery_auth_rejection_is_login_required(self, tmp_path):
+        """A token rejected during discovery is reported as "sign in again"."""
+        manager, account_id = self._single_json_account(tmp_path)
+        await manager.load_credentials()
+
+        with patch.object(KiroAuthManager, "get_access_token", new=AsyncMock(return_value="tok")), \
+                patch.object(KiroAuthManager, "ensure_profile_arn",
+                             new=AsyncMock(side_effect=ValueError("sign in again"))):
+            assert await manager._initialize_account(account_id) is False
+
+        account = manager._accounts[account_id]
+        assert account.last_init_auth_failure is True
+        assert account.last_init_hint is None
+        assert manager.describe_init_failure()["code"] == "account_auth_required"
+
+    @pytest.mark.asyncio
+    async def test_successful_retry_clears_previous_discovery_hint(self, tmp_path):
+        """Lazy re-initialization after a fix must not keep reporting the old hint."""
+        from kiro.profile_discovery import ProfileDiscoveryError, ProfileDiscoveryFailure
+
+        manager, account_id = self._single_json_account(tmp_path)
+        await manager.load_credentials()
+        error = ProfileDiscoveryError("offline", ProfileDiscoveryFailure.UNAVAILABLE)
+        ensure = AsyncMock(side_effect=[error, "arn"])
+
+        with patch.object(KiroAuthManager, "get_access_token", new=AsyncMock(return_value="tok")), \
+                patch.object(KiroAuthManager, "ensure_profile_arn", new=ensure):
+            assert await manager._initialize_account(account_id) is False
+            assert manager._accounts[account_id].last_init_hint == "offline"
+            assert await manager._initialize_account(account_id) is True
+
+        assert manager._accounts[account_id].last_init_hint is None
+
 
 
 class TestAccountManagerGetNextAccount:
