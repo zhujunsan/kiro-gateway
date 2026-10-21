@@ -2138,3 +2138,16 @@ class TestBuildKiroPayloadIntegration:
         print(f"Checking for <max_thinking_length>{expected_budget}</max_thinking_length>...")
         assert f"<max_thinking_length>{expected_budget}</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+class TestOpenAiDocumentConversion:
+    """OpenAI Chat file parts must survive conversion to unified messages."""
+
+    def test_user_file_part_becomes_document(self):
+        from kiro.converters_openai import convert_openai_messages_to_unified
+        messages = [ChatMessage(role="user", content=[
+            {"type": "text", "text": "summarize"},
+            {"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,JVBERi0xLjQK"}},
+        ])]
+        _, unified = convert_openai_messages_to_unified(messages)
+        assert unified[0].content == "summarize"
+        assert unified[0].documents == [{"media_type": "application/pdf", "filename": "a.pdf", "data": "JVBERi0xLjQK"}]

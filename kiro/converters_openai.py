@@ -41,6 +41,7 @@ from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool
 from kiro.converters_core import (
     extract_text_content,
     extract_images_from_content,
+    extract_documents_from_content,
     UnifiedMessage,
     UnifiedTool,
     ThinkingConfig,
@@ -231,6 +232,7 @@ def convert_openai_messages_to_unified(messages: List[ChatMessage]) -> Tuple[str
             tool_calls = None
             tool_results = None
             images = None
+            documents = None
 
             if msg.role == "assistant":
                 tool_calls = _extract_tool_calls_from_openai(msg) or None
@@ -244,13 +246,15 @@ def convert_openai_messages_to_unified(messages: List[ChatMessage]) -> Tuple[str
                 images = extract_images_from_content(msg.content) or None
                 if images:
                     total_images += len(images)
+                documents = extract_documents_from_content(msg.content) or None
 
             unified_msg = UnifiedMessage(
                 role=msg.role,
                 content=extract_text_content(msg.content),
                 tool_calls=tool_calls,
                 tool_results=tool_results,
-                images=images
+                images=images,
+                documents=documents,
             )
             processed.append(unified_msg)
     

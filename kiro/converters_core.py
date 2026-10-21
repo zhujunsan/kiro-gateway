@@ -124,12 +124,15 @@ class UnifiedMessage:
         tool_results: List of tool results (for user messages with tool responses)
         images: List of images in unified format (for multimodal user messages)
                 Format: [{"media_type": "image/jpeg", "data": "base64..."}]
+        documents: List of document attachments in unified format (for user messages)
+                Format: [{"media_type": "application/pdf", "filename": "a.pdf", "data": "base64..."}]
     """
     role: str
     content: Any = ""
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_results: Optional[List[Dict[str, Any]]] = None
     images: Optional[List[Dict[str, Any]]] = None
+    documents: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
@@ -1094,6 +1097,159 @@ def convert_images_to_kiro_format(images: Optional[List[Dict[str, Any]]]) -> Lis
 
 
 # ==================================================================================================
+# Document Attachments
+# ==================================================================================================
+
+# MIME type -> Kiro document format, mirroring the formats accepted by the native Kiro IDE.
+KIRO_DOCUMENT_FORMATS: Dict[str, str] = {
+    "application/pdf": "pdf",
+    "text/csv": "csv",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "text/html": "html",
+    "text/plain": "txt",
+    "text/markdown": "md",
+}
+
+# Kiro allows at most this many documents per user message.
+KIRO_MAX_DOCUMENTS_PER_MESSAGE = 5
+
+_DOCUMENT_NAME_INVALID_CHARS = re.compile(r"[^a-zA-Z0-9\s\-()\[\]]")
+
+
+def _split_data_url(value: str) -> Tuple[Optional[str], str]:
+    """
+    Splits a base64 data URL into its media type and payload.
+
+    Args:
+        value: A "data:<mime>;base64,<payload>" string or a bare base64 payload.
+
+    Returns:
+        Tuple of (media type or None, base64 payload).
+    """
+    if not value.startswith("data:") or "," not in value:
+        return None, value
+    header, payload = value.split(",", 1)
+    media_type = header[len("data:"):].split(";")[0] or None
+    return media_type, payload
+
+
+def extract_documents_from_content(content: Any) -> List[Dict[str, Any]]:
+    """
+    Extracts base64 document attachments from message content.
+
+    Supports OpenAI Chat file parts:
+        {"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,..."}}
+
+    Args:
+        content: Message content (string or list of content blocks).
+
+    Returns:
+        Documents in unified format: [{"media_type": ..., "filename": ..., "data": ...}].
+        File parts without inline data (file_id references) are skipped with a warning.
+    """
+    documents: List[Dict[str, Any]] = []
+    if not isinstance(content, list):
+        return documents
+
+    for item in content:
+        block = item if isinstance(item, dict) else getattr(item, "model_dump", lambda: None)()
+        if not isinstance(block, dict):
+            continue
+        item_type = block.get("type")
+
+        if item_type == "file":
+            file_obj = block.get("file") or {}
+            file_data = file_obj.get("file_data") or ""
+            if not file_data:
+                logger.warning("File content part without inline file_data is not supported by Kiro API, skipping")
+                continue
+            media_type, data = _split_data_url(file_data)
+            documents.append({
+                "media_type": media_type or "application/octet-stream",
+                "filename": file_obj.get("filename") or "document",
+                "data": data,
+            })
+
+    if documents:
+        logger.debug(f"Extracted {len(documents)} document(s) from content")
+    return documents
+
+
+def _kiro_document_name(filename: str) -> str:
+    """
+    Normalizes a filename to the document name format accepted by Kiro.
+
+    Kiro (Bedrock Converse) only accepts alphanumerics, whitespace, hyphens,
+    parentheses and square brackets, so the extension is dropped and other
+    characters are replaced, matching the native Kiro IDE.
+
+    Args:
+        filename: Original attachment filename.
+
+    Returns:
+        A non-empty name of at most 200 characters.
+    """
+    name = re.sub(r"\.[^.]+$", "", filename)
+    name = _DOCUMENT_NAME_INVALID_CHARS.sub("-", name)
+    name = re.sub(r"-{2,}", "-", name)
+    name = re.sub(r"\s{2,}", " ", name).strip()[:200]
+    return name or "document"
+
+
+def convert_documents_to_kiro_format(documents: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """
+    Converts unified documents to Kiro userInputMessage.documents format.
+
+    Kiro format: [{"name": "report", "format": "pdf", "source": {"bytes": "base64..."}}]
+
+    Args:
+        documents: Documents in unified format.
+
+    Returns:
+        Kiro documents with unique names, limited to KIRO_MAX_DOCUMENTS_PER_MESSAGE.
+
+    Raises:
+        ValueError: If a document has an unsupported MIME type or empty data, so the
+            client gets an explicit error instead of the model silently missing the file.
+    """
+    if not documents:
+        return []
+
+    kiro_documents: List[Dict[str, Any]] = []
+    used_names: set = set()
+    for document in documents:
+        media_type = (document.get("media_type") or "").lower()
+        filename = document.get("filename") or "document"
+        doc_format = KIRO_DOCUMENT_FORMATS.get(media_type)
+        if doc_format is None:
+            raise ValueError(f"Unsupported document type for Kiro API: {media_type or 'unknown'} ({filename})")
+        data = document.get("data") or ""
+        if not data:
+            raise ValueError(f"Document {filename} has no data")
+
+        base_name = _kiro_document_name(filename)
+        name = base_name
+        suffix = 1
+        while name in used_names:
+            name = f"{base_name[:195]} ({suffix})"
+            suffix += 1
+        used_names.add(name)
+        kiro_documents.append({"name": name, "format": doc_format, "source": {"bytes": data}})
+
+    if len(kiro_documents) > KIRO_MAX_DOCUMENTS_PER_MESSAGE:
+        raise ValueError(
+            f"Too many documents attached ({len(kiro_documents)}). "
+            f"Kiro accepts at most {KIRO_MAX_DOCUMENTS_PER_MESSAGE} per message."
+        )
+
+    logger.debug(f"Converted {len(kiro_documents)} document(s) to Kiro format")
+    return kiro_documents
+
+
+# ==================================================================================================
 # Tool Results and Tool Uses Extraction
 # ==================================================================================================
 
@@ -1563,6 +1719,7 @@ def strip_unknown_tool_calls(
             tool_calls=kept_calls if msg.tool_calls else None,
             tool_results=kept_results if msg.tool_results else None,
             images=msg.images,
+            documents=msg.documents,
         ))
 
     logger.debug(
@@ -1644,7 +1801,8 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
                 content=content,
                 tool_calls=None,
                 tool_results=None,
-                images=msg.images
+                images=msg.images,
+                documents=msg.documents
             )
             result.append(cleaned_msg)
         else:
@@ -1727,7 +1885,8 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
                     content=new_content,
                     tool_calls=msg.tool_calls,
                     tool_results=None,  # Remove orphaned tool_results (now in text)
-                    images=msg.images
+                    images=msg.images,
+                    documents=msg.documents
                 )
                 result.append(cleaned_msg)
                 converted_any_tool_results = True
@@ -1792,6 +1951,13 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                     last.tool_results = []
                 last.tool_results = list(last.tool_results) + list(msg.tool_results)
                 total_tool_results_merged += len(msg.tool_results)
+
+            # Merge attachments; converters move them out of content, so dropping
+            # them here would silently lose user attachments.
+            if msg.images:
+                last.images = list(last.images or []) + list(msg.images)
+            if msg.documents:
+                last.documents = list(last.documents or []) + list(msg.documents)
             
             # Count merges by role
             if msg.role in merge_counts:
@@ -1913,7 +2079,8 @@ def normalize_message_roles(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                 content=msg.content,
                 tool_calls=msg.tool_calls,
                 tool_results=msg.tool_results,
-                images=msg.images
+                images=msg.images,
+                documents=msg.documents
             )
             normalized.append(normalized_msg)
             converted_count += 1
@@ -2028,6 +2195,10 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
                 kiro_images = convert_images_to_kiro_format(images)
                 if kiro_images:
                     user_input["images"] = kiro_images
+
+            documents = msg.documents or extract_documents_from_content(msg.content)
+            if documents:
+                user_input["documents"] = convert_documents_to_kiro_format(documents)
             
             # Build userInputMessageContext for tools and toolResults only
             user_input_context: Dict[str, Any] = {}
@@ -2211,6 +2382,11 @@ def build_kiro_payload(
         kiro_images = convert_images_to_kiro_format(images)
         if kiro_images:
             logger.debug(f"Added {len(kiro_images)} image(s) to current message")
+
+    documents = current_message.documents or extract_documents_from_content(current_message.content)
+    kiro_documents = convert_documents_to_kiro_format(documents) if documents else None
+    if kiro_documents:
+        logger.debug(f"Added {len(kiro_documents)} document(s) to current message")
     
     # Build user_input_context for tools and toolResults only (NOT images)
     user_input_context: Dict[str, Any] = {}
@@ -2246,6 +2422,8 @@ def build_kiro_payload(
     # Add images directly to userInputMessage (NOT to userInputMessageContext)
     if kiro_images:
         user_input_message["images"] = kiro_images
+    if kiro_documents:
+        user_input_message["documents"] = kiro_documents
     
     # Add user_input_context if present (contains tools and toolResults only)
     if user_input_context:

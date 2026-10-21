@@ -1162,6 +1162,23 @@ class TestMergeAdjacentMessages:
         assert result[1].role == "assistant"
         assert result[2].role == "user"
     
+    def test_merges_images_from_adjacent_user_messages(self):
+        """
+        What it does: Verifies images survive merging adjacent user messages.
+        Purpose: A text-only context message followed by a user message with an
+        attachment must keep the attachment after merging.
+        """
+        image = {"media_type": "image/png", "data": "abc123"}
+        messages = [
+            UnifiedMessage(role="user", content="context"),
+            UnifiedMessage(role="user", content="what is in the image?", images=[image]),
+        ]
+
+        result = merge_adjacent_messages(messages)
+
+        assert len(result) == 1
+        assert result[0].images == [image]
+
     def test_merges_list_contents_correctly(self):
         """
         What it does: Verifies merging of list contents.
@@ -7732,3 +7749,116 @@ class TestToolArgsSizeHintInPayload:
         prompt = self._system_prompt(result)
         assert "You are a helpful assistant." in prompt
         assert "Tool Call Size Limit" in prompt
+
+
+# ==================================================================================================
+# Tests for document attachments
+# ==================================================================================================
+
+from kiro.converters_core import (  # noqa: E402
+    KIRO_MAX_DOCUMENTS_PER_MESSAGE,
+    convert_documents_to_kiro_format,
+    extract_documents_from_content,
+)
+
+TEST_PDF_BASE64 = "JVBERi0xLjQK"
+
+
+class TestDocumentAttachments:
+    """Tests for document extraction, conversion and payload placement."""
+
+    def test_extracts_openai_file_part(self):
+        """OpenAI Chat file parts become unified documents with the data URL stripped."""
+        content = [
+            {"type": "text", "text": "read this"},
+            {"type": "file", "file": {"filename": "report.pdf", "file_data": f"data:application/pdf;base64,{TEST_PDF_BASE64}"}},
+        ]
+        assert extract_documents_from_content(content) == [
+            {"media_type": "application/pdf", "filename": "report.pdf", "data": TEST_PDF_BASE64}
+        ]
+
+    def test_skips_file_id_references(self):
+        """References Kiro cannot resolve are skipped instead of producing empty documents."""
+        content = [{"type": "file", "file": {"file_id": "file-123"}}]
+        assert extract_documents_from_content(content) == []
+
+    def test_non_list_content_has_no_documents(self):
+        assert extract_documents_from_content("plain text") == []
+        assert extract_documents_from_content(None) == []
+
+    def test_text_extraction_ignores_file_parts(self):
+        """Base64 payloads must never leak into the text content."""
+        content = [{"type": "text", "text": "hi"}, {"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,AAAA"}}]
+        assert extract_text_content(content) == "hi"
+
+    def test_converts_to_kiro_format_with_sanitized_unique_names(self):
+        documents = [
+            {"media_type": "application/pdf", "filename": "Q3 report_v2.pdf", "data": "AAAA"},
+            {"media_type": "application/pdf", "filename": "Q3 report_v2.pdf", "data": "BBBB"},
+        ]
+        result = convert_documents_to_kiro_format(documents)
+        assert result[0] == {"name": "Q3 report-v2", "format": "pdf", "source": {"bytes": "AAAA"}}
+        assert result[1]["name"] == "Q3 report-v2 (1)"
+
+    def test_rejects_unsupported_mime_type(self):
+        with pytest.raises(ValueError, match="Unsupported document type"):
+            convert_documents_to_kiro_format([{"media_type": "application/zip", "filename": "a.zip", "data": "AAAA"}])
+
+    def test_rejects_empty_data(self):
+        with pytest.raises(ValueError, match="has no data"):
+            convert_documents_to_kiro_format([{"media_type": "application/pdf", "filename": "a.pdf", "data": ""}])
+
+    def test_rejects_too_many_documents(self):
+        documents = [
+            {"media_type": "application/pdf", "filename": f"d{i}.pdf", "data": "AAAA"}
+            for i in range(KIRO_MAX_DOCUMENTS_PER_MESSAGE + 1)
+        ]
+        with pytest.raises(ValueError, match="Too many documents"):
+            convert_documents_to_kiro_format(documents)
+
+    def test_merge_preserves_documents(self):
+        document = {"media_type": "application/pdf", "filename": "a.pdf", "data": "AAAA"}
+        result = merge_adjacent_messages([
+            UnifiedMessage(role="user", content="context"),
+            UnifiedMessage(role="user", content="summarize", documents=[document]),
+        ])
+        assert len(result) == 1
+        assert result[0].documents == [document]
+
+    def test_payload_places_attachments_on_current_message_after_merge(self):
+        """Reproduces Cursor BYOK: a context user message followed by a user message with attachments."""
+        image = {"media_type": "image/png", "data": TEST_IMAGE_BASE64}
+        document = {"media_type": "application/pdf", "filename": "a.pdf", "data": TEST_PDF_BASE64}
+        result = build_kiro_payload(
+            messages=[
+                UnifiedMessage(role="user", content="request context"),
+                UnifiedMessage(role="user", content="what is in these?", images=[image], documents=[document]),
+            ],
+            system_prompt="",
+            model_id="claude-sonnet-4",
+            tools=None,
+            conversation_id="conv",
+            profile_arn="arn",
+            thinking_config=ThinkingConfig(enabled=False),
+        )
+        current = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert current["images"] == [{"format": "png", "source": {"bytes": TEST_IMAGE_BASE64}}]
+        assert current["documents"] == [{"name": "a", "format": "pdf", "source": {"bytes": TEST_PDF_BASE64}}]
+
+    def test_payload_keeps_documents_in_history(self):
+        document = {"media_type": "application/pdf", "filename": "a.pdf", "data": TEST_PDF_BASE64}
+        result = build_kiro_payload(
+            messages=[
+                UnifiedMessage(role="user", content="summarize", documents=[document]),
+                UnifiedMessage(role="assistant", content="done"),
+                UnifiedMessage(role="user", content="thanks"),
+            ],
+            system_prompt="",
+            model_id="claude-sonnet-4",
+            tools=None,
+            conversation_id="conv",
+            profile_arn="arn",
+            thinking_config=ThinkingConfig(enabled=False),
+        )
+        history = result.payload["conversationState"]["history"]
+        assert history[0]["userInputMessage"]["documents"][0]["format"] == "pdf"
