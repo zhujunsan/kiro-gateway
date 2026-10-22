@@ -24,13 +24,14 @@ Adapter layer: Responses input/tools/instructions/reasoning â†’ unified format â
 converters_core.build_kiro_payload.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from loguru import logger
 
 from kiro.config import HIDDEN_MODELS
 from kiro.model_resolver import get_model_id_for_kiro
+from kiro.native_effort import build_additional_model_request_fields, split_effort_suffix
 from kiro.models_responses import (
     ResponsesFunctionTool,
     ResponsesRequest,
@@ -1010,7 +1011,10 @@ def convert_responses_tools_to_unified(
 # Thinking configuration
 # ==================================================================================================
 
-def extract_thinking_config_from_responses(request: ResponsesRequest) -> ThinkingConfig:
+def extract_thinking_config_from_responses(
+    request: ResponsesRequest,
+    effort: Optional[str] = None,
+) -> ThinkingConfig:
     """
     Extract thinking configuration from Responses ``reasoning.effort`` /
     ``reasoning.summary``.
@@ -1029,8 +1033,12 @@ def extract_thinking_config_from_responses(request: ResponsesRequest) -> Thinkin
     here; it cannot be forwarded as an absolute stop to Kiro. Truncation is
     detected heuristically in streaming and surfaced as
     ``status=incomplete`` + ``incomplete_details.reason=max_output_tokens``.
+
+    ``effort`` overrides ``reasoning.effort`` (e.g. a ``-<effort>`` model
+    suffix).
     """
-    effort = request.reasoning.effort if request.reasoning else None
+    if not effort:
+        effort = request.reasoning.effort if request.reasoning else None
     summary = request.reasoning.summary if request.reasoning else None
     summary_factor = reasoning_summary_budget_factor(summary)
 
@@ -1135,8 +1143,13 @@ def build_kiro_payload_from_responses(
         apply_text_format_constraint(system_prompt, request_data.text)
     )
 
-    model_id = get_model_id_for_kiro(request_data.model, HIDDEN_MODELS)
-    thinking_config = extract_thinking_config_from_responses(request_data)
+    base_model, suffix_effort = split_effort_suffix(request_data.model)
+    model_id = get_model_id_for_kiro(base_model, HIDDEN_MODELS)
+    effort = suffix_effort or (request_data.reasoning.effort if request_data.reasoning else None)
+    thinking_config = extract_thinking_config_from_responses(request_data, effort=effort)
+    native_fields = build_additional_model_request_fields(model_id, effort=effort)
+    if native_fields:
+        thinking_config = replace(thinking_config, native_fields=native_fields)
 
     logger.debug(
         f"Converting Responses request: model={request_data.model} -> {model_id}, "
@@ -1149,7 +1162,8 @@ def build_kiro_payload_from_responses(
         f"echo_reasoning_items={len(echo_reasoning_items)}, "
         f"emit_reasoning_summary={emit_summary}, "
         f"thinking_enabled={thinking_config.enabled}, "
-        f"thinking_budget={thinking_config.budget_tokens}"
+        f"thinking_budget={thinking_config.budget_tokens}, "
+        f"native_fields={native_fields}"
     )
 
     result = core_build_kiro_payload(

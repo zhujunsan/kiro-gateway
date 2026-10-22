@@ -29,6 +29,7 @@ Contains functions for:
 - Building Kiro payload from OpenAI requests
 """
 
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -36,6 +37,7 @@ from loguru import logger
 from kiro.config import HIDDEN_MODELS
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool
+from kiro.native_effort import build_additional_model_request_fields, split_effort_suffix
 
 # Import from core - reuse shared logic
 from kiro.converters_core import (
@@ -353,11 +355,15 @@ def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
         "medium": 0.50,   # 50% - balanced reasoning
         "high": 0.80,     # 80% - deep reasoning
         "xhigh": 0.95,    # 95% - maximum reasoning depth
+        "max": 0.99,      # 99% - Kiro "max" effort tier
     }
     return int(max_tokens * percent[effort])
 
 
-def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> ThinkingConfig:
+def extract_thinking_config_from_openai(
+    request: ChatCompletionRequest,
+    effort: Optional[str] = None,
+) -> ThinkingConfig:
     """
     Extract thinking configuration from OpenAI request.
     
@@ -388,12 +394,17 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
         >>> request.max_tokens = 4096
         >>> extract_thinking_config_from_openai(request)
         ThinkingConfig(enabled=True, budget_tokens=3276)  # 80% of 4096
+    
+    Args (extra):
+        effort: Effective effort overriding ``request.reasoning_effort``
+            (e.g. parsed from a ``-<effort>`` model-name suffix).
     """
-    if not request.reasoning_effort:
+    reasoning_effort = effort or request.reasoning_effort
+    if not reasoning_effort:
         # No reasoning_effort specified → use defaults
         return ThinkingConfig(enabled=True, budget_tokens=None)
     
-    if request.reasoning_effort == "none":
+    if reasoning_effort == "none":
         # Explicitly disabled
         return ThinkingConfig(enabled=False, budget_tokens=None)
     
@@ -405,10 +416,10 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
         # NOT DEFAULT_MAX_INPUT_TOKENS (200000) - that's for INPUT
         max_tokens = 4096  # Standard output limit
     
-    budget = reasoning_effort_to_budget(max_tokens, request.reasoning_effort)
+    budget = reasoning_effort_to_budget(max_tokens, reasoning_effort)
     
     logger.debug(
-        f"Extracted thinking config from OpenAI: reasoning_effort='{request.reasoning_effort}', "
+        f"Extracted thinking config from OpenAI: reasoning_effort='{reasoning_effort}', "
         f"max_tokens={max_tokens}, budget={budget}"
     )
     
@@ -449,16 +460,24 @@ def build_kiro_payload(
     
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
-    model_id = get_model_id_for_kiro(request_data.model, HIDDEN_MODELS)
+    # A "-<effort>" model suffix (e.g. kiro-o-5-high) wins over reasoning_effort:
+    # it is the only knob clients like Cursor expose for custom models.
+    base_model, suffix_effort = split_effort_suffix(request_data.model)
+    model_id = get_model_id_for_kiro(base_model, HIDDEN_MODELS)
+    effort = suffix_effort or request_data.reasoning_effort
     
     # Extract thinking configuration from reasoning_effort
-    thinking_config = extract_thinking_config_from_openai(request_data)
+    thinking_config = extract_thinking_config_from_openai(request_data, effort=effort)
+    native_fields = build_additional_model_request_fields(model_id, effort=effort)
+    if native_fields:
+        thinking_config = replace(thinking_config, native_fields=native_fields)
     
     logger.debug(
         f"Converting OpenAI request: model={request_data.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}, "
-        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
+        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}, "
+        f"native_fields={native_fields}"
     )
     
     # Use core function to build payload

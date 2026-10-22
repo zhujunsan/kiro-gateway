@@ -314,6 +314,14 @@ async def _process_parser_events(
         elif event["type"] == "metering":
             yield KiroEvent(type="metering", credits=event["data"])
         
+        elif event["type"] == "reasoning":
+            # Native reasoning (additionalModelRequestFields thinking/effort)
+            # arrives as a separate event stream, not as <thinking> tags, so
+            # it bypasses the fake reasoning parser. It still honours
+            # FAKE_REASONING_HANDLING="remove" so operators can hide it.
+            if event["data"] and FAKE_REASONING_HANDLING != "remove":
+                yield KiroEvent(type="thinking", thinking_content=event["data"])
+        
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
 

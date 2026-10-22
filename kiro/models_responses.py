@@ -141,7 +141,7 @@ class ResponsesReasoning(BaseModel):
             from Kiro thinking when available. Concise/detailed also scale
             the thinking budget proportion.
     """
-    effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = None
+    effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]] = None
     summary: Optional[Any] = None
 
     model_config = {"extra": "allow"}

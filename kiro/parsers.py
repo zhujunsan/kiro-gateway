@@ -307,6 +307,7 @@ class AwsEventStreamParser:
     - usage: Legacy numeric credits or upstream token usage dictionaries
     - metering: Validated credit consumption, separate from token usage
     - context_usage: Context usage percentage
+    - reasoning: Native reasoning text (reasoningContentEvent)
     
     Attributes:
         buffer: Buffer for accumulating data
@@ -335,6 +336,10 @@ class AwsEventStreamParser:
         'unit': 'metering',
         'unitPlural': 'metering',
         'contextUsagePercentage': 'context_usage',
+        # reasoningContentEvent: {"text": ...} deltas, then a {"signature": ...}
+        # (or {"redactedContent": ...}) frame. Only text is surfaced; signature
+        # and redacted frames are consumed and ignored like other unknown keys.
+        'text': 'reasoning',
     }
     
     def __init__(self):
@@ -408,6 +413,10 @@ class AwsEventStreamParser:
             return self._process_usage_event(data, event_type)
         elif event_type == 'context_usage':
             return [{"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}]
+        elif event_type == 'reasoning':
+            text = data.get('text')
+            # No dedup here: short reasoning deltas legitimately repeat.
+            return [{"type": "reasoning", "data": text}] if isinstance(text, str) and text else []
         
         return []
     

@@ -50,6 +50,7 @@ from kiro.auth import KiroAuthManager, AuthType
 from kiro.profile_discovery import ProfileDiscoveryError
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver, normalize_model_name
+from kiro.native_effort import register_model_schemas
 from kiro.config import (
     HIDDEN_MODELS,
     MODEL_ALIASES,
@@ -709,6 +710,8 @@ class AccountManager:
             await account.model_cache.update(models_list)
             for display_name, internal_id in HIDDEN_MODELS.items():
                 account.model_cache.add_hidden_model(display_name, internal_id)
+            # Per-model effort/thinking schemas drive native reasoning fields.
+            register_model_schemas(models_list)
 
             completed_at = time.time()
             account.models_cached_at = completed_at

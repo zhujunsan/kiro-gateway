@@ -25,12 +25,14 @@ to the unified format used by converters_core.py.
 """
 
 import re
+from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
 from kiro.config import HIDDEN_MODELS, STRIP_BILLING_HEADER
 from kiro.model_resolver import get_model_id_for_kiro
+from kiro.native_effort import build_additional_model_request_fields, split_effort_suffix
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicMessage,
@@ -476,7 +478,10 @@ def _thinking_config_from_effort(
     return ThinkingConfig(enabled=True, budget_tokens=budget)
 
 
-def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) -> ThinkingConfig:
+def extract_thinking_config_from_anthropic(
+    request: AnthropicMessagesRequest,
+    effort: Optional[str] = None,
+) -> ThinkingConfig:
     """
     Extract thinking configuration from Anthropic request.
 
@@ -524,9 +529,12 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
         >>> request.output_config = {"effort": "xhigh"}
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=True, budget_tokens=30400)
+
+    ``effort`` overrides ``output_config.effort`` (e.g. a ``-<effort>``
+    model-name suffix).
     """
-    output_config = request.output_config if isinstance(request.output_config, dict) else None
-    effort = output_config.get("effort") if output_config else None
+    if not effort:
+        effort = _anthropic_effort(request)
 
     if not request.thinking:
         # No thinking specified → derive from effort if present, else defaults
@@ -558,6 +566,53 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
 
     # Unknown type → use defaults
     return ThinkingConfig(enabled=True, budget_tokens=None)
+
+
+def _anthropic_effort(request: AnthropicMessagesRequest) -> Optional[str]:
+    """Return ``output_config.effort`` when present."""
+    output_config = request.output_config if isinstance(request.output_config, dict) else None
+    effort = output_config.get("effort") if output_config else None
+    return effort if isinstance(effort, str) else None
+
+
+def native_fields_from_anthropic(
+    request: AnthropicMessagesRequest,
+    model_id: str,
+    effort: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Map Anthropic ``thinking`` / ``output_config.effort`` onto Kiro-native
+    ``additionalModelRequestFields``.
+
+    - ``thinking.type=disabled`` → thinking off
+    - ``thinking.type=adaptive|enabled`` → adaptive thinking (Kiro models do
+      not accept fixed ``budget_tokens``)
+    - ``output_config.effort`` (or ``effort`` override) → model effort level
+
+    Args:
+        request: Anthropic MessagesRequest
+        model_id: Resolved Kiro model ID
+        effort: Effort overriding ``output_config.effort``
+
+    Returns:
+        Native fields, or None when not applicable (fake reasoning is used).
+    """
+    thinking_pref: Optional[str] = None
+    display: Optional[str] = None
+    if isinstance(request.thinking, dict):
+        thinking_type = request.thinking.get("type")
+        if thinking_type == "disabled":
+            thinking_pref = "disabled"
+        elif thinking_type in ("adaptive", "enabled"):
+            thinking_pref = "enabled"
+        raw_display = request.thinking.get("display")
+        display = raw_display if isinstance(raw_display, str) else None
+    return build_additional_model_request_fields(
+        model_id,
+        effort=effort or _anthropic_effort(request),
+        thinking=thinking_pref,
+        thinking_display=display,
+    )
 
 
 def anthropic_to_kiro(
@@ -615,16 +670,21 @@ def anthropic_to_kiro(
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
-    model_id = get_model_id_for_kiro(request.model, HIDDEN_MODELS)
+    base_model, suffix_effort = split_effort_suffix(request.model)
+    model_id = get_model_id_for_kiro(base_model, HIDDEN_MODELS)
 
     # Extract thinking configuration from thinking parameter
-    thinking_config = extract_thinking_config_from_anthropic(request)
+    thinking_config = extract_thinking_config_from_anthropic(request, effort=suffix_effort)
+    native_fields = native_fields_from_anthropic(request, model_id, effort=suffix_effort)
+    if native_fields:
+        thinking_config = replace(thinking_config, native_fields=native_fields)
 
     logger.debug(
         f"Converting Anthropic request: model={request.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}, "
-        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
+        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}, "
+        f"native_fields={native_fields}"
     )
 
     # Use core function to build payload

@@ -104,9 +104,15 @@ class ThinkingConfig:
         >>> # Custom budget from client
         >>> ThinkingConfig(enabled=True, budget_tokens=8000)
         ThinkingConfig(enabled=True, budget_tokens=8000)
+
+    ``native_fields`` carries the Kiro-native ``additionalModelRequestFields``
+    document (see :mod:`kiro.native_effort`). When set, it is sent as-is and
+    fake reasoning (system prompt addition + tag injection) is skipped, so the
+    model is not asked to reason twice.
     """
     enabled: bool = True
     budget_tokens: Optional[int] = None
+    native_fields: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -2284,8 +2290,11 @@ def build_kiro_payload(
     if tool_documentation:
         full_system_prompt = full_system_prompt + tool_documentation if full_system_prompt else tool_documentation.strip()
     
+    # Native reasoning replaces fake reasoning for this request.
+    native_fields = thinking_config.native_fields
+    
     # Add thinking mode legitimization to system prompt if enabled
-    thinking_system_addition = get_thinking_system_prompt_addition()
+    thinking_system_addition = "" if native_fields else get_thinking_system_prompt_addition()
     if thinking_system_addition:
         full_system_prompt = full_system_prompt + thinking_system_addition if full_system_prompt else thinking_system_addition.strip()
     
@@ -2409,7 +2418,7 @@ def build_kiro_payload(
             user_input_context["toolResults"] = tool_results
     
     # Inject thinking tags if enabled (only for the current/last user message)
-    if current_message.role == "user":
+    if current_message.role == "user" and not native_fields:
         current_content = inject_thinking_tags(current_content, thinking_config)
     
     # Build userInputMessage
@@ -2447,6 +2456,10 @@ def build_kiro_payload(
     # Add profileArn
     if profile_arn:
         payload["profileArn"] = profile_arn
+    
+    # Native reasoning controls (same top-level field Kiro IDE sends)
+    if native_fields:
+        payload["additionalModelRequestFields"] = native_fields
 
     # Payload size guard — auto-trim if enabled
     if AUTO_TRIM_PAYLOAD:

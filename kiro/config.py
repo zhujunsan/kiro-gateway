@@ -479,6 +479,23 @@ def _warn_timeout_configuration():
 # Fake Reasoning Settings (Extended Thinking via Tag Injection)
 # ==================================================================================================
 
+# Native reasoning effort (Kiro IDE parity).
+#
+# Kiro IDE controls reasoning depth through the top-level
+# ``additionalModelRequestFields`` document of GenerateAssistantResponse, whose
+# shape is declared per model by ListAvailableModels
+# ``additionalModelRequestFieldsSchema`` (Claude: output_config.effort +
+# thinking.type; GPT/Kimi: reasoning.effort). When enabled, client effort
+# hints (OpenAI reasoning_effort, Anthropic output_config.effort/thinking,
+# Responses reasoning.effort, or a ``-<effort>`` model-name suffix) are mapped
+# onto that document for models that support it, and fake reasoning prompt
+# injection is skipped for those requests. Models without a schema keep the
+# fake reasoning behavior below.
+#
+# Default: true. Set NATIVE_EFFORT=false to restore the legacy behavior.
+_NATIVE_EFFORT_RAW: str = os.getenv("NATIVE_EFFORT", "").lower()
+NATIVE_EFFORT_ENABLED: bool = _NATIVE_EFFORT_RAW not in ("false", "0", "no", "disabled", "off")
+
 # Enable fake reasoning - injects special tags into requests to enable model reasoning.
 # When enabled, the model will include its reasoning process in the response wrapped in tags.
 # The response is then parsed and converted to OpenAI-compatible reasoning_content format.
