@@ -59,6 +59,7 @@ from kiro.network_errors import (
 )
 from kiro.proxy import resolve_proxy
 from kiro.kiro_errors import INSUFFICIENT_MODEL_CAPACITY_REASON
+from kiro.payload_repair import MAX_REPAIRS_PER_REQUEST, PayloadRepairer
 
 
 _CAPACITY_JITTER_RATIO = 0.25
@@ -317,7 +318,10 @@ class KiroHttpClient:
         # FIRST_TOKEN_TIMEOUT is used in streaming_openai.py, not here
         max_retries = FIRST_TOKEN_MAX_RETRIES if stream else MAX_RETRIES
         # INVALID_MODEL_ID has its own budget; ensure the loop can cover it.
-        loop_limit = max(max_retries, 1 + INVALID_MODEL_ID_MAX_RETRIES)
+        # Payload repairs (optional reasoning fields rejected with 400) have
+        # their own bounded budget too and never consume network retries.
+        loop_limit = max(max_retries, 1 + INVALID_MODEL_ID_MAX_RETRIES) + MAX_REPAIRS_PER_REQUEST
+        payload_repairer = PayloadRepairer()
         
         client = await self._get_client(stream=stream)
         last_error = None
@@ -395,7 +399,11 @@ class KiroHttpClient:
                 
                 # 400 - only INVALID_MODEL_ID is eligible for same-account retry
                 if response.status_code == 400:
-                    response, _body, reason = await _drain_error_response(response, stream)
+                    response, body, reason = await _drain_error_response(response, stream)
+                    # Optional reasoning fields added by the gateway must never
+                    # turn into a user-visible 400: narrow/remove and resend.
+                    if payload_repairer.repair(json_data, body):
+                        continue
                     if (
                         reason == "INVALID_MODEL_ID"
                         and invalid_model_retries_done < INVALID_MODEL_ID_MAX_RETRIES

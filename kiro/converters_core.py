@@ -48,6 +48,8 @@ from kiro.config import (
     AUTO_TRIM_PAYLOAD,
 )
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
+from kiro.native_effort import get_native_capability
+from kiro.reasoning_replay import to_history_reasoning_content
 
 
 # Filler used when a message has no text content but Kiro API requires a
@@ -132,6 +134,8 @@ class UnifiedMessage:
                 Format: [{"media_type": "image/jpeg", "data": "base64..."}]
         documents: List of document attachments in unified format (for user messages)
                 Format: [{"media_type": "application/pdf", "filename": "a.pdf", "data": "base64..."}]
+        reasoning: Replayable native reasoning for assistant messages
+                Format: {"text": "...", "signature": "..."} (see kiro.reasoning_replay)
     """
     role: str
     content: Any = ""
@@ -139,6 +143,7 @@ class UnifiedMessage:
     tool_results: Optional[List[Dict[str, Any]]] = None
     images: Optional[List[Dict[str, Any]]] = None
     documents: Optional[List[Dict[str, Any]]] = None
+    reasoning: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -1726,6 +1731,7 @@ def strip_unknown_tool_calls(
             tool_results=kept_results if msg.tool_results else None,
             images=msg.images,
             documents=msg.documents,
+            reasoning=msg.reasoning,
         ))
 
     logger.debug(
@@ -1808,7 +1814,8 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
                 tool_calls=None,
                 tool_results=None,
                 images=msg.images,
-                documents=msg.documents
+                documents=msg.documents,
+                reasoning=msg.reasoning,
             )
             result.append(cleaned_msg)
         else:
@@ -1892,7 +1899,8 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
                     tool_calls=msg.tool_calls,
                     tool_results=None,  # Remove orphaned tool_results (now in text)
                     images=msg.images,
-                    documents=msg.documents
+                    documents=msg.documents,
+                    reasoning=msg.reasoning,
                 )
                 result.append(cleaned_msg)
                 converted_any_tool_results = True
@@ -1964,6 +1972,10 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                 last.images = list(last.images or []) + list(msg.images)
             if msg.documents:
                 last.documents = list(last.documents or []) + list(msg.documents)
+            # Kiro holds one reasoning block per assistant message; keep the
+            # first one, which precedes the merged text/tool calls.
+            if msg.reasoning and not last.reasoning:
+                last.reasoning = msg.reasoning
             
             # Count merges by role
             if msg.role in merge_counts:
@@ -2160,6 +2172,26 @@ def ensure_alternating_roles(messages: List[UnifiedMessage]) -> List[UnifiedMess
 # Kiro History Building
 # ==================================================================================================
 
+def _should_replay_reasoning(model_id: str) -> bool:
+    """
+    Whether replayed reasoning should be sent in history for ``model_id``.
+
+    Replay is limited to models with native reasoning controls: they are the
+    only ones that produce signed reasoning, and models such as deepseek reject
+    ``reasoningContent`` with a generic 400. ``NATIVE_EFFORT=false`` disables
+    replay together with native effort.
+
+    Args:
+        model_id: Internal Kiro model ID of the current request.
+
+    Returns:
+        True when ``reasoningContent`` may be attached to history messages.
+    """
+    from kiro.config import NATIVE_EFFORT_ENABLED
+
+    return NATIVE_EFFORT_ENABLED and get_native_capability(model_id) is not None
+
+
 def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Dict[str, Any]]:
     """
     Builds history array for Kiro API from unified messages.
@@ -2239,6 +2271,12 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
             tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)
             if tool_uses:
                 assistant_response["toolUses"] = tool_uses
+            
+            # Replay native reasoning (Kiro IDE parity). Only for models with
+            # native reasoning controls; others may reject the field. Any
+            # rejection is self-healed by kiro.payload_repair.
+            if msg.reasoning and _should_replay_reasoning(model_id):
+                assistant_response["reasoningContent"] = to_history_reasoning_content(msg.reasoning)
             
             history.append({"assistantResponseMessage": assistant_response})
     

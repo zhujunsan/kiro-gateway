@@ -51,6 +51,7 @@ from kiro.streaming_core import (
 from kiro.tokenizer import count_tokens, estimate_request_tokens
 from kiro.parsers import parse_bracket_tool_calls, parse_xml_tool_calls, deduplicate_tool_calls
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
+from kiro.reasoning_replay import generate_placeholder_signature
 
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
@@ -90,13 +91,14 @@ def generate_thinking_signature() -> str:
     """
     Generate a placeholder signature for thinking content blocks.
     
-    In real Anthropic API, this is a cryptographic signature for verification.
-    Since we're using fake reasoning via tag injection, we generate a placeholder.
+    Fake reasoning (tag injection) has no upstream signature. Native reasoning
+    replaces this placeholder with the real one; placeholders are recognised
+    and never replayed upstream (see kiro.reasoning_replay).
     
     Returns:
         Placeholder signature string
     """
-    return f"sig_{uuid.uuid4().hex[:32]}"
+    return generate_placeholder_signature()
 
 
 def _extract_cache_usage_fields(usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
@@ -197,8 +199,39 @@ async def stream_kiro_to_anthropic(
     # it and show "Error editing file" / "Invalid tool parameters".
     streamed_tool_ids: set[str] = set()
     
-    # Generate signature for thinking block (used if thinking is present)
+    # Placeholder signature for the thinking block start. Native reasoning
+    # replaces it with the real upstream signature via signature_delta before
+    # the block closes (SDK accumulators assign, not append, the signature).
     thinking_signature = generate_thinking_signature()
+    # Real upstream signature for the thinking block currently open, if any.
+    pending_thinking_signature: Optional[str] = None
+
+    def close_thinking_block_events(index: int) -> List[str]:
+        """Close the thinking block, attaching the real signature first.
+
+        Args:
+            index: Content block index of the open thinking block.
+
+        Returns:
+            SSE events: optional ``signature_delta`` then ``content_block_stop``.
+        """
+        nonlocal pending_thinking_signature
+        events: List[str] = []
+        if pending_thinking_signature:
+            events.append(format_sse_event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": pending_thinking_signature,
+                },
+            }))
+            pending_thinking_signature = None
+        events.append(format_sse_event("content_block_stop", {
+            "type": "content_block_stop",
+            "index": index,
+        }))
+        return events
     
     # Track context usage for token calculation
     context_usage_percentage: Optional[float] = None
@@ -242,10 +275,8 @@ async def stream_kiro_to_anthropic(
                 
                 # Close thinking block if it was open and we're now getting regular content
                 if thinking_block_started and thinking_block_index is not None:
-                    yield format_sse_event("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": thinking_block_index
-                    })
+                    for close_evt in close_thinking_block_events(thinking_block_index):
+                        yield close_evt
                     thinking_block_started = False
                     current_block_index += 1
                 
@@ -311,10 +342,8 @@ async def stream_kiro_to_anthropic(
                     # Include thinking as regular text content
                     # Close thinking block if it was open (shouldn't happen in this mode)
                     if thinking_block_started and thinking_block_index is not None:
-                        yield format_sse_event("content_block_stop", {
-                            "type": "content_block_stop",
-                            "index": thinking_block_index
-                        })
+                        for close_evt in close_thinking_block_events(thinking_block_index):
+                            yield close_evt
                         thinking_block_started = False
                         current_block_index += 1
                     
@@ -342,6 +371,12 @@ async def stream_kiro_to_anthropic(
                         })
                 # For "strip" mode, we just skip the thinking content
             
+            elif event.type == "thinking_signature" and event.thinking_signature:
+                # Only meaningful while a thinking block is open; a signature
+                # without a visible block (include_as_text) has no carrier.
+                if thinking_block_started:
+                    pending_thinking_signature = event.thinking_signature
+            
             elif event.type == "tool_start" and event.tool_use:
                 tool = event.tool_use
                 tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
@@ -354,10 +389,8 @@ async def stream_kiro_to_anthropic(
                 # Anthropic content blocks cannot overlap. Close text/reasoning
                 # before opening the tool block as soon as Kiro announces it.
                 if thinking_block_started and thinking_block_index is not None:
-                    yield format_sse_event("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": thinking_block_index,
-                    })
+                    for close_evt in close_thinking_block_events(thinking_block_index):
+                        yield close_evt
                     thinking_block_started = False
                     current_block_index += 1
                 if text_block_started and text_block_index is not None:
@@ -453,10 +486,8 @@ async def stream_kiro_to_anthropic(
 
                 # Close thinking block if open
                 if thinking_block_started and thinking_block_index is not None:
-                    yield format_sse_event("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": thinking_block_index
-                    })
+                    for close_evt in close_thinking_block_events(thinking_block_index):
+                        yield close_evt
                     thinking_block_started = False
                     current_block_index += 1
                 
@@ -674,10 +705,8 @@ async def stream_kiro_to_anthropic(
         if fallback_tool_calls:
             # Close thinking block if open
             if thinking_block_started and thinking_block_index is not None:
-                yield format_sse_event("content_block_stop", {
-                    "type": "content_block_stop",
-                    "index": thinking_block_index
-                })
+                for close_evt in close_thinking_block_events(thinking_block_index):
+                    yield close_evt
                 thinking_block_started = False
                 current_block_index += 1
             
@@ -739,10 +768,8 @@ async def stream_kiro_to_anthropic(
         
         # Close thinking block if still open
         if thinking_block_started and thinking_block_index is not None:
-            yield format_sse_event("content_block_stop", {
-                "type": "content_block_stop",
-                "index": thinking_block_index
-            })
+            for close_evt in close_thinking_block_events(thinking_block_index):
+                yield close_evt
             current_block_index += 1
         
         # Close text block if still open
@@ -919,7 +946,9 @@ async def collect_anthropic_response(
         content_blocks.append({
             "type": "thinking",
             "thinking": result.thinking_content,
-            "signature": generate_thinking_signature()
+            # Real upstream signature for native reasoning, so clients can
+            # replay this block; placeholder for fake reasoning.
+            "signature": result.thinking_signature or generate_thinking_signature()
         })
     
     # Add text block if there's content

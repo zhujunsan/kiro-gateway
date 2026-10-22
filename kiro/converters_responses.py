@@ -32,6 +32,7 @@ from loguru import logger
 from kiro.config import HIDDEN_MODELS
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.native_effort import build_additional_model_request_fields, split_effort_suffix
+from kiro.reasoning_replay import decode_responses_encrypted_content
 from kiro.models_responses import (
     ResponsesFunctionTool,
     ResponsesRequest,
@@ -580,8 +581,31 @@ def convert_responses_input_to_unified(
     pending_tool_results: List[Dict[str, Any]] = []
     total_tool_calls = 0
     total_tool_results = 0
+    # Replayable reasoning waiting for the assistant turn it precedes. Kiro
+    # IDE stores reasoning on the assistant message that follows it.
+    pending_reasoning: Optional[Dict[str, str]] = None
+    scanned = 0
+
+    def attach_pending_reasoning() -> None:
+        """Attach pending reasoning to the next newly produced assistant turn.
+
+        Messages are scanned in order; if a user message appears before any
+        assistant message, the reasoning belongs to nothing and is dropped.
+        """
+        nonlocal pending_reasoning, scanned
+        while scanned < len(processed):
+            message = processed[scanned]
+            scanned += 1
+            if pending_reasoning is None:
+                continue
+            if message.role == "assistant":
+                message.reasoning = pending_reasoning
+            pending_reasoning = None
 
     for item in items:
+        # Assistant turns are produced lazily (function_calls are buffered and
+        # flushed by later items), so attachment runs before each item.
+        attach_pending_reasoning()
         if isinstance(item, str):
             _flush_pending_tool_calls(pending_tool_calls, processed)
             _flush_pending_tool_results(pending_tool_results, processed)
@@ -599,8 +623,13 @@ def convert_responses_input_to_unified(
             item_type = "message"
 
         if item_type == "reasoning":
-            # Do not forward to Kiro (including encrypted_content).
+            # Gateway-issued encrypted_content carries native reasoning text +
+            # signature; it is replayed on the assistant turn that follows.
+            # Foreign blobs (real OpenAI, compaction stubs) are ignored.
             # Echo stubs are collected separately via extract_reasoning_input_stubs.
+            decoded = decode_responses_encrypted_content(item.get("encrypted_content"))
+            if decoded:
+                pending_reasoning = decoded
             continue
 
         if item_type == "compaction_trigger":
@@ -694,6 +723,7 @@ def convert_responses_input_to_unified(
 
     _flush_pending_tool_calls(pending_tool_calls, processed)
     _flush_pending_tool_results(pending_tool_results, processed)
+    attach_pending_reasoning()
 
     system_prompt = "\n".join(p.strip() for p in system_parts if p and str(p).strip()).strip()
 

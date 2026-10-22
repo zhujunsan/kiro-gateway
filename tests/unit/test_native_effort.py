@@ -216,6 +216,112 @@ class TestBuildAdditionalModelRequestFields:
         assert build_fields("claude-opus-5", effort="high") is None
 
 
+class TestMaxTierOutputTokens:
+    """``max`` effort also raises max_tokens to the schema maximum (Claude only)."""
+
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            ("claude-opus-5", 128000),
+            ("claude-opus-5.5", 128000),
+            ("claude-opus-4.7", 128000),
+            ("claude-sonnet-4.6", 64000),  # 4.6 rejects anything above 64000
+            ("claude-opus-4.6", 64000),
+        ],
+    )
+    def test_max_effort_sends_schema_maximum(self, model, expected):
+        fields = build_fields(model, effort="max")
+        assert fields["output_config"] == {"effort": "max"}
+        assert fields["max_tokens"] == expected
+
+    @pytest.mark.parametrize("effort", ["none", "minimal", "low", "medium", "high", "xhigh"])
+    def test_lower_tiers_never_send_max_tokens(self, effort):
+        fields = build_fields("claude-opus-5", effort=effort)
+        assert fields is not None
+        assert "max_tokens" not in fields
+
+    def test_xhigh_mapped_down_on_46_does_not_send_max_tokens(self):
+        # 4.6 has no xhigh -> mapped to high, which is not the max tier.
+        fields = build_fields("claude-sonnet-4.6", effort="xhigh")
+        assert fields["output_config"] == {"effort": "high"}
+        assert "max_tokens" not in fields
+
+    @pytest.mark.parametrize("model", ["gpt-5.6-luna", "gpt-5.6-terra", "kimi-k3"])
+    def test_reasoning_path_models_never_send_max_tokens(self, model):
+        # Their schemas reject max_tokens with HTTP 400 (additionalProperties: false).
+        assert build_fields(model, effort="max") == {"reasoning": {"effort": "max"}}
+
+    def test_max_with_thinking_disabled_is_capped_and_sends_no_max_tokens(self):
+        fields = build_fields("claude-opus-5", effort="max", thinking="disabled")
+        assert fields == {"thinking": {"type": "disabled"}, "output_config": {"effort": "high"}}
+
+    def test_switch_off_keeps_upstream_default_cap(self, monkeypatch):
+        monkeypatch.setattr("kiro.config.NATIVE_EFFORT_MAX_TIER_OUTPUT_TOKENS", False)
+        fields = build_fields("claude-opus-5", effort="max")
+        assert fields == {"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}
+
+    def test_live_schema_maximum_overrides_snapshot(self):
+        schema = {
+            **OPUS_5_SCHEMA,
+            "properties": {
+                **OPUS_5_SCHEMA["properties"],
+                "max_tokens": {"type": "integer", "minimum": 1024, "maximum": 32000},
+            },
+        }
+        register_model_schemas([{"modelId": "claude-opus-5", "additionalModelRequestFieldsSchema": schema}])
+        assert build_fields("claude-opus-5", effort="max")["max_tokens"] == 32000
+
+    def test_live_schema_without_max_tokens_sends_none(self):
+        schema = {**OPUS_5_SCHEMA, "properties": {
+            k: v for k, v in OPUS_5_SCHEMA["properties"].items() if k != "max_tokens"
+        }}
+        register_model_schemas([{"modelId": "claude-opus-5", "additionalModelRequestFieldsSchema": schema}])
+        assert "max_tokens" not in build_fields("claude-opus-5", effort="max")
+
+    @pytest.mark.parametrize(
+        "max_node,expected",
+        [
+            ({"type": "integer", "maximum": 64000}, 64000),
+            ({"type": "integer", "maximum": 64000.0}, 64000),
+            ({"type": "integer"}, None),
+            ({"type": "integer", "maximum": True}, None),
+            ({"type": "integer", "maximum": "64000"}, None),
+            ({"type": "integer", "maximum": 0}, None),
+            ({"type": "integer", "maximum": -5}, None),
+            ({"type": "integer", "maximum": float("nan")}, None),
+            ({"type": "integer", "maximum": float("inf")}, None),
+            ("not-a-dict", None),
+        ],
+    )
+    def test_schema_maximum_parsing_is_defensive(self, max_node, expected):
+        schema = {**OPUS_5_SCHEMA, "properties": {**OPUS_5_SCHEMA["properties"], "max_tokens": max_node}}
+        assert capability_from_schema(schema).max_output_tokens == expected
+
+    def test_gpt_schema_has_no_output_cap(self):
+        assert capability_from_schema(GPT_SCHEMA).max_output_tokens is None
+
+    def test_anthropic_claude_code_max_effort(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.6",
+            messages=[AnthropicMessage(role="user", content="Hi")],
+            max_tokens=32000,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "max"},
+        )
+        payload = anthropic_to_kiro(request, "conv-1", "arn:test")
+        assert payload["additionalModelRequestFields"] == {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+            "max_tokens": 64000,
+        }
+
+    def test_responses_model_suffix_max(self):
+        request = ResponsesRequest(model="kiro-o-4.7-max", input="Hi")
+        payload = build_kiro_payload_from_responses(request, "conv-1", "arn:test").payload
+        assert _model_id(payload) == "claude-opus-4.7"
+        assert payload["additionalModelRequestFields"]["max_tokens"] == 128000
+
+
 class TestSplitEffortSuffix:
     @pytest.mark.parametrize(
         "model,expected",
@@ -251,6 +357,7 @@ class TestOpenAIIntegration:
         assert payload["additionalModelRequestFields"] == {
             "thinking": {"type": "adaptive"},
             "output_config": {"effort": "max"},
+            "max_tokens": 128000,
         }
         assert "<thinking_mode>" not in _user_content(payload)
 
@@ -345,7 +452,7 @@ class TestResponsesIntegration:
 # ==================================================================================================
 
 class TestReasoningContentEvents:
-    def test_parser_emits_reasoning_and_ignores_signature(self):
+    def test_parser_emits_reasoning_and_signature(self):
         parser = AwsEventStreamParser()
         events = parser.feed(
             b'{"text":"Let me "}{"text":"Let me "}{"signature":"EpASCnw"}{"content":"391"}'
@@ -353,6 +460,7 @@ class TestReasoningContentEvents:
         assert events == [
             {"type": "reasoning", "data": "Let me "},
             {"type": "reasoning", "data": "Let me "},  # not deduplicated
+            {"type": "reasoning_signature", "data": "EpASCnw"},
             {"type": "content", "data": "391"},
         ]
 

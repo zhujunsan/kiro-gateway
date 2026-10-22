@@ -93,6 +93,9 @@ tests/
 │   ├── test_mcp_tools.py           # MCP Tools tests (WebSearch: ID generation, MCP API calls, SSE emulation, query extraction)
 │   ├── test_model_aliases.py       # Cursor-safe model alias generation and resolution
 │   ├── test_model_resolver.py      # Dynamic Model Resolution System tests
+│   ├── test_native_effort.py       # Native reasoning effort (additionalModelRequestFields) mapping and schemas
+│   ├── test_payload_repair.py      # Self-healing of Kiro 400s caused by optional reasoning fields
+│   ├── test_reasoning_replay.py    # Thinking signature round-trip (Anthropic/Responses → Kiro history)
 │   ├── test_models_anthropic.py    # Anthropic Pydantic models tests (all content blocks, tools, streaming, server-side tools)
 │   ├── test_models_openai.py       # OpenAI Pydantic models tests (messages, tools, responses, streaming)
 │   ├── test_network_errors.py      # Network error handling tests

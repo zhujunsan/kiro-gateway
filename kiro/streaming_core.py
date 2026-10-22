@@ -79,10 +79,13 @@ class KiroEvent:
         context_usage_percentage: Context usage percentage (for context_usage events)
         is_first_thinking_chunk: Whether this is the first thinking chunk
         is_last_thinking_chunk: Whether this is the last thinking chunk
+        thinking_signature: Upstream signature closing a native reasoning
+            phase (for ``thinking_signature`` events)
     """
     type: str
     content: Optional[str] = None
     thinking_content: Optional[str] = None
+    thinking_signature: Optional[str] = None
     tool_use: Optional[Dict[str, Any]] = None
     tool_call_id: Optional[str] = None
     tool_input_delta: Optional[str] = None
@@ -105,9 +108,12 @@ class StreamResult:
         usage: Upstream token usage dictionary
         credits: Sum of credit events, or None if no metering was received
         context_usage_percentage: Context usage percentage from Kiro API
+        thinking_signature: Last upstream signature for native reasoning, or
+            None (fake reasoning has no real signature)
     """
     content: str = ""
     thinking_content: str = ""
+    thinking_signature: Optional[str] = None
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
@@ -322,6 +328,12 @@ async def _process_parser_events(
             if event["data"] and FAKE_REASONING_HANDLING != "remove":
                 yield KiroEvent(type="thinking", thinking_content=event["data"])
         
+        elif event["type"] == "reasoning_signature":
+            # Real signature for the reasoning phase just streamed. Formatters
+            # attach it to the thinking block so clients can replay it.
+            if event["data"] and FAKE_REASONING_HANDLING != "remove":
+                yield KiroEvent(type="thinking_signature", thinking_signature=event["data"])
+        
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
 
@@ -373,6 +385,8 @@ async def collect_stream_to_result(
         elif event.type == "thinking" and event.thinking_content:
             result.thinking_content += event.thinking_content
             full_content_for_bracket_tools += event.thinking_content
+        elif event.type == "thinking_signature" and event.thinking_signature:
+            result.thinking_signature = event.thinking_signature
         elif event.type in ("tool_stop", "tool_use") and event.tool_use:
             result.tool_calls.append(event.tool_use)
         elif event.type == "usage" and event.usage:

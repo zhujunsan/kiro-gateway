@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 from loguru import logger
@@ -74,6 +74,8 @@ class NativeReasoningCapability:
         default_effort: Schema default effort (informational).
         thinking_types: Allowed ``thinking.type`` values (Claude only).
         thinking_displays: Allowed ``thinking.display`` values (Claude only).
+        max_output_tokens: Schema ``max_tokens.maximum`` (Claude only), or
+            None when the model does not accept ``max_tokens``.
     """
 
     effort_path: Optional[str] = None
@@ -81,6 +83,7 @@ class NativeReasoningCapability:
     default_effort: Optional[str] = None
     thinking_types: Tuple[str, ...] = ()
     thinking_displays: Tuple[str, ...] = ()
+    max_output_tokens: Optional[int] = None
 
     @property
     def supports_effort(self) -> bool:
@@ -146,16 +149,44 @@ def capability_from_schema(schema: Any) -> Optional[NativeReasoningCapability]:
         default_effort=default_effort,
         thinking_types=thinking_types,
         thinking_displays=thinking_displays,
+        max_output_tokens=_integer_maximum(_child(schema, "max_tokens")),
     )
 
 
-def _claude(levels: Iterable[str], default: str, thinking: Iterable[str]) -> NativeReasoningCapability:
+def _integer_maximum(node: Any) -> Optional[int]:
+    """Return the positive integer ``maximum`` of a schema node, or None.
+
+    Args:
+        node: JSON schema node (e.g. the ``max_tokens`` property).
+
+    Returns:
+        The maximum as int, or None when absent, non-numeric, or not positive.
+        Booleans are rejected explicitly because ``bool`` subclasses ``int``.
+    """
+    if not isinstance(node, Mapping):
+        return None
+    maximum = node.get("maximum")
+    if isinstance(maximum, bool) or not isinstance(maximum, (int, float)):
+        return None
+    if maximum != maximum or maximum in (float("inf"), float("-inf")):  # NaN / inf
+        return None
+    value = int(maximum)
+    return value if value > 0 else None
+
+
+def _claude(
+    levels: Iterable[str],
+    default: str,
+    thinking: Iterable[str],
+    max_output_tokens: int = 128000,
+) -> NativeReasoningCapability:
     return NativeReasoningCapability(
         effort_path="output_config",
         effort_levels=tuple(levels),
         default_effort=default,
         thinking_types=tuple(thinking),
         thinking_displays=("summarized", "omitted"),
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -179,8 +210,8 @@ STATIC_CAPABILITIES: Dict[str, NativeReasoningCapability] = {
     "claude-sonnet-5": _claude(_CLAUDE_5_LEVELS, "high", _TOGGLEABLE),
     "claude-opus-4.8": _claude(_CLAUDE_5_LEVELS, "high", _TOGGLEABLE),
     "claude-opus-4.7": _claude(_CLAUDE_5_LEVELS, "xhigh", _TOGGLEABLE),
-    "claude-opus-4.6": _claude(_CLAUDE_46_LEVELS, "high", _TOGGLEABLE),
-    "claude-sonnet-4.6": _claude(_CLAUDE_46_LEVELS, "high", _TOGGLEABLE),
+    "claude-opus-4.6": _claude(_CLAUDE_46_LEVELS, "high", _TOGGLEABLE, max_output_tokens=64000),
+    "claude-sonnet-4.6": _claude(_CLAUDE_46_LEVELS, "high", _TOGGLEABLE, max_output_tokens=64000),
     "gpt-5.6-terra": _reasoning(("none", "low", "medium", "high", "xhigh", "max"), "high"),
     "gpt-5.6-luna": _reasoning(("none", "low", "medium", "high", "xhigh", "max"), "high"),
     "kimi-k3": _reasoning(("low", "high", "max"), "max"),
@@ -272,13 +303,110 @@ def split_effort_suffix(model: str) -> Tuple[str, Optional[str]]:
     return match.group("base"), match.group("effort").lower()
 
 
-def _nearest_level(effort: str, levels: Iterable[str]) -> Optional[str]:
-    """Map ``effort`` to the closest allowed level (ties go to the cheaper one)."""
+def nearest_level(effort: str, levels: Iterable[str]) -> Optional[str]:
+    """Map ``effort`` to the closest allowed level (ties go to the cheaper one).
+
+    Args:
+        effort: Requested effort level.
+        levels: Allowed levels.
+
+    Returns:
+        The nearest allowed level, or None when ``effort`` is unknown or no
+        allowed level is a known effort.
+    """
     target = _EFFORT_RANK.get(effort)
     ranked = sorted((lv for lv in levels if lv in _EFFORT_RANK), key=_EFFORT_RANK.__getitem__)
     if target is None or not ranked:
         return None
     return min(ranked, key=lambda lv: (abs(_EFFORT_RANK[lv] - target), _EFFORT_RANK[lv]))
+
+
+_nearest_level = nearest_level
+
+
+# --------------------------------------------------------------------------------------------------
+# Learning from upstream rejections (see kiro.payload_repair). Learned values
+# are stored as live capabilities, so the next ListAvailableModels refresh
+# naturally replaces them with authoritative data.
+# --------------------------------------------------------------------------------------------------
+
+def _update_capability(model_id: Optional[str], **changes: Any) -> None:
+    """Replace fields of a model's current capability with ``changes``."""
+    if not model_id:
+        return
+    current = get_native_capability(model_id)
+    if current is None:
+        return
+    updated = replace(current, **changes)
+    with _live_lock:
+        _live_capabilities[model_id] = updated
+    logger.info(f"Native effort capability for {model_id} updated from upstream error: {changes}")
+
+
+def learn_effort_levels(model_id: Optional[str], levels: Tuple[str, ...]) -> None:
+    """Record the effort enum Kiro reported for ``model_id``.
+
+    Args:
+        model_id: Kiro model ID.
+        levels: Allowed effort levels from the error message.
+    """
+    if levels:
+        _update_capability(model_id, effort_levels=tuple(levels))
+
+
+def learn_max_output_tokens(model_id: Optional[str], maximum: Optional[int]) -> None:
+    """Record the ``max_tokens`` ceiling Kiro reported (None = not accepted).
+
+    Args:
+        model_id: Kiro model ID.
+        maximum: New ceiling, or None when the model rejects ``max_tokens``.
+    """
+    _update_capability(model_id, max_output_tokens=maximum)
+
+
+def learn_unsupported(model_id: Optional[str]) -> None:
+    """Record that ``model_id`` rejected native reasoning fields entirely.
+
+    Args:
+        model_id: Kiro model ID.
+    """
+    if not model_id:
+        return
+    with _live_lock:
+        _live_capabilities[model_id] = None
+    logger.info(
+        f"Native effort disabled for {model_id} after upstream rejection; "
+        f"fake reasoning is used until the model list is refreshed"
+    )
+
+
+def _max_tier_output_tokens(
+    level: Optional[str], capability: NativeReasoningCapability
+) -> Optional[int]:
+    """Output-token ceiling to request alongside the ``max`` effort tier.
+
+    Without ``max_tokens`` Kiro applies a much lower default output cap
+    (measured on claude-sonnet-4.6: ~55K chars vs ~119K chars with 64000), so
+    ``max`` effort often spends the whole budget thinking and stops with
+    MAX_TOKENS before answering. Raising the ceiling to the schema maximum for
+    ``max`` gives the deepest tier room to finish. Lower tiers are left at the
+    upstream default so their cost profile does not change.
+
+    Args:
+        level: Effort level actually being sent (after nearest-level mapping).
+        capability: Model capability (provides the schema maximum).
+
+    Returns:
+        Token ceiling to send, or None when not applicable (not ``max``, the
+        model does not accept ``max_tokens``, or the feature is disabled).
+    """
+    from kiro.config import NATIVE_EFFORT_MAX_TIER_OUTPUT_TOKENS
+
+    if level != "max" or capability.max_output_tokens is None:
+        return None
+    if not NATIVE_EFFORT_MAX_TIER_OUTPUT_TOKENS:
+        return None
+    return capability.max_output_tokens
 
 
 def build_additional_model_request_fields(
@@ -344,6 +472,10 @@ def build_additional_model_request_fields(
 
     if level and capability.effort_path:
         fields[capability.effort_path] = {"effort": level}
+
+    max_tokens = _max_tier_output_tokens(level, capability)
+    if max_tokens is not None:
+        fields["max_tokens"] = max_tokens
 
     if not fields:
         return None

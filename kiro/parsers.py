@@ -308,6 +308,7 @@ class AwsEventStreamParser:
     - metering: Validated credit consumption, separate from token usage
     - context_usage: Context usage percentage
     - reasoning: Native reasoning text (reasoningContentEvent)
+    - reasoning_signature: Signature closing a native reasoning phase
     
     Attributes:
         buffer: Buffer for accumulating data
@@ -337,9 +338,10 @@ class AwsEventStreamParser:
         'unitPlural': 'metering',
         'contextUsagePercentage': 'context_usage',
         # reasoningContentEvent: {"text": ...} deltas, then a {"signature": ...}
-        # (or {"redactedContent": ...}) frame. Only text is surfaced; signature
-        # and redacted frames are consumed and ignored like other unknown keys.
+        # (or {"redactedContent": ...}) frame. Text and signature are surfaced;
+        # redacted frames are consumed and ignored like other unknown keys.
         'text': 'reasoning',
+        'signature': 'reasoning_signature',
     }
     
     def __init__(self):
@@ -417,6 +419,13 @@ class AwsEventStreamParser:
             text = data.get('text')
             # No dedup here: short reasoning deltas legitimately repeat.
             return [{"type": "reasoning", "data": text}] if isinstance(text, str) and text else []
+        elif event_type == 'reasoning_signature':
+            # Closes a native reasoning phase; required to replay the thinking
+            # block in later turns (Kiro rejects forged signatures).
+            signature = data.get('signature')
+            if isinstance(signature, str) and signature:
+                return [{"type": "reasoning_signature", "data": signature}]
+            return []
         
         return []
     

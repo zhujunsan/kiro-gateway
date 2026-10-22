@@ -33,6 +33,7 @@ from loguru import logger
 from kiro.config import HIDDEN_MODELS, STRIP_BILLING_HEADER
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.native_effort import build_additional_model_request_fields, split_effort_suffix
+from kiro.reasoning_replay import make_reasoning
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicMessage,
@@ -301,6 +302,41 @@ def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any
     return tool_calls
 
 
+def extract_reasoning_from_anthropic_content(content: Any) -> Optional[Dict[str, str]]:
+    """
+    Extract replayable reasoning from a replayed assistant ``thinking`` block.
+
+    Claude Code and other Anthropic clients send earlier ``thinking`` blocks
+    back verbatim, including the upstream ``signature``. Only the first block
+    with a real (non-placeholder) signature is used: Kiro stores one reasoning
+    block per assistant message. ``redacted_thinking`` is not replayable in
+    Kiro's history format and is skipped.
+
+    Args:
+        content: Anthropic assistant message content.
+
+    Returns:
+        ``{"text", "signature"}`` record, or None when nothing is replayable.
+    """
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            text = block.get("thinking")
+            signature = block.get("signature")
+        else:
+            block_type = getattr(block, "type", None)
+            text = getattr(block, "thinking", None)
+            signature = getattr(block, "signature", None)
+        if block_type != "thinking":
+            continue
+        reasoning = make_reasoning(text, signature)
+        if reasoning:
+            return reasoning
+    return None
+
+
 def convert_anthropic_messages(
     messages: List[AnthropicMessage],
 ) -> List[UnifiedMessage]:
@@ -369,6 +405,7 @@ def convert_anthropic_messages(
             tool_calls=tool_calls if tool_calls else None,
             tool_results=tool_results if tool_results else None,
             images=images if images else None,
+            reasoning=extract_reasoning_from_anthropic_content(content) if role == "assistant" else None,
         )
         unified_messages.append(unified_msg)
 

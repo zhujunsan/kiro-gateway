@@ -496,6 +496,18 @@ def _warn_timeout_configuration():
 _NATIVE_EFFORT_RAW: str = os.getenv("NATIVE_EFFORT", "").lower()
 NATIVE_EFFORT_ENABLED: bool = _NATIVE_EFFORT_RAW not in ("false", "0", "no", "disabled", "off")
 
+# When the native effort tier is "max", also send the model's schema maximum
+# ``max_tokens`` (Claude only; e.g. 64000 for 4.6, 128000 for 4.7+). Without
+# it Kiro uses a much lower default output cap and "max" frequently stops with
+# MAX_TOKENS before producing an answer. Lower tiers are never affected.
+#
+# Default: true. Set NATIVE_EFFORT_MAX_TIER_OUTPUT_TOKENS=false to keep the
+# upstream default cap for "max" too.
+_NATIVE_EFFORT_MAX_TIER_RAW: str = os.getenv("NATIVE_EFFORT_MAX_TIER_OUTPUT_TOKENS", "").lower()
+NATIVE_EFFORT_MAX_TIER_OUTPUT_TOKENS: bool = _NATIVE_EFFORT_MAX_TIER_RAW not in (
+    "false", "0", "no", "disabled", "off"
+)
+
 # Enable fake reasoning - injects special tags into requests to enable model reasoning.
 # When enabled, the model will include its reasoning process in the response wrapped in tags.
 # The response is then parsed and converted to OpenAI-compatible reasoning_content format.

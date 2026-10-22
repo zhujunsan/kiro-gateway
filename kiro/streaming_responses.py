@@ -58,6 +58,7 @@ from kiro.config import (
 )
 from kiro.output_tokens import count_generated_output_tokens
 from kiro.parsers import deduplicate_tool_calls, parse_bracket_tool_calls, parse_xml_tool_calls
+from kiro.reasoning_replay import encode_responses_encrypted_content
 from kiro.streaming_core import (
     FirstTokenTimeoutError,
     calculate_tokens_from_context_usage,
@@ -197,13 +198,29 @@ def _reasoning_item(
     item_id: str,
     summary: Optional[List[Dict[str, Any]]] = None,
     status: str = "completed",
+    encrypted_content: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return {
+    """Build a Responses ``reasoning`` output item.
+
+    Args:
+        item_id: Reasoning item ID.
+        summary: Summary parts (empty list when omitted).
+        status: Item status.
+        encrypted_content: Opaque replay carrier for native reasoning
+            (see kiro.reasoning_replay); omitted when None.
+
+    Returns:
+        Reasoning item dictionary.
+    """
+    item: Dict[str, Any] = {
         "id": item_id,
         "type": "reasoning",
         "status": status,
         "summary": summary if summary is not None else [],
     }
+    if encrypted_content:
+        item["encrypted_content"] = encrypted_content
+    return item
 
 
 def _summary_text_part(text: str = "") -> Dict[str, Any]:
@@ -270,6 +287,8 @@ async def stream_kiro_to_responses_internal(
     context_usage_percentage = None
     full_content = ""
     full_thinking_content = ""
+    # Real upstream signature of native reasoning (None for fake reasoning).
+    thinking_signature: Optional[str] = None
     tool_calls_from_stream: List[Dict[str, Any]] = []
     tool_streams: Dict[str, Dict[str, Any]] = {}
     streamed_tool_ids = set()
@@ -428,7 +447,12 @@ async def stream_kiro_to_responses_internal(
             else:
                 summary_parts = [_summary_text_part(full_thinking_content)]
         done_item = _reasoning_item(
-            reasoning_item_id, summary=summary_parts, status="completed"
+            reasoning_item_id,
+            summary=summary_parts,
+            status="completed",
+            encrypted_content=encode_responses_encrypted_content(
+                full_thinking_content, thinking_signature
+            ),
         )
         events.append(
             format_sse_event(
@@ -484,6 +508,11 @@ async def stream_kiro_to_responses_internal(
                         "sequence_number": next_seq(),
                     },
                 )
+
+            elif event.type == "thinking_signature" and event.thinking_signature:
+                # Arrives right after the reasoning deltas, before the reasoning
+                # item is closed; packed into encrypted_content for replay.
+                thinking_signature = event.thinking_signature
 
             elif event.type == "thinking" and event.thinking_content:
                 full_thinking_content += event.thinking_content
@@ -838,7 +867,12 @@ async def stream_kiro_to_responses_internal(
                 summary_parts = [_summary_text_part(full_thinking_content)]
             output_items.append(
                 _reasoning_item(
-                    reasoning_item_id, summary=summary_parts, status="completed"
+                    reasoning_item_id,
+                    summary=summary_parts,
+                    status="completed",
+                    encrypted_content=encode_responses_encrypted_content(
+                        full_thinking_content, thinking_signature
+                    ),
                 )
             )
 

@@ -339,6 +339,28 @@ For a single account, failover doesn't work — you get the original error from 
 
 For complete configuration examples (including per-account region settings), see [`credentials.json.example`](credentials.json.example).
 
+---
+
+## 🧠 Reasoning Effort
+
+For models that support it (Claude 4.6+, GPT-5.6, Kimi), the gateway forwards the requested effort to Kiro natively, the same way Kiro IDE does. Other models keep the prompt-based fake reasoning.
+
+**How to pick a level** (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`):
+
+| Client | Parameter |
+|--------|-----------|
+| OpenAI Chat Completions | `reasoning_effort` |
+| Anthropic Messages (Claude Code) | `thinking` + `output_config.effort` |
+| OpenAI Responses (Codex) | `reasoning.effort` |
+| Any client, including Cursor custom models | Model name suffix, e.g. `kiro-o-5-high`, `gpt-5.6-luna-low` (wins over parameters) |
+
+- A level the model does not offer maps to the nearest one (4.6 has no `xhigh` → `high`). `none` turns thinking off where the model allows it.
+- `max` also raises the output-token ceiling to the model maximum so the answer is not cut off. It is much slower and more expensive than `high`; use it for genuinely hard problems.
+- Thinking signatures are passed through: Anthropic `thinking` blocks and Responses `reasoning` items carry the real upstream signature, and replaying them lets the model see its earlier reasoning (useful in tool loops). Chat Completions has no field for this, so reasoning is not replayed there.
+- If Kiro rejects any of these optional fields (for example after it changes a model's allowed values), the gateway adjusts or drops them and retries automatically. The request still succeeds; a warning in the log explains what was changed.
+
+Set `NATIVE_EFFORT=false` to restore the legacy behavior everywhere, or `NATIVE_EFFORT_MAX_TIER_OUTPUT_TOKENS=false` to keep Kiro's default output ceiling for `max`.
+
 ### Dynamic Model Discovery Cache
 
 Generation requests continue to use `runtime.{region}.kiro.dev`, while model discovery uses the separate `q.{region}.amazonaws.com/ListAvailableModels` endpoint. Discovery happens only when a client requests `GET /v1/models` or `GET /v1/responses/models`, never during startup, chat, Messages, Responses generation, or a background task. Each account makes at most one discovery attempt per four-hour window. A first failure serves `FALLBACK_MODELS`; a failed refresh preserves the stale dynamic list. Both failure paths start a new four-hour window. Set `MODEL_DISCOVERY_CACHE_TTL_SECONDS` (default `14400`) only if you need a different interval.
