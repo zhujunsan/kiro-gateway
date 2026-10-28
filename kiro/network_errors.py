@@ -31,6 +31,7 @@ Architecture:
 """
 
 import socket
+import ssl
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
@@ -83,6 +84,147 @@ class NetworkErrorInfo:
 
 
 ApiErrorFormat = Literal["openai", "anthropic"]
+
+
+# Substrings (lowercase) that identify a TLS *handshake* failure rather than a
+# record-layer error on an established connection. Handshake failures are
+# deterministic (proxy/firewall/regional filtering) and deserve a "check your
+# proxy or network" hint; record errors (bad MAC, decryption failed) are usually
+# a transient proxy glitch.
+_TLS_HANDSHAKE_MARKERS = (
+    "handshake",
+    "alert_handshake_failure",
+    "wrong_version_number",
+    "certificate_verify_failed",
+    "unknown_protocol",
+    "unsupported_protocol",
+    "no_protocols_available",
+    "tlsv1_alert_protocol_version",
+)
+
+# Shown to users first when the TLS handshake itself fails.
+TLS_HANDSHAKE_HINT = (
+    "Check your proxy or network settings: a proxy, firewall, or regional "
+    "network filtering may be blocking the secure connection"
+)
+
+
+def _iter_exception_chain(error: BaseException) -> List[BaseException]:
+    """Return ``error`` followed by its ``__cause__`` / ``__context__`` chain.
+
+    Cycles are cut so a self-referencing chain cannot loop forever.
+
+    Args:
+        error: Head of the chain.
+
+    Returns:
+        Exceptions from outermost to innermost.
+    """
+    chain: List[BaseException] = []
+    seen: set[int] = set()
+    current: Optional[BaseException] = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def has_ssl_error_in_chain(error: BaseException) -> bool:
+    """Return whether ``error`` or any exception it chains is an ``ssl.SSLError``.
+
+    httpx wrappers and :func:`normalize_os_error` callers keep the original
+    ``ssl.SSLError`` as ``__cause__``, so the type survives normalization.
+
+    Args:
+        error: Exception to inspect.
+
+    Returns:
+        True when an ``ssl.SSLError`` appears anywhere in the chain.
+    """
+    return any(isinstance(item, ssl.SSLError) for item in _iter_exception_chain(error))
+
+
+def is_tls_handshake_failure(error: BaseException) -> bool:
+    """Return whether ``error`` (or its cause chain) is a TLS handshake failure.
+
+    Args:
+        error: Exception raised while connecting, possibly an httpx wrapper
+            around ``ssl.SSLError``.
+
+    Returns:
+        True when the text of the error or any chained cause names a TLS
+        handshake failure (for example ``SSLV3_ALERT_HANDSHAKE_FAILURE``).
+
+    Examples:
+        >>> is_tls_handshake_failure(httpx.ConnectError("[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE]"))
+        True
+        >>> is_tls_handshake_failure(ssl.SSLError(1, "decryption failed or bad record mac"))
+        False
+    """
+    return any(
+        marker in str(item).lower()
+        for item in _iter_exception_chain(error)
+        for marker in _TLS_HANDSHAKE_MARKERS
+    )
+
+
+def is_tls_error(error: BaseException) -> bool:
+    """Return whether ``error`` is a TLS failure, by type first and text second.
+
+    Raw ``ssl.SSLError`` can escape httpcore on the read path (Sentry
+    KIRO-GATEWAY-TRAY-2D), and httpx wrappers keep it as ``__cause__``, so the
+    cause chain is checked by type before falling back to message markers.
+
+    Args:
+        error: Exception to inspect.
+
+    Returns:
+        True for ``ssl.SSLError`` anywhere in the cause chain, or an error whose
+        text mentions SSL/TLS handshakes or certificates.
+    """
+    if has_ssl_error_in_chain(error):
+        return True
+    text = str(error).lower()
+    return "ssl" in text or "handshake" in text or "certificate" in text
+
+
+def normalize_os_error(
+    error: OSError,
+    request: Optional[httpx.Request] = None,
+) -> httpx.TransportError:
+    """Convert a raw ``OSError`` that escaped httpx into an httpx transport error.
+
+    httpcore maps socket errors to httpx exceptions on connect and in the TLS
+    handshake, but not on the read path: an ``ssl.SSLError`` such as
+    ``DECRYPTION_FAILED_OR_BAD_RECORD_MAC`` (common behind HTTP proxies) escapes
+    ``client.post`` as-is. Every caller only handles ``httpx.HTTPError``, so the
+    raw error used to surface as HTTP 500 (Sentry KIRO-GATEWAY-TRAY-2D).
+
+    Mapping:
+        * ``TimeoutError`` -> ``httpx.ReadTimeout``
+        * TLS handshake failure -> ``httpx.ConnectError``
+        * other ``ssl.SSLError`` (record-layer) -> ``httpx.ReadError``
+        * any other ``OSError`` -> ``httpx.ConnectError``
+
+    The original exception is chained as ``__cause__`` by callers using
+    ``raise normalize_os_error(e, request) from e``.
+
+    Args:
+        error: Raw ``OSError`` (including ``ssl.SSLError``) raised by httpx.
+        request: Request that failed, attached so downstream handlers can log it.
+
+    Returns:
+        An ``httpx.TransportError`` subclass carrying the original message.
+    """
+    message = str(error) or type(error).__name__
+    if isinstance(error, TimeoutError):
+        return httpx.ReadTimeout(message, request=request)
+    if isinstance(error, ssl.SSLError):
+        if is_tls_handshake_failure(error):
+            return httpx.ConnectError(message, request=request)
+        return httpx.ReadError(message, request=request)
+    return httpx.ConnectError(message, request=request)
 
 
 class NetworkHTTPException(HTTPException):
@@ -407,6 +549,23 @@ def classify_network_error(error: Exception) -> NetworkErrorInfo:
             suggested_http_code=502
         )
     
+    # TLS record-layer errors on an established connection (e.g. bad record
+    # MAC behind an HTTP proxy) surface as ReadError/WriteError after
+    # normalize_os_error. They are usually transient, so keep them retryable.
+    if isinstance(error, httpx.NetworkError) and is_tls_error(error):
+        return NetworkErrorInfo(
+            category=ErrorCategory.SSL_ERROR,
+            user_message="SSL/TLS error - the secure connection was corrupted in transit.",
+            troubleshooting_steps=[
+                "Check your proxy or network settings: an HTTP proxy or VPN may be corrupting HTTPS traffic",
+                "Try again in a few moments",
+                "Temporarily disable the proxy or VPN to confirm",
+            ],
+            technical_details=technical_details,
+            is_retryable=True,
+            suggested_http_code=502
+        )
+
     # Generic httpx.RequestError (catch-all)
     if isinstance(error, httpx.RequestError):
         return NetworkErrorInfo(
@@ -527,16 +686,26 @@ def _classify_connect_error(error: httpx.ConnectError, technical_details: str) -
         )
     
     # Check for SSL/TLS errors
-    if "SSL" in error_str or "TLS" in error_str or "certificate" in error_str.lower():
+    if (
+        "SSL" in error_str
+        or "TLS" in error_str
+        or "certificate" in error_str.lower()
+        or is_tls_error(error)
+    ):
+        steps = [
+            "Check system date and time (incorrect time causes SSL errors)",
+            "Update SSL certificates on your system",
+            "Check if antivirus/firewall is intercepting HTTPS traffic",
+            "Verify the server's SSL certificate is valid"
+        ]
+        if is_tls_handshake_failure(error):
+            # Handshake failures are almost always a proxy/firewall/regional
+            # block; lead with the step the user can actually act on.
+            steps = [TLS_HANDSHAKE_HINT, *steps]
         return NetworkErrorInfo(
             category=ErrorCategory.SSL_ERROR,
             user_message="SSL/TLS error - secure connection could not be established.",
-            troubleshooting_steps=[
-                "Check system date and time (incorrect time causes SSL errors)",
-                "Update SSL certificates on your system",
-                "Check if antivirus/firewall is intercepting HTTPS traffic",
-                "Verify the server's SSL certificate is valid"
-            ],
+            troubleshooting_steps=steps,
             technical_details=technical_details,
             is_retryable=False,
             suggested_http_code=502

@@ -775,3 +775,158 @@ class TestNetworkHTTPException:
         """SSE error events must not relabel PoolTimeout as a generic timeout."""
         body = build_stream_error_body(httpx.PoolTimeout("full"), "openai")
         assert body["error"]["code"] == "pool_exhausted"
+
+
+# =============================================================================
+# Raw OSError / ssl.SSLError normalization (Sentry KIRO-GATEWAY-TRAY-2D, -2E)
+# =============================================================================
+
+import ssl as _ssl
+
+from kiro.network_errors import (
+    TLS_HANDSHAKE_HINT,
+    has_ssl_error_in_chain,
+    is_tls_error,
+    is_tls_handshake_failure,
+    normalize_os_error,
+)
+
+_BAD_RECORD_MAC = (
+    "[SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac (_ssl.c:2580)"
+)
+_HANDSHAKE_FAILURE = (
+    "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure (_ssl.c:1006)"
+)
+
+
+class TestNormalizeOsError:
+    """Raw socket/TLS errors escaping httpx must become httpx transport errors."""
+
+    def test_record_layer_ssl_error_becomes_read_error(self):
+        """Bad record MAC happens on an established connection: ReadError."""
+        result = normalize_os_error(_ssl.SSLError(1, _BAD_RECORD_MAC))
+        assert isinstance(result, httpx.ReadError)
+        assert "DECRYPTION_FAILED" in str(result)
+
+    def test_handshake_ssl_error_becomes_connect_error(self):
+        """Handshake rejection never established a connection: ConnectError."""
+        result = normalize_os_error(_ssl.SSLError(1, _HANDSHAKE_FAILURE))
+        assert isinstance(result, httpx.ConnectError)
+
+    def test_ssl_eof_error_becomes_read_error(self):
+        """SSLEOFError is a subclass of SSLError and must not slip through."""
+        result = normalize_os_error(_ssl.SSLEOFError(8, "EOF occurred in violation of protocol"))
+        assert isinstance(result, httpx.ReadError)
+
+    def test_cert_verification_error_becomes_connect_error(self):
+        """Certificate failure is part of the handshake."""
+        error = _ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        assert isinstance(normalize_os_error(error), httpx.ConnectError)
+
+    def test_timeout_error_becomes_read_timeout(self):
+        """Builtin TimeoutError (an OSError) must map to an httpx timeout."""
+        result = normalize_os_error(TimeoutError("timed out"))
+        assert isinstance(result, httpx.ReadTimeout)
+
+    @pytest.mark.parametrize(
+        "error",
+        [ConnectionResetError(54, "Connection reset by peer"), BrokenPipeError(32, "Broken pipe"), OSError("boom")],
+    )
+    def test_other_os_errors_become_connect_error(self, error):
+        """Any other OSError is still a transport failure, never a bare 500."""
+        result = normalize_os_error(error)
+        assert isinstance(result, httpx.ConnectError)
+        assert isinstance(result, httpx.TransportError)
+
+    def test_empty_message_falls_back_to_type_name(self):
+        """An OSError with no text must still produce a readable message."""
+        assert str(normalize_os_error(OSError())) == "OSError"
+
+    def test_request_is_attached_when_given(self):
+        """Downstream handlers read .request; it must be the one passed in."""
+        request = httpx.Request("POST", "https://oidc.example/token")
+        result = normalize_os_error(_ssl.SSLError(1, _BAD_RECORD_MAC), request)
+        assert result.request is request
+
+    def test_result_without_request_does_not_raise_on_construction(self):
+        """Normalization must work even without a request object."""
+        result = normalize_os_error(OSError("x"))
+        with pytest.raises(RuntimeError):
+            _ = result.request
+
+
+class TestTlsDetection:
+    """Type-based TLS detection must survive wrapping and odd messages."""
+
+    def test_ssl_error_without_ssl_text_is_detected_by_type(self):
+        """Messages without the 'ssl' marker still count as TLS."""
+        assert is_tls_error(_ssl.SSLError(1, "bad record mac")) is True
+
+    def test_chained_ssl_error_is_detected(self):
+        """httpx keeps the original SSLError as __cause__."""
+        wrapped = httpx.ReadError("read failed")
+        wrapped.__cause__ = _ssl.SSLError(1, "bad record mac")
+        assert has_ssl_error_in_chain(wrapped) is True
+        assert is_tls_error(wrapped) is True
+
+    def test_plain_connect_error_is_not_tls(self):
+        """Ordinary connection failures must not be relabeled TLS."""
+        assert is_tls_error(httpx.ConnectError("All connection attempts failed")) is False
+
+    def test_cyclic_cause_chain_terminates(self):
+        """A self-referencing chain must not loop forever."""
+        first = OSError("a")
+        second = OSError("b")
+        first.__cause__ = second
+        second.__cause__ = first
+        assert has_ssl_error_in_chain(first) is False
+        assert is_tls_handshake_failure(first) is False
+
+    def test_handshake_failure_detected_in_wrapper_text(self):
+        """2E shape: ConnectError carrying the handshake alert text."""
+        assert is_tls_handshake_failure(httpx.ConnectError(_HANDSHAKE_FAILURE)) is True
+
+    def test_handshake_failure_detected_in_cause(self):
+        """Wrapper with generic text but a handshake SSLError cause."""
+        wrapped = httpx.ConnectError("connect failed")
+        wrapped.__cause__ = _ssl.SSLError(1, _HANDSHAKE_FAILURE)
+        assert is_tls_handshake_failure(wrapped) is True
+
+    def test_record_layer_error_is_not_handshake(self):
+        """Bad record MAC is not a handshake failure; no proxy hint for it."""
+        assert is_tls_handshake_failure(_ssl.SSLError(1, _BAD_RECORD_MAC)) is False
+
+
+class TestClassifyTlsHint:
+    """Handshake failures lead with an actionable proxy/network hint."""
+
+    def test_handshake_failure_leads_with_proxy_hint(self):
+        """2E: the first troubleshooting step must be the proxy/network hint."""
+        info = classify_network_error(httpx.ConnectError(_HANDSHAKE_FAILURE))
+        assert info.category == ErrorCategory.SSL_ERROR
+        assert info.troubleshooting_steps[0] == TLS_HANDSHAKE_HINT
+
+    def test_handshake_hint_reaches_client_message(self):
+        """The client-facing message uses the first step, so it must show the hint."""
+        error = network_http_exception(classify_network_error(httpx.ConnectError(_HANDSHAKE_FAILURE)))
+        assert "proxy or network" in error.user_message
+
+    def test_non_handshake_ssl_connect_error_keeps_original_first_step(self):
+        """Certificate-text errors without handshake markers keep the old ordering."""
+        info = classify_network_error(httpx.ConnectError("SSL certificate problem: expired"))
+        assert info.category == ErrorCategory.SSL_ERROR
+        assert info.troubleshooting_steps[0] != TLS_HANDSHAKE_HINT
+
+    def test_record_layer_read_error_is_retryable_ssl_error(self):
+        """2D after normalization: SSL_ERROR, retryable, not the generic bucket."""
+        normalized = normalize_os_error(_ssl.SSLError(1, _BAD_RECORD_MAC))
+        normalized.__cause__ = _ssl.SSLError(1, _BAD_RECORD_MAC)
+        info = classify_network_error(normalized)
+        assert info.category == ErrorCategory.SSL_ERROR
+        assert info.is_retryable is True
+        assert info.suggested_http_code == 502
+
+    def test_plain_read_error_stays_unknown(self):
+        """Non-TLS read errors must not be relabeled SSL."""
+        info = classify_network_error(httpx.ReadError("peer closed"))
+        assert info.category == ErrorCategory.UNKNOWN

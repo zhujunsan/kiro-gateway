@@ -1697,3 +1697,154 @@ class TestKiroHttpClientRequestParameters:
         assert captured_kwargs["params"]["filter"] == "active"
         assert json.loads(captured_kwargs["content"])["data"] == "value"
         assert response.status_code == 200
+
+# =============================================================================
+# Raw OSError / ssl.SSLError from httpx (Sentry KIRO-GATEWAY-TRAY-2D)
+# =============================================================================
+
+import ssl as _ssl
+
+from kiro.network_errors import NetworkHTTPException
+
+_BAD_MAC = "[SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac"
+
+
+def _mock_stream_client(send_side_effect):
+    """Build a mock client whose send() follows ``send_side_effect``."""
+    client = AsyncMock()
+    client.is_closed = False
+    client.build_request = Mock(return_value=httpx.Request("POST", "https://api.example.com/x"))
+    client.send = AsyncMock(side_effect=send_side_effect)
+    return client
+
+
+class TestRequestWithRetryRawOsErrors:
+    """httpcore leaks read-path SSLError; request_with_retry must normalize it."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            _ssl.SSLError(1, _BAD_MAC),
+            _ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+            ConnectionResetError(54, "Connection reset by peer"),
+        ],
+    )
+    async def test_non_stream_raw_error_retries_then_raises_network_exception(
+        self, mock_auth_manager_for_http, raw
+    ):
+        """Non-streaming: retried with backoff, then typed 502, never raw OSError."""
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        client = AsyncMock()
+        client.is_closed = False
+        client.request = AsyncMock(side_effect=raw)
+
+        with patch.object(http_client, "_get_client", return_value=client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}), \
+             patch("kiro.http_client.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            with pytest.raises(NetworkHTTPException) as exc_info:
+                await http_client.request_with_retry("POST", "https://api.example.com/x", {"a": 1})
+
+        assert exc_info.value.status_code == 502
+        assert client.request.await_count == MAX_RETRIES
+        assert sleep.await_count == MAX_RETRIES - 1
+
+    @pytest.mark.asyncio
+    async def test_non_stream_ssl_error_is_classified_ssl(self, mock_auth_manager_for_http):
+        """The typed exception keeps the TLS category for the client message."""
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        client = AsyncMock()
+        client.is_closed = False
+        client.request = AsyncMock(side_effect=_ssl.SSLError(1, _BAD_MAC))
+
+        with patch.object(http_client, "_get_client", return_value=client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}), \
+             patch("kiro.http_client.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(NetworkHTTPException) as exc_info:
+                await http_client.request_with_retry("POST", "https://api.example.com/x", {"a": 1})
+
+        assert exc_info.value.error_code == "ssl_error"
+        assert "_ssl.c" not in exc_info.value.user_message
+
+    @pytest.mark.asyncio
+    async def test_stream_raw_ssl_error_retries_then_raises_network_exception(
+        self, mock_auth_manager_for_http
+    ):
+        """Streaming send() path is normalized the same way."""
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        client = _mock_stream_client(_ssl.SSLError(1, _BAD_MAC))
+
+        with patch.object(http_client, "_get_client", return_value=client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}), \
+             patch("kiro.http_client.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(NetworkHTTPException) as exc_info:
+                await http_client.request_with_retry(
+                    "POST", "https://api.example.com/x", {"a": 1}, stream=True
+                )
+
+        assert exc_info.value.status_code == 502
+        assert client.send.await_count == FIRST_TOKEN_MAX_RETRIES
+
+    @pytest.mark.asyncio
+    async def test_stream_recovers_after_transient_ssl_error(self, mock_auth_manager_for_http):
+        """A single bad-record-MAC blip must be retried and succeed."""
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        ok = AsyncMock()
+        ok.status_code = 200
+        client = _mock_stream_client([_ssl.SSLError(1, _BAD_MAC), ok])
+
+        with patch.object(http_client, "_get_client", return_value=client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}), \
+             patch("kiro.http_client.asyncio.sleep", new_callable=AsyncMock):
+            response = await http_client.request_with_retry(
+                "POST", "https://api.example.com/x", {"a": 1}, stream=True
+            )
+
+        assert response is ok
+        assert client.send.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stream_keeps_connection_close_header(self, mock_auth_manager_for_http):
+        """Refactor must not drop the CLOSE_WAIT leak guard (issue #38)."""
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        ok = AsyncMock()
+        ok.status_code = 200
+        client = _mock_stream_client([ok])
+
+        with patch.object(http_client, "_get_client", return_value=client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}):
+            await http_client.request_with_retry(
+                "POST", "https://api.example.com/x", {"a": 1}, stream=True
+            )
+
+        headers = client.build_request.call_args.kwargs["headers"]
+        assert headers["Connection"] == "close"
+
+    @pytest.mark.asyncio
+    async def test_builtin_timeout_error_is_treated_as_timeout(self, mock_auth_manager_for_http):
+        """Builtin TimeoutError must land in the 504 timeout bucket."""
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        client = AsyncMock()
+        client.is_closed = False
+        client.request = AsyncMock(side_effect=TimeoutError("timed out"))
+
+        with patch.object(http_client, "_get_client", return_value=client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}), \
+             patch("kiro.http_client.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(NetworkHTTPException) as exc_info:
+                await http_client.request_with_retry("POST", "https://api.example.com/x", {"a": 1})
+
+        assert exc_info.value.status_code == 504
+
+    @pytest.mark.asyncio
+    async def test_non_os_errors_still_propagate(self, mock_auth_manager_for_http):
+        """Genuine bugs (RuntimeError) must not be swallowed as network errors."""
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        client = AsyncMock()
+        client.is_closed = False
+        client.request = AsyncMock(side_effect=RuntimeError("bug"))
+
+        with patch.object(http_client, "_get_client", return_value=client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}):
+            with pytest.raises(RuntimeError):
+                await http_client.request_with_retry("POST", "https://api.example.com/x", {"a": 1})

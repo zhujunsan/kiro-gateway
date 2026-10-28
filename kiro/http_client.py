@@ -35,7 +35,7 @@ with connection pooling for better resource management.
 import asyncio
 import json
 import random
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 from loguru import logger
@@ -56,6 +56,7 @@ from kiro.network_errors import (
     classify_network_error,
     get_short_error_message,
     network_http_exception,
+    normalize_os_error,
 )
 from kiro.proxy import resolve_proxy
 from kiro.kiro_errors import INSUFFICIENT_MODEL_CAPACITY_REASON
@@ -126,6 +127,61 @@ async def _drain_error_response(
         except Exception as e:
             logger.debug(f"Error closing streamed error response: {e}")
     return response, body, _peek_kiro_reason(body)
+
+
+async def _send_normalized(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    request_kwargs: Dict[str, Any],
+    *,
+    stream: bool,
+) -> httpx.Response:
+    """Send one request, converting raw ``OSError`` into httpx transport errors.
+
+    httpcore does not map ``ssl.SSLError`` raised on the read path (for example
+    ``DECRYPTION_FAILED_OR_BAD_RECORD_MAC`` behind an HTTP proxy), so it can
+    escape ``client.request`` / ``client.send`` untranslated. Normalizing here
+    lets the existing ``httpx.TimeoutException`` / ``httpx.RequestError``
+    branches of :meth:`KiroHttpClient.request_with_retry` retry and classify it
+    instead of the route returning a bare HTTP 500.
+
+    Args:
+        client: httpx client to send through.
+        method: HTTP method.
+        url: Target URL.
+        request_kwargs: Keyword arguments for ``request`` / ``build_request``.
+        stream: When True, send as a streamed request with ``Connection: close``.
+
+    Returns:
+        The upstream response.
+
+    Raises:
+        httpx.TransportError: When the transport raised a raw ``OSError``.
+        httpx.HTTPError: Propagated unchanged from httpx.
+    """
+    request: Optional[httpx.Request] = None
+    try:
+        if stream:
+            # Prevent CLOSE_WAIT connection leak (issue #38)
+            request_kwargs["headers"]["Connection"] = "close"
+            request = client.build_request(method, url, **request_kwargs)
+            logger.debug("Sending request to Kiro API...")
+            return await client.send(request, stream=True)
+        logger.debug("Sending request to Kiro API...")
+        return await client.request(method, url, **request_kwargs)
+    except OSError as error:
+        normalized = normalize_os_error(
+            error,
+            request if isinstance(request, httpx.Request) else None,
+        )
+        logger.warning(
+            "Raw transport error escaped httpx; normalized {} -> {}: {}",
+            type(error).__name__,
+            type(normalized).__name__,
+            error,
+        )
+        raise normalized from error
 
 
 class KiroHttpClient:
@@ -344,15 +400,9 @@ class KiroHttpClient:
                 if params is not None:
                     request_kwargs["params"] = params
                 
-                if stream:
-                    # Prevent CLOSE_WAIT connection leak (issue #38)
-                    headers["Connection"] = "close"
-                    req = client.build_request(method, url, **request_kwargs)
-                    logger.debug("Sending request to Kiro API...")
-                    response = await client.send(req, stream=True)
-                else:
-                    logger.debug("Sending request to Kiro API...")
-                    response = await client.request(method, url, **request_kwargs)
+                response = await _send_normalized(
+                    client, method, url, request_kwargs, stream=stream
+                )
                 
                 # Check status
                 if response.status_code == 200:

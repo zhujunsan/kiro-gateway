@@ -737,11 +737,15 @@ def _merge_root_schema_constraints(
     return merged
 
 
-def _resolve_top_level_composition(schema: Dict[str, Any]) -> Dict[str, Any]:
+def _resolve_top_level_composition(
+    schema: Dict[str, Any], *, document_root: bool = True
+) -> Dict[str, Any]:
     """Expand only root compositions that have a conservative, lossless form.
 
     Args:
         schema: A sanitized schema whose nested composition must remain intact.
+        document_root: Whether this is the original document root, where a dialect
+            declaration can stay in place without changing its scope.
 
     Returns:
         A schema without root composition, retaining all representable constraints.
@@ -749,7 +753,12 @@ def _resolve_top_level_composition(schema: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         ValueError: Alternatives or evaluation-sensitive constraints need client changes.
     """
-    unsupported = set(schema) - _SCHEMA_COMPOSITION_KEYS - _SCHEMA_FLATTENABLE_KEYS
+    allowed = _SCHEMA_COMPOSITION_KEYS | _SCHEMA_FLATTENABLE_KEYS
+    if document_root:
+        # Preserve the dialect at its original scope. Branch-local declarations
+        # remain unsupported: promoting them could change sibling constraints.
+        allowed = allowed | {"$schema"}
+    unsupported = set(schema) - allowed
     if unsupported:
         raise ValueError(
             f"Cannot safely flatten root tool schema keywords: {', '.join(sorted(unsupported))}. "
@@ -773,7 +782,7 @@ def _resolve_top_level_composition(schema: Dict[str, Any]) -> Dict[str, Any]:
                     "Root tool schema composition forbids all inputs. "
                     + _SCHEMA_COMPOSITION_GUIDANCE
                 )
-            branch = _resolve_top_level_composition(variant)
+            branch = _resolve_top_level_composition(variant, document_root=False)
             resolved = _merge_root_schema_constraints(resolved, branch)
     logger.debug("Expanded root tool schema composition without discarding constraints")
     return resolved
@@ -787,7 +796,9 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     than losing valid requirements. Root allOf constraints and single-branch
     alternatives are expanded only when this preserves their meaning; ambiguous
     alternatives produce actionable conversion errors (HTTP 400 in all routes).
-    Nested compositions and instance values such as defaults are preserved.
+    Nested compositions, the document's $schema dialect declaration, and instance
+    values such as defaults are preserved. Branch-local dialect declarations are
+    rejected when flattening would promote them to a different scope.
 
     Args:
         schema: Tool input schema, or None for a parameterless tool.

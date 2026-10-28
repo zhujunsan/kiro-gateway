@@ -17,9 +17,12 @@ This module is the single place that answers "is this a credential problem?" so
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 import httpx
+
+from kiro.network_errors import has_ssl_error_in_chain
 
 # Stable machine-readable codes clients switch on. The tray uses these to stop
 # polling and to prompt for re-login instead of showing a network error.
@@ -77,6 +80,13 @@ def is_auth_failure(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in _AUTH_FAILURE_STATUSES
 
+    # A 200 whose body is not JSON (captive portal, proxy login page, HTML error
+    # page) raises JSONDecodeError from response.json(). It is a ValueError
+    # subclass but says nothing about credentials, so it must not trigger a
+    # re-login prompt.
+    if isinstance(exc, json.JSONDecodeError):
+        return False
+
     # ValueError is what KiroAuthManager raises once refresh is unrecoverable.
     if isinstance(exc, ValueError):
         return True
@@ -128,6 +138,10 @@ def transport_failure_reason(exc: BaseException) -> str:
         return "upstream_status"
     if isinstance(exc, httpx.TimeoutException):
         return "timeout"
+    # By type first: a raw or chained ssl.SSLError is TLS even when its message
+    # lacks the "ssl" marker (Sentry KIRO-GATEWAY-TRAY-2D).
+    if has_ssl_error_in_chain(exc):
+        return "tls"
 
     text = str(exc).lower()
     if "ssl" in text or "handshake" in text or "certificate" in text:

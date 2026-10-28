@@ -20,7 +20,6 @@ from kiro.auth_state import (
 from kiro.usage_upstream import (
     USAGE_OUTAGE_CONSECUTIVE_THRESHOLD,
     USAGE_OUTAGE_DURATION_S,
-    USAGE_OUTAGE_REPORT_COOLDOWN_S,
     USAGE_UPSTREAM_MAX_ATTEMPTS,
     UsageUpstreamMonitor,
     build_usage_auth_required_response,
@@ -70,6 +69,11 @@ def _status_error(status: int, url: str = "https://oidc.test/token") -> httpx.HT
     request = httpx.Request("POST", url)
     response = httpx.Response(status, request=request, text="body")
     return httpx.HTTPStatusError(f"status {status}", request=request, response=response)
+
+
+async def _no_sleep(_delay: float) -> None:
+    """Skip real backoff in retry tests."""
+    return None
 
 
 class TestIsAuthFailure:
@@ -241,8 +245,10 @@ class TestFinalizeSplitsAuthFromTransport:
         fake_sdk = MagicMock()
         with patch.dict("sys.modules", {"sentry_sdk": fake_sdk}):
             for _ in range(_POLLS_TO_ESCALATE):
+                # 5xx from the refresh endpoint: cause=upstream_status, which is
+                # not an external cause, so it may open one Issue.
                 response = await finalize_usage_transport_failure(
-                    httpx.ConnectError("down"), attempts=1, monitor=monitor
+                    _status_error(500), attempts=1, monitor=monitor
                 )
                 assert response.status_code == 503
         fake_sdk.capture_message.assert_called_once()
@@ -381,12 +387,16 @@ class TestObtainUsageAccessToken:
             side_effect=httpx.ConnectError("oidc unreachable")
         )
         monitor = UsageUpstreamMonitor()
-        token, error = await obtain_usage_access_token(auth, monitor=monitor)
+        token, error = await obtain_usage_access_token(
+            auth, monitor=monitor, sleep=_no_sleep
+        )
         assert token is None
         assert error is not None
         assert error.status_code == 503
         assert b"usage_upstream_unreachable" in error.body
+        # All retries of one poll count as a single streak failure.
         assert monitor.consecutive_failures == 1
+        assert auth.get_access_token.await_count == USAGE_UPSTREAM_MAX_ATTEMPTS
 
     async def test_read_timeout_returns_soft_503(self) -> None:
         auth = MagicMock()
@@ -396,6 +406,7 @@ class TestObtainUsageAccessToken:
         token, error = await obtain_usage_access_token(
             auth,
             monitor=UsageUpstreamMonitor(),
+            sleep=_no_sleep,
         )
         assert token is None
         assert error is not None
@@ -454,14 +465,14 @@ async def test_finalize_usage_transport_failure_escalates_after_streak() -> None
     with patch.dict("sys.modules", {"sentry_sdk": fake_sdk}):
         for _ in range(_POLLS_TO_ESCALATE - 1):
             resp = await finalize_usage_transport_failure(
-                httpx.ConnectError("blip"),
+                _status_error(502),
                 attempts=1,
                 monitor=monitor,
             )
             assert resp.status_code == 503
             fake_sdk.capture_message.assert_not_called()
         resp = await finalize_usage_transport_failure(
-            httpx.ConnectError("sustained"),
+            _status_error(503),
             attempts=1,
             monitor=monitor,
         )
@@ -514,7 +525,7 @@ class TestUsageUpstreamMonitor:
         assert monitor.consecutive_failures == 3
         assert USAGE_OUTAGE_CONSECUTIVE_THRESHOLD > 3
 
-    async def test_both_gates_met_reports_once_then_cools_down(self) -> None:
+    async def test_both_gates_met_opens_episode_exactly_once(self) -> None:
         monitor = UsageUpstreamMonitor()
         start = 1_000.0
         step = USAGE_OUTAGE_DURATION_S / (USAGE_OUTAGE_CONSECUTIVE_THRESHOLD - 1)
@@ -522,28 +533,37 @@ class TestUsageUpstreamMonitor:
             assert await monitor.note_failure(now=start + index * step) is False
         reported_at = start + USAGE_OUTAGE_DURATION_S
         assert await monitor.note_failure(now=reported_at) is True
-        # Inside the cooldown window: no second event.
+        assert monitor.outage_open is True
         assert await monitor.note_failure(now=reported_at + 10.0) is False
-        assert (
-            await monitor.note_failure(
-                now=reported_at + USAGE_OUTAGE_REPORT_COOLDOWN_S - 0.001
-            )
-            is False
-        )
 
-    async def test_report_resumes_after_cooldown_expires(self) -> None:
+    async def test_no_periodic_re_report_while_outage_persists(self) -> None:
+        """Regression for TRAY-2B/-22: 640+ failures produced 40+ events.
+
+        The old 15-minute cooldown re-reported forever. An episode must report
+        once, however long it lasts.
+        """
         monitor = UsageUpstreamMonitor()
         start = 1_000.0
         for index in range(USAGE_OUTAGE_CONSECUTIVE_THRESHOLD - 1):
             await monitor.note_failure(now=start + index)
-        reported_at = start + USAGE_OUTAGE_DURATION_S
-        assert await monitor.note_failure(now=reported_at) is True
-        assert (
-            await monitor.note_failure(
-                now=reported_at + USAGE_OUTAGE_REPORT_COOLDOWN_S
-            )
-            is True
-        )
+        assert await monitor.note_failure(now=start + USAGE_OUTAGE_DURATION_S) is True
+        later = [
+            await monitor.note_failure(now=start + USAGE_OUTAGE_DURATION_S + 60.0 * i)
+            for i in range(1, 700)
+        ]
+        assert not any(later)
+        assert monitor.consecutive_failures == USAGE_OUTAGE_CONSECUTIVE_THRESHOLD + 699
+
+    async def test_new_episode_reports_again_after_recovery(self) -> None:
+        """A success closes the episode; the next sustained streak is a new state change."""
+        monitor = UsageUpstreamMonitor()
+        for start in (1_000.0, 50_000.0):
+            for index in range(USAGE_OUTAGE_CONSECUTIVE_THRESHOLD - 1):
+                assert await monitor.note_failure(now=start + index) is False
+            assert await monitor.note_failure(now=start + USAGE_OUTAGE_DURATION_S) is True
+            recovery = await monitor.note_success(now=start + USAGE_OUTAGE_DURATION_S + 1.0)
+            assert recovery is not None
+            assert monitor.outage_open is False
 
     async def test_exact_thresholds_are_inclusive(self) -> None:
         """``>=`` semantics: exactly N failures spanning exactly D seconds report."""
@@ -819,3 +839,574 @@ def test_report_usage_outage_survives_missing_sentry_sdk() -> None:
     """Reporter must never break /usage when the SDK is absent."""
     with patch.dict("sys.modules", {"sentry_sdk": None}):
         report_usage_outage(httpx.ConnectError("down"), consecutive=5, attempts=3)
+
+
+# =============================================================================
+# Raw ssl.SSLError / OSError, token retry, TLS hint, JSON decode classification
+# (Sentry KIRO-GATEWAY-TRAY-2D, -2E, and the 200+HTML misclassification)
+# =============================================================================
+
+import json as _json
+import ssl as _ssl
+
+from kiro.auth import RefreshCredentialsSuspectError
+from kiro.usage_upstream import USAGE_TLS_HANDSHAKE_REASON
+
+_BAD_MAC = "[SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac"
+_HANDSHAKE = "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure"
+
+
+def _auth_raising(*effects: object) -> MagicMock:
+    """Auth double whose get_access_token follows ``effects`` in order."""
+    auth = MagicMock()
+    auth.get_access_token = AsyncMock(side_effect=list(effects))
+    return auth
+
+
+class TestObtainUsageAccessTokenRawErrors:
+    """Second line of defense: raw OSError must never escape as HTTP 500."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            _ssl.SSLError(1, _BAD_MAC),
+            _ssl.SSLError(1, "bad record mac"),  # no "ssl" marker in text
+            _ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+            ConnectionResetError(54, "Connection reset by peer"),
+            OSError("socket closed"),
+        ],
+    )
+    async def test_raw_os_errors_soft_fail_as_503(self, raw: OSError) -> None:
+        monitor = UsageUpstreamMonitor()
+        auth = _auth_raising(*([raw] * USAGE_UPSTREAM_MAX_ATTEMPTS))
+        token, error = await obtain_usage_access_token(auth, monitor=monitor, sleep=_no_sleep)
+        assert token is None
+        assert error is not None
+        assert error.status_code == 503
+        assert b"usage_upstream_unreachable" in error.body
+        assert monitor.consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_raw_ssl_error_is_classified_tls_for_reporting(self) -> None:
+        """The normalized error keeps SSLError as cause, so cause=tls."""
+        captured: list[BaseException] = []
+        auth = _auth_raising(*([_ssl.SSLError(1, "bad record mac")] * USAGE_UPSTREAM_MAX_ATTEMPTS))
+
+        async def spy(exc: BaseException, **_: object):
+            captured.append(exc)
+            return build_usage_network_error_response(exc)
+
+        with patch("kiro.usage_upstream.finalize_usage_transport_failure", side_effect=spy):
+            await obtain_usage_access_token(auth, monitor=UsageUpstreamMonitor(), sleep=_no_sleep)
+        assert len(captured) == 1
+        assert isinstance(captured[0], httpx.TransportError)
+        assert transport_failure_reason(captured[0]) == "tls"
+
+    @pytest.mark.asyncio
+    async def test_non_os_runtime_error_still_propagates(self) -> None:
+        """Genuine bugs must reach Sentry as unhandled, not be masked as 503."""
+        auth = _auth_raising(RuntimeError("bug"))
+        with pytest.raises(RuntimeError):
+            await obtain_usage_access_token(auth, monitor=UsageUpstreamMonitor(), sleep=_no_sleep)
+
+
+class TestObtainUsageAccessTokenRetry:
+    """Token refresh retries transport/5xx only, with the getUsageLimits budget."""
+
+    @pytest.mark.asyncio
+    async def test_transient_transport_error_recovers_within_one_poll(self) -> None:
+        monitor = UsageUpstreamMonitor()
+        auth = _auth_raising(httpx.ConnectError("blip"), "tok")
+        sleeps: list[float] = []
+
+        async def record(delay: float) -> None:
+            sleeps.append(delay)
+
+        token, error = await obtain_usage_access_token(auth, monitor=monitor, sleep=record)
+        assert token == "tok"
+        assert error is None
+        assert len(sleeps) == 1
+        assert monitor.consecutive_failures == 0
+
+    @pytest.mark.asyncio
+    async def test_raw_ssl_error_is_retried(self) -> None:
+        auth = _auth_raising(_ssl.SSLError(1, _BAD_MAC), "tok")
+        token, error = await obtain_usage_access_token(
+            auth, monitor=UsageUpstreamMonitor(), sleep=_no_sleep
+        )
+        assert token == "tok"
+        assert error is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [500, 502, 503, 504])
+    async def test_5xx_is_retried_up_to_budget(self, status: int) -> None:
+        auth = _auth_raising(*([_status_error(status)] * USAGE_UPSTREAM_MAX_ATTEMPTS))
+        sleeps: list[float] = []
+
+        async def record(delay: float) -> None:
+            sleeps.append(delay)
+
+        _, error = await obtain_usage_access_token(auth, monitor=UsageUpstreamMonitor(), sleep=record)
+        assert error is not None and error.status_code == 503
+        assert auth.get_access_token.await_count == USAGE_UPSTREAM_MAX_ATTEMPTS
+        # No sleep after the final attempt.
+        assert len(sleeps) == USAGE_UPSTREAM_MAX_ATTEMPTS - 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [400, 401, 403, 404, 429])
+    async def test_4xx_is_not_retried(self, status: int) -> None:
+        """Credential/client errors repeat identically; 429 is not in scope."""
+        auth = _auth_raising(_status_error(status), "never")
+        await obtain_usage_access_token(auth, monitor=UsageUpstreamMonitor(), sleep=_no_sleep)
+        assert auth.get_access_token.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_value_error_is_not_retried(self) -> None:
+        auth = _auth_raising(ValueError("Token expired and refresh failed"), "never")
+        _, error = await obtain_usage_access_token(
+            auth, monitor=UsageUpstreamMonitor(), sleep=_no_sleep
+        )
+        assert auth.get_access_token.await_count == 1
+        assert error is not None and error.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_decoding_error_is_not_retried_and_is_soft_503(self) -> None:
+        """200+HTML: not a credential failure, not worth an in-poll retry."""
+        auth = _auth_raising(httpx.DecodingError("not json"), "never")
+        monitor = UsageUpstreamMonitor()
+        _, error = await obtain_usage_access_token(auth, monitor=monitor, sleep=_no_sleep)
+        assert auth.get_access_token.await_count == 1
+        assert error is not None and error.status_code == 503
+        assert monitor.consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_then_credential_failure_stops_and_returns_401(self) -> None:
+        """A 5xx followed by 400 stops immediately at the credential failure."""
+        auth = _auth_raising(_status_error(500), _status_error(400), "never")
+        monitor = UsageUpstreamMonitor()
+        _, error = await obtain_usage_access_token(auth, monitor=monitor, sleep=_no_sleep)
+        assert auth.get_access_token.await_count == 2
+        assert error is not None and error.status_code == 401
+        assert monitor.consecutive_failures == 0
+
+    @pytest.mark.asyncio
+    async def test_suspected_credentials_return_login_required(self) -> None:
+        """2B: long 5xx streak from Kiro Desktop is surfaced as re-login."""
+        auth = _auth_raising(RefreshCredentialsSuspectError(500, 4000.0), "never")
+        monitor = UsageUpstreamMonitor()
+        _, error = await obtain_usage_access_token(auth, monitor=monitor, sleep=_no_sleep)
+        assert auth.get_access_token.await_count == 1
+        assert error is not None and error.status_code == 401
+        body = _json.loads(error.body)
+        assert body["error"]["login_required"] is True
+        assert body["error"]["code"] == USAGE_AUTH_REQUIRED_CODE
+        assert monitor.consecutive_failures == 0
+
+
+class TestFetchUsageLimitsRawErrors:
+    """getUsageLimits transport path must normalize raw OSError too."""
+
+    @pytest.mark.asyncio
+    async def test_raw_ssl_error_is_retried_and_soft_fails(self) -> None:
+        calls = 0
+
+        async def transport(_url: str, _headers: dict) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            raise _ssl.SSLError(1, _BAD_MAC)
+
+        result = await fetch_usage_limits(
+            url="https://q.us-east-1.amazonaws.com/getUsageLimits",
+            headers={},
+            proxy=None,
+            monitor=UsageUpstreamMonitor(),
+            sleep=_no_sleep,
+            transport_get=transport,
+        )
+        assert calls == USAGE_UPSTREAM_MAX_ATTEMPTS
+        assert result.response is None
+        assert isinstance(result.error, httpx.TransportError)
+        assert transport_failure_reason(result.error) == "tls"
+
+    @pytest.mark.asyncio
+    async def test_raw_ssl_error_then_success(self) -> None:
+        request = httpx.Request("GET", "https://q.us-east-1.amazonaws.com/getUsageLimits")
+        effects: list[object] = [_ssl.SSLError(1, _BAD_MAC), httpx.Response(200, request=request, json={})]
+
+        async def transport(_url: str, _headers: dict) -> httpx.Response:
+            effect = effects.pop(0)
+            if isinstance(effect, BaseException):
+                raise effect
+            return effect  # type: ignore[return-value]
+
+        result = await fetch_usage_limits(
+            url=str(request.url), headers={}, proxy=None,
+            monitor=UsageUpstreamMonitor(), sleep=_no_sleep, transport_get=transport,
+        )
+        assert result.response is not None and result.response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_runtime_error_propagates(self) -> None:
+        async def transport(_url: str, _headers: dict) -> httpx.Response:
+            raise RuntimeError("bug")
+
+        with pytest.raises(RuntimeError):
+            await fetch_usage_limits(
+                url="u", headers={}, proxy=None,
+                monitor=UsageUpstreamMonitor(), sleep=_no_sleep, transport_get=transport,
+            )
+
+
+class TestUsageTlsHandshakeHint:
+    """Handshake failures carry an actionable proxy/network hint in /usage 503."""
+
+    def test_handshake_failure_body_has_hint_and_reason(self) -> None:
+        response = build_usage_network_error_response(httpx.ConnectError(_HANDSHAKE))
+        body = _json.loads(response.body)
+        assert response.status_code == 503
+        assert body["error"]["code"] == "usage_upstream_unreachable"
+        assert body["error"]["reason"] == USAGE_TLS_HANDSHAKE_REASON
+        assert "proxy or network" in body["error"]["message"]
+
+    def test_record_layer_error_has_no_hint(self) -> None:
+        normalized = httpx.ReadError(_BAD_MAC)
+        normalized.__cause__ = _ssl.SSLError(1, _BAD_MAC)
+        body = _json.loads(build_usage_network_error_response(normalized).body)
+        assert "reason" not in body["error"]
+
+    def test_plain_connect_error_has_no_hint(self) -> None:
+        body = _json.loads(
+            build_usage_network_error_response(httpx.ConnectError("All connection attempts failed")).body
+        )
+        assert "reason" not in body["error"]
+        assert "login_required" not in body["error"]
+
+
+class TestTransportFailureReasonSslType:
+    """cause=tls is decided by type, not only by message text."""
+
+    def test_raw_ssl_error_without_marker_is_tls(self) -> None:
+        assert transport_failure_reason(_ssl.SSLError(1, "bad record mac")) == "tls"
+
+    def test_wrapped_ssl_error_without_marker_is_tls(self) -> None:
+        wrapped = httpx.ReadError("read failed")
+        wrapped.__cause__ = _ssl.SSLError(1, "bad record mac")
+        assert transport_failure_reason(wrapped) == "tls"
+
+    def test_status_error_still_upstream_status(self) -> None:
+        """Type checks for status/timeout still win over the chain check."""
+        assert transport_failure_reason(_status_error(500)) == "upstream_status"
+
+    def test_timeout_with_ssl_cause_stays_timeout(self) -> None:
+        timeout = httpx.ReadTimeout("slow")
+        timeout.__cause__ = _ssl.SSLError(1, "x")
+        assert transport_failure_reason(timeout) == "timeout"
+
+
+class TestJsonDecodeIsNotAuthFailure:
+    """200+HTML bodies must not prompt a re-login."""
+
+    def test_json_decode_error_is_not_auth_failure(self) -> None:
+        with pytest.raises(_json.JSONDecodeError) as exc_info:
+            _json.loads("<html>captive portal</html>")
+        assert is_auth_failure(exc_info.value) is False
+
+    def test_plain_value_error_is_still_auth_failure(self) -> None:
+        """The established ValueError contract is unchanged."""
+        assert is_auth_failure(ValueError("Failed to obtain access token")) is True
+
+    def test_suspect_error_is_auth_failure(self) -> None:
+        assert is_auth_failure(RefreshCredentialsSuspectError(500, 3600.0)) is True
+
+
+class TestUsageEndpointSslError:
+    """End-to-end: GET /usage must not return 500 for a raw SSLError (2D)."""
+
+    def test_raw_ssl_error_in_token_refresh_returns_503(self, clean_app) -> None:
+        from fastapi.testclient import TestClient
+        from kiro.routes_openai import verify_api_key
+
+        auth = MagicMock()
+        auth.get_access_token = AsyncMock(side_effect=_ssl.SSLError(1, _BAD_MAC))
+        account = SimpleNamespace(auth_manager=auth)
+        clean_app.dependency_overrides[verify_api_key] = lambda: True
+        original = getattr(clean_app.state, "account_manager", None)
+        clean_app.state.account_manager = SimpleNamespace(_accounts={"a": account})
+        try:
+            # The sleep default is bound at definition time; zero the delay instead.
+            with patch("kiro.usage_upstream._retry_delay_seconds", return_value=0.0), \
+                 patch("kiro.usage_upstream.usage_upstream_monitor", UsageUpstreamMonitor()):
+                client = TestClient(clean_app, raise_server_exceptions=False)
+                response = client.get("/usage")
+        finally:
+            clean_app.state.account_manager = original
+            clean_app.dependency_overrides = {}
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "usage_upstream_unreachable"
+
+
+# =============================================================================
+# State-change reporting: one Issue per episode, external causes breadcrumb-only
+# (Sentry KIRO-GATEWAY-TRAY-2B, -22, -20, -2E)
+# =============================================================================
+
+from kiro.usage_upstream import (
+    USAGE_OUTAGE_EXTERNAL_CAUSES,
+    UsageOutageRecovery,
+    is_external_outage_cause,
+    note_usage_failure,
+    note_usage_success,
+)
+
+_EXTERNAL_ERRORS = {
+    "tls": httpx.ConnectError(_HANDSHAKE),
+    "dns": httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known"),
+    "timeout": httpx.ConnectTimeout(""),
+    "connect": httpx.ConnectError("All connection attempts failed"),
+}
+
+
+def _fake_sentry() -> tuple[MagicMock, MagicMock]:
+    """Return (sdk, scope) doubles wired like sentry_sdk.new_scope()."""
+    sdk = MagicMock()
+    scope = MagicMock()
+    sdk.new_scope.return_value.__enter__.return_value = scope
+    return sdk, scope
+
+
+def _breadcrumbs(sdk: MagicMock) -> list[dict]:
+    """Collect kwargs of every add_breadcrumb call."""
+    return [c.kwargs for c in sdk.add_breadcrumb.call_args_list]
+
+
+async def _drive(exc: BaseException, monitor: UsageUpstreamMonitor, polls: int) -> list[bool]:
+    """Feed ``polls`` identical failures through the shared entry point."""
+    return [await note_usage_failure(exc, attempts=3, monitor=monitor) for _ in range(polls)]
+
+
+class TestExternalCauseClassification:
+    """The external set is exactly what the user decided."""
+
+    def test_external_set_is_exact(self) -> None:
+        assert USAGE_OUTAGE_EXTERNAL_CAUSES == frozenset({"tls", "dns", "timeout", "connect"})
+
+    @pytest.mark.parametrize("cause", ["upstream_status", "other", "", "TLS"])
+    def test_non_external_causes(self, cause: str) -> None:
+        """Case-sensitive: tags are produced lowercase by transport_failure_reason."""
+        assert is_external_outage_cause(cause) is False
+
+    @pytest.mark.parametrize("cause,exc", list(_EXTERNAL_ERRORS.items()))
+    def test_fixtures_map_to_their_cause(self, cause: str, exc: BaseException) -> None:
+        assert transport_failure_reason(exc) == cause
+
+
+@pytest.mark.asyncio
+class TestEpisodeReporting:
+    """Issue once at episode start for gateway-relevant causes, never for external."""
+
+    @pytest.mark.parametrize("cause", sorted(_EXTERNAL_ERRORS))
+    async def test_external_cause_never_creates_event(self, cause: str) -> None:
+        sdk, _ = _fake_sentry()
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+        with patch.dict("sys.modules", {"sentry_sdk": sdk}):
+            opened = await _drive(_EXTERNAL_ERRORS[cause], monitor, _POLLS_TO_ESCALATE + 20)
+        sdk.capture_message.assert_not_called()
+        sdk.capture_exception.assert_not_called()
+        assert not any(opened)
+        assert monitor.outage_open is True
+        assert monitor.outage_issue_reported is False
+        crumbs = _breadcrumbs(sdk)
+        # One crumb per failure from the episode start on: "started" then "ongoing".
+        assert len(crumbs) == 21
+        assert crumbs[0]["message"] == "GET /usage upstream outage started"
+        assert all(c["message"] == "GET /usage upstream outage ongoing" for c in crumbs[1:])
+        assert all(c["data"]["cause"] == cause and c["data"]["external"] for c in crumbs)
+
+    @pytest.mark.parametrize("exc", [_status_error(500), _status_error(503), httpx.DecodingError("x")])
+    async def test_gateway_relevant_cause_reports_once_at_start(self, exc: BaseException) -> None:
+        sdk, scope = _fake_sentry()
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+        with patch.dict("sys.modules", {"sentry_sdk": sdk}):
+            opened = await _drive(exc, monitor, _POLLS_TO_ESCALATE + 50)
+        assert opened.count(True) == 1
+        assert opened.index(True) == _POLLS_TO_ESCALATE - 1
+        sdk.capture_message.assert_called_once()
+        assert scope.fingerprint[1] in {"upstream_status", "other"}
+        # Every later failure is a breadcrumb, not an event.
+        assert len(_breadcrumbs(sdk)) == 50
+        assert all(c["message"].endswith("ongoing") for c in _breadcrumbs(sdk))
+
+    async def test_failures_before_threshold_emit_nothing(self) -> None:
+        sdk, _ = _fake_sentry()
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+        with patch.dict("sys.modules", {"sentry_sdk": sdk}):
+            await _drive(_status_error(500), monitor, _POLLS_TO_ESCALATE - 1)
+        sdk.capture_message.assert_not_called()
+        sdk.add_breadcrumb.assert_not_called()
+        assert monitor.outage_open is False
+
+    async def test_opening_cause_decides_episode(self) -> None:
+        """External start then upstream_status later: still no Issue in that episode."""
+        sdk, _ = _fake_sentry()
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+        with patch.dict("sys.modules", {"sentry_sdk": sdk}):
+            await _drive(_EXTERNAL_ERRORS["connect"], monitor, _POLLS_TO_ESCALATE)
+            await _drive(_status_error(500), monitor, 10)
+        sdk.capture_message.assert_not_called()
+        assert monitor.outage_cause == "connect"
+
+    async def test_upstream_start_then_external_does_not_report_again(self) -> None:
+        sdk, _ = _fake_sentry()
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+        with patch.dict("sys.modules", {"sentry_sdk": sdk}):
+            await _drive(_status_error(500), monitor, _POLLS_TO_ESCALATE)
+            await _drive(_EXTERNAL_ERRORS["tls"], monitor, 10)
+        sdk.capture_message.assert_called_once()
+
+    async def test_external_logs_stay_below_warning(self) -> None:
+        """Tray ships WARNING+ loguru records to Sentry Logs; external must stay INFO."""
+        from loguru import logger as _logger
+
+        levels: list[str] = []
+        sink_id = _logger.add(lambda m: levels.append(m.record["level"].name), level="DEBUG")
+        try:
+            monitor = UsageUpstreamMonitor(clock=_polling_clock())
+            with patch.dict("sys.modules", {"sentry_sdk": None}):
+                await _drive(_EXTERNAL_ERRORS["dns"], monitor, _POLLS_TO_ESCALATE + 3)
+                await note_usage_success(monitor)
+        finally:
+            _logger.remove(sink_id)
+        assert "WARNING" not in levels and "ERROR" not in levels
+        assert "INFO" in levels
+
+    async def test_missing_sdk_never_breaks_reporting(self) -> None:
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+        with patch.dict("sys.modules", {"sentry_sdk": None}):
+            opened = await _drive(_status_error(500), monitor, _POLLS_TO_ESCALATE + 2)
+            await note_usage_success(monitor)
+        assert opened.count(True) == 1
+
+    async def test_breadcrumb_failure_is_swallowed(self) -> None:
+        sdk, _ = _fake_sentry()
+        sdk.add_breadcrumb.side_effect = RuntimeError("sdk broken")
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+        with patch.dict("sys.modules", {"sentry_sdk": sdk}):
+            await _drive(_EXTERNAL_ERRORS["timeout"], monitor, _POLLS_TO_ESCALATE + 1)
+            await note_usage_success(monitor)
+
+
+@pytest.mark.asyncio
+class TestEpisodeRecovery:
+    """Recovery closes the episode with an info breadcrumb, never an event."""
+
+    @pytest.mark.parametrize(
+        "exc,external,issue",
+        [
+            (_EXTERNAL_ERRORS["tls"], True, False),
+            (_status_error(500), False, True),
+        ],
+    )
+    async def test_recovery_records_info_breadcrumb(
+        self, exc: BaseException, external: bool, issue: bool
+    ) -> None:
+        sdk, _ = _fake_sentry()
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+        with patch.dict("sys.modules", {"sentry_sdk": sdk}):
+            await _drive(exc, monitor, _POLLS_TO_ESCALATE + 2)
+            events_before = sdk.capture_message.call_count
+            await note_usage_success(monitor)
+        assert sdk.capture_message.call_count == events_before
+        last = _breadcrumbs(sdk)[-1]
+        assert last["level"] == "info"
+        assert last["message"] == "GET /usage upstream recovered"
+        assert last["data"]["external"] is external
+        assert last["data"]["issue_reported"] is issue
+        assert last["data"]["consecutive_failures"] == _POLLS_TO_ESCALATE + 2
+        assert monitor.outage_open is False
+        assert monitor.consecutive_failures == 0
+
+    async def test_success_without_episode_is_silent(self) -> None:
+        """Recovering from a sub-threshold blip is not a state change."""
+        sdk, _ = _fake_sentry()
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+        with patch.dict("sys.modules", {"sentry_sdk": sdk}):
+            await _drive(_EXTERNAL_ERRORS["connect"], monitor, 2)
+            await note_usage_success(monitor)
+        sdk.add_breadcrumb.assert_not_called()
+
+    async def test_repeated_success_reports_recovery_once(self) -> None:
+        sdk, _ = _fake_sentry()
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+        with patch.dict("sys.modules", {"sentry_sdk": sdk}):
+            await _drive(_status_error(500), monitor, _POLLS_TO_ESCALATE)
+            for _ in range(3):
+                await note_usage_success(monitor)
+        recovered = [c for c in _breadcrumbs(sdk) if c["message"].endswith("recovered")]
+        assert len(recovered) == 1
+
+    async def test_recovery_snapshot_duration_and_backwards_clock(self) -> None:
+        monitor = UsageUpstreamMonitor()
+        for index in range(USAGE_OUTAGE_CONSECUTIVE_THRESHOLD):
+            await monitor.note_failure(now=1_000.0 + index * 100.0, cause="other")
+        assert monitor.outage_open is True
+        recovery = await monitor.note_success(now=1_000.0 + 1_000.0)
+        assert recovery == UsageOutageRecovery(
+            cause="other", issue_reported=True,
+            consecutive_failures=USAGE_OUTAGE_CONSECUTIVE_THRESHOLD, duration_s=1_000.0,
+        )
+        for index in range(USAGE_OUTAGE_CONSECUTIVE_THRESHOLD):
+            await monitor.note_failure(now=5_000.0 + index * 100.0, cause="dns")
+        backwards = await monitor.note_success(now=1.0)
+        assert backwards is not None and backwards.duration_s == 0.0
+        assert backwards.issue_reported is False
+
+    async def test_auth_failure_does_not_close_episode(self) -> None:
+        """A 401 mid-outage is not a recovery."""
+        sdk, _ = _fake_sentry()
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+        with patch.dict("sys.modules", {"sentry_sdk": sdk}):
+            await _drive(_EXTERNAL_ERRORS["connect"], monitor, _POLLS_TO_ESCALATE)
+            await finalize_usage_transport_failure(_status_error(401), monitor=monitor)
+        assert monitor.outage_open is True
+
+
+@pytest.mark.asyncio
+class TestFetchUsageLimitsEpisodeWiring:
+    """getUsageLimits paths go through the same state-change policy."""
+
+    async def test_200_after_outage_reports_recovery(self) -> None:
+        sdk, _ = _fake_sentry()
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+        request = httpx.Request("GET", "https://q.test/getUsageLimits")
+
+        async def ok(_url: str, _headers: dict) -> httpx.Response:
+            return httpx.Response(200, request=request, json={})
+
+        with patch.dict("sys.modules", {"sentry_sdk": sdk}):
+            await _drive(_EXTERNAL_ERRORS["timeout"], monitor, _POLLS_TO_ESCALATE)
+            await fetch_usage_limits(
+                url=str(request.url), headers={}, proxy=None,
+                monitor=monitor, sleep=_no_sleep, transport_get=ok,
+            )
+        assert _breadcrumbs(sdk)[-1]["message"] == "GET /usage upstream recovered"
+        sdk.capture_message.assert_not_called()
+
+    async def test_transport_exhaustion_external_never_reports(self) -> None:
+        sdk, _ = _fake_sentry()
+        monitor = UsageUpstreamMonitor(clock=_polling_clock())
+
+        async def down(_url: str, _headers: dict) -> httpx.Response:
+            raise httpx.ConnectError("All connection attempts failed")
+
+        reported: list[bool] = []
+        with patch.dict("sys.modules", {"sentry_sdk": sdk}):
+            for _ in range(_POLLS_TO_ESCALATE + 5):
+                result = await fetch_usage_limits(
+                    url="u", headers={}, proxy=None,
+                    monitor=monitor, sleep=_no_sleep, transport_get=down,
+                )
+                reported.append(result.reported_outage)
+        assert not any(reported)
+        sdk.capture_message.assert_not_called()

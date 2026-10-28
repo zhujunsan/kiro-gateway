@@ -4903,3 +4903,296 @@ class TestKiroAuthManagerEnsureProfileArn:
                 patch.object(manager, "_save_credentials_to_file") as save_json:
             assert await manager.ensure_profile_arn() == _DISCOVERED_ARN
         save_json.assert_not_called()
+
+
+# =============================================================================
+# Refresh transport normalization, non-JSON bodies, and 5xx credential suspicion
+# (Sentry KIRO-GATEWAY-TRAY-2D, KIRO-GATEWAY-TRAY-2B)
+# =============================================================================
+
+import ssl as _ssl
+
+from kiro.auth import (
+    KIRO_DESKTOP_REFRESH_5XX_SUSPECT_AFTER_S,
+    RefreshCredentialsSuspectError,
+)
+from kiro.auth_state import is_auth_failure as _is_auth_failure
+
+_BAD_MAC = "[SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac"
+
+
+def _patched_async_client(post_side_effect):
+    """Patch kiro.auth.httpx.AsyncClient so post() follows ``post_side_effect``."""
+    patcher = patch("kiro.auth.httpx.AsyncClient")
+    mock_client_class = patcher.start()
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(side_effect=post_side_effect)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client_class.return_value = mock_client
+    return patcher, mock_client
+
+
+def _status_response(status: int, url: str = "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken") -> httpx.Response:
+    """Real httpx.Response so raise_for_status behaves like production."""
+    return httpx.Response(status, request=httpx.Request("POST", url), text="err")
+
+
+def _sso_manager() -> KiroAuthManager:
+    """AWS SSO OIDC manager with all required credentials set."""
+    manager = KiroAuthManager(
+        refresh_token="rt", client_id="cid-12345678", client_secret="secret", region="us-east-1"
+    )
+    assert manager.auth_type == AuthType.AWS_SSO_OIDC
+    return manager
+
+
+class TestRefreshTransportNormalization:
+    """Raw socket/TLS errors from client.post must become httpx transport errors."""
+
+    @pytest.mark.asyncio
+    async def test_desktop_refresh_ssl_read_error_becomes_read_error(self):
+        """2D on the Kiro Desktop path: raw SSLError -> httpx.ReadError, cause kept."""
+        manager = KiroAuthManager(refresh_token="rt")
+        raw = _ssl.SSLError(1, _BAD_MAC)
+        patcher, _ = _patched_async_client(raw)
+        try:
+            with pytest.raises(httpx.ReadError) as exc_info:
+                await manager._refresh_token_request()
+        finally:
+            patcher.stop()
+        assert exc_info.value.__cause__ is raw
+
+    @pytest.mark.asyncio
+    async def test_sso_refresh_ssl_read_error_becomes_read_error(self):
+        """2D exact stack: _do_aws_sso_oidc_refresh client.post raising SSLError."""
+        manager = _sso_manager()
+        patcher, _ = _patched_async_client(_ssl.SSLError(1, _BAD_MAC))
+        try:
+            with pytest.raises(httpx.ReadError):
+                await manager._refresh_token_request()
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_get_access_token_surfaces_httpx_error_not_ssl_error(self):
+        """The public entry point must never leak a raw OSError."""
+        manager = _sso_manager()
+        patcher, _ = _patched_async_client(_ssl.SSLError(1, _BAD_MAC))
+        try:
+            with pytest.raises(httpx.HTTPError) as exc_info:
+                await manager.get_access_token()
+        finally:
+            patcher.stop()
+        assert not isinstance(exc_info.value, OSError)
+
+    @pytest.mark.asyncio
+    async def test_handshake_failure_becomes_connect_error(self):
+        """2E shape on refresh: handshake alert -> ConnectError."""
+        manager = KiroAuthManager(refresh_token="rt")
+        patcher, _ = _patched_async_client(
+            _ssl.SSLError(1, "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure")
+        )
+        try:
+            with pytest.raises(httpx.ConnectError):
+                await manager._refresh_token_request()
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_connection_reset_becomes_transport_error(self):
+        """Plain OSError subclasses are normalized too."""
+        manager = KiroAuthManager(refresh_token="rt")
+        patcher, _ = _patched_async_client(ConnectionResetError(54, "Connection reset by peer"))
+        try:
+            with pytest.raises(httpx.TransportError):
+                await manager._refresh_token_request()
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_non_os_error_is_not_swallowed(self):
+        """A RuntimeError is a bug and must propagate unchanged."""
+        manager = KiroAuthManager(refresh_token="rt")
+        patcher, _ = _patched_async_client(RuntimeError("bug"))
+        try:
+            with pytest.raises(RuntimeError):
+                await manager._refresh_token_request()
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_normalized_transport_error_is_not_auth_failure(self):
+        """Network trouble must never trigger a re-login prompt."""
+        manager = KiroAuthManager(refresh_token="rt")
+        patcher, _ = _patched_async_client(_ssl.SSLError(1, _BAD_MAC))
+        try:
+            with pytest.raises(httpx.HTTPError) as exc_info:
+                await manager._refresh_token_request()
+        finally:
+            patcher.stop()
+        assert _is_auth_failure(exc_info.value) is False
+
+
+class TestRefreshNonJsonBody:
+    """A 200 HTML page (captive portal) must not look like signed-out credentials."""
+
+    @staticmethod
+    def _html_response(url: str) -> httpx.Response:
+        return httpx.Response(200, request=httpx.Request("POST", url), text="<html>login</html>")
+
+    @pytest.mark.asyncio
+    async def test_desktop_html_body_raises_decoding_error(self):
+        """Kiro Desktop: JSONDecodeError -> httpx.DecodingError, not ValueError."""
+        manager = KiroAuthManager(refresh_token="rt")
+        patcher, _ = _patched_async_client([self._html_response(manager._refresh_url)])
+        try:
+            with pytest.raises(httpx.DecodingError) as exc_info:
+                await manager._refresh_token_request()
+        finally:
+            patcher.stop()
+        assert not isinstance(exc_info.value, ValueError)
+        assert _is_auth_failure(exc_info.value) is False
+        assert isinstance(exc_info.value.__cause__, json.JSONDecodeError)
+
+    @pytest.mark.asyncio
+    async def test_sso_html_body_raises_decoding_error(self):
+        """AWS SSO OIDC: same treatment on the 200 path."""
+        manager = _sso_manager()
+        patcher, _ = _patched_async_client(
+            [self._html_response("https://oidc.us-east-1.amazonaws.com/token")]
+        )
+        try:
+            with pytest.raises(httpx.DecodingError):
+                await manager._refresh_token_request()
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_decoding_error_message_points_at_interception(self):
+        """The message must be actionable, not a raw parser error."""
+        manager = KiroAuthManager(refresh_token="rt")
+        patcher, _ = _patched_async_client([self._html_response(manager._refresh_url)])
+        try:
+            with pytest.raises(httpx.DecodingError) as exc_info:
+                await manager._refresh_token_request()
+        finally:
+            patcher.stop()
+        assert "proxy" in str(exc_info.value)
+
+
+class TestDesktopRefresh5xxSuspicion:
+    """Persistent /refreshToken 5xx escalates to a re-login prompt (2B)."""
+
+    @staticmethod
+    async def _refresh_at(manager: KiroAuthManager, status: int, now: float) -> BaseException:
+        """Run one refresh returning ``status`` at wall-clock ``now``; return the error."""
+        patcher, _ = _patched_async_client([_status_response(status)])
+        try:
+            with patch("kiro.auth.time.time", return_value=now):
+                with pytest.raises((httpx.HTTPStatusError, RefreshCredentialsSuspectError)) as exc_info:
+                    await manager._refresh_token_request()
+        finally:
+            patcher.stop()
+        return exc_info.value
+
+    @pytest.mark.asyncio
+    async def test_first_5xx_is_plain_status_error(self):
+        """A fresh 500 is an upstream blip, not a credential problem."""
+        manager = KiroAuthManager(refresh_token="rt")
+        error = await self._refresh_at(manager, 500, 1_000.0)
+        assert isinstance(error, httpx.HTTPStatusError)
+        assert manager._refresh_5xx_since == 1_000.0
+        assert _is_auth_failure(error) is False
+
+    @pytest.mark.asyncio
+    async def test_5xx_just_under_threshold_stays_status_error(self):
+        """One second short of the window must not escalate."""
+        manager = KiroAuthManager(refresh_token="rt")
+        await self._refresh_at(manager, 500, 1_000.0)
+        error = await self._refresh_at(
+            manager, 503, 1_000.0 + KIRO_DESKTOP_REFRESH_5XX_SUSPECT_AFTER_S - 1
+        )
+        assert isinstance(error, httpx.HTTPStatusError)
+
+    @pytest.mark.asyncio
+    async def test_5xx_at_threshold_escalates_to_auth_failure(self):
+        """At exactly the window (inclusive) the error becomes a re-login prompt."""
+        manager = KiroAuthManager(refresh_token="rt")
+        await self._refresh_at(manager, 500, 1_000.0)
+        error = await self._refresh_at(
+            manager, 500, 1_000.0 + KIRO_DESKTOP_REFRESH_5XX_SUSPECT_AFTER_S
+        )
+        assert isinstance(error, RefreshCredentialsSuspectError)
+        assert isinstance(error, ValueError)
+        assert _is_auth_failure(error) is True
+        assert error.status_code == 500
+        assert "sign in again" in str(error)
+        assert isinstance(error.__cause__, httpx.HTTPStatusError)
+
+    @pytest.mark.asyncio
+    async def test_4xx_resets_streak(self):
+        """A non-5xx status ends the 5xx streak."""
+        manager = KiroAuthManager(refresh_token="rt")
+        await self._refresh_at(manager, 500, 1_000.0)
+        await self._refresh_at(manager, 401, 1_500.0)
+        assert manager._refresh_5xx_since is None
+        error = await self._refresh_at(
+            manager, 500, 1_000.0 + KIRO_DESKTOP_REFRESH_5XX_SUSPECT_AFTER_S + 10
+        )
+        assert isinstance(error, httpx.HTTPStatusError)
+
+    @pytest.mark.asyncio
+    async def test_success_resets_streak(self, mock_kiro_token_response):
+        """A successful refresh clears the streak."""
+        manager = KiroAuthManager(refresh_token="rt")
+        await self._refresh_at(manager, 500, 1_000.0)
+        ok = httpx.Response(
+            200,
+            request=httpx.Request("POST", manager._refresh_url),
+            json=mock_kiro_token_response(),
+        )
+        patcher, _ = _patched_async_client([ok])
+        try:
+            with patch.object(manager, "_save_credentials_to_file"):
+                await manager._refresh_token_request()
+        finally:
+            patcher.stop()
+        assert manager._refresh_5xx_since is None
+
+    @pytest.mark.asyncio
+    async def test_transport_error_does_not_reset_or_advance_streak(self):
+        """Network errors say nothing about the token; leave the streak alone."""
+        manager = KiroAuthManager(refresh_token="rt")
+        await self._refresh_at(manager, 500, 1_000.0)
+        patcher, _ = _patched_async_client(httpx.ConnectError("down"))
+        try:
+            with pytest.raises(httpx.ConnectError):
+                await manager._refresh_token_request()
+        finally:
+            patcher.stop()
+        assert manager._refresh_5xx_since == 1_000.0
+
+    @pytest.mark.asyncio
+    async def test_backwards_clock_restarts_streak(self):
+        """A clock jump backwards restarts the window instead of escalating."""
+        manager = KiroAuthManager(refresh_token="rt")
+        await self._refresh_at(manager, 500, 10_000.0)
+        error = await self._refresh_at(manager, 500, 5_000.0)
+        assert isinstance(error, httpx.HTTPStatusError)
+        assert manager._refresh_5xx_since == 5_000.0
+
+    @pytest.mark.asyncio
+    async def test_sso_oidc_5xx_never_escalates(self):
+        """Scope: only Kiro Desktop /refreshToken is suspected; OIDC 5xx is an outage."""
+        manager = _sso_manager()
+        for now in (1_000.0, 1_000.0 + KIRO_DESKTOP_REFRESH_5XX_SUSPECT_AFTER_S * 2):
+            patcher, _ = _patched_async_client(
+                [_status_response(500, "https://oidc.us-east-1.amazonaws.com/token")]
+            )
+            try:
+                with patch("kiro.auth.time.time", return_value=now):
+                    with pytest.raises(httpx.HTTPStatusError):
+                        await manager._refresh_token_request()
+            finally:
+                patcher.stop()

@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from pathlib import Path
@@ -48,6 +49,7 @@ from kiro.config import (
     get_kiro_q_host,
     get_aws_sso_oidc_url,
 )
+from kiro.network_errors import normalize_os_error
 from kiro.utils import get_machine_fingerprint
 from kiro.proxy import resolve_proxy
 from kiro.profile_discovery import (
@@ -70,6 +72,125 @@ SQLITE_REGISTRATION_KEYS = [
     "kirocli:odic:device-registration",
     "codewhisperer:odic:device-registration",
 ]
+
+
+# Kiro Desktop's /refreshToken answers HTTP 5xx indefinitely for some revoked or
+# corrupted refresh tokens instead of a 4xx (Sentry KIRO-GATEWAY-TRAY-2B: one
+# user, 644 consecutive 500s over ~11 hours). A genuine Kiro auth outage does not
+# last this long, so once 5xx persists past this window the failure is treated
+# as "credentials suspected invalid" and the user is asked to sign in again.
+KIRO_DESKTOP_REFRESH_5XX_SUSPECT_AFTER_S = 3600.0
+
+# Message carried by RefreshCredentialsSuspectError. Contains the
+# "token expired and refresh failed" marker that kiro.auth_state.is_auth_failure
+# recognizes, so every surface (/usage, chat, health) routes it to re-login.
+REFRESH_SUSPECT_MESSAGE = (
+    "Token expired and refresh failed: Kiro auth server kept returning HTTP {status} "
+    "for over {hours:g}h, so the saved Kiro credentials are likely invalid. "
+    "Open Kiro (or run 'kiro-cli login') and sign in again."
+)
+
+
+class RefreshCredentialsSuspectError(ValueError):
+    """Kiro Desktop refresh has failed with 5xx long enough to suspect credentials.
+
+    Subclasses ``ValueError`` because that is the established contract for
+    "refresh is unrecoverable" (see :func:`kiro.auth_state.is_auth_failure`).
+
+    Attributes:
+        status_code: Last upstream HTTP status seen from /refreshToken.
+        failing_for_s: Seconds since the first 5xx of the current streak.
+    """
+
+    def __init__(self, status_code: int, failing_for_s: float) -> None:
+        """Build the error with an actionable re-login message.
+
+        Args:
+            status_code: Last upstream 5xx status.
+            failing_for_s: Duration of the 5xx streak in seconds.
+        """
+        super().__init__(
+            REFRESH_SUSPECT_MESSAGE.format(
+                status=status_code,
+                hours=KIRO_DESKTOP_REFRESH_5XX_SUSPECT_AFTER_S / 3600.0,
+            )
+        )
+        self.status_code = status_code
+        self.failing_for_s = failing_for_s
+
+
+async def post_refresh_request(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    json_body: dict,
+    headers: dict,
+) -> httpx.Response:
+    """POST a token refresh request, normalizing raw socket/TLS errors.
+
+    httpcore leaves ``ssl.SSLError`` raised while *reading* the response
+    unmapped, so ``DECRYPTION_FAILED_OR_BAD_RECORD_MAC`` behind an HTTP proxy
+    escaped ``client.post`` as a raw ``SSLError`` and turned GET /usage into
+    HTTP 500 (Sentry KIRO-GATEWAY-TRAY-2D). Converting it to an httpx transport
+    error lets every caller's existing ``httpx.HTTPError`` handling apply.
+
+    Args:
+        client: Open httpx client.
+        url: Refresh endpoint URL.
+        json_body: JSON payload.
+        headers: Request headers.
+
+    Returns:
+        The refresh endpoint response.
+
+    Raises:
+        httpx.TransportError: When the transport raised a raw ``OSError``.
+        httpx.HTTPError: Propagated unchanged from httpx.
+    """
+    try:
+        return await client.post(url, json=json_body, headers=headers)
+    except OSError as error:
+        normalized = normalize_os_error(error, httpx.Request("POST", url))
+        logger.warning(
+            "Token refresh transport error normalized {} -> {}: {}",
+            type(error).__name__,
+            type(normalized).__name__,
+            error,
+        )
+        raise normalized from error
+
+
+def parse_refresh_json(response: httpx.Response, url: str) -> dict:
+    """Parse a refresh endpoint body, mapping non-JSON bodies to an httpx error.
+
+    A 200 with an HTML body (captive portal, proxy login page) makes
+    ``response.json()`` raise ``json.JSONDecodeError``. That is a ``ValueError``,
+    which every caller reads as "refresh is unrecoverable, sign in again" — the
+    wrong advice for a network interception. Raising ``httpx.DecodingError``
+    routes it through network error handling instead.
+
+    Args:
+        response: Refresh endpoint response with a 2xx status.
+        url: Endpoint URL, used to build the error's request.
+
+    Returns:
+        Parsed JSON object.
+
+    Raises:
+        httpx.DecodingError: When the body is not valid JSON.
+    """
+    try:
+        return response.json()
+    except json.JSONDecodeError as error:
+        logger.warning(
+            "Token refresh returned a non-JSON body (proxy or captive portal?): {}",
+            error,
+        )
+        raise httpx.DecodingError(
+            f"Token refresh response from {url} is not JSON; a proxy, captive "
+            "portal, or firewall may be intercepting the request",
+            request=httpx.Request("POST", url),
+        ) from error
 
 
 class AuthType(Enum):
@@ -181,6 +302,10 @@ class KiroAuthManager:
         self._access_token: Optional[str] = None
         self._expires_at: Optional[datetime] = None
         self._lock = asyncio.Lock()
+        # Wall-clock start of the current Kiro Desktop /refreshToken 5xx streak
+        # (None when the last refresh did not end in 5xx). See
+        # KIRO_DESKTOP_REFRESH_5XX_SUSPECT_AFTER_S.
+        self._refresh_5xx_since: Optional[float] = None
         
         # Auth type will be determined after loading credentials
         self._auth_type: AuthType = AuthType.KIRO_DESKTOP
@@ -771,9 +896,16 @@ class KiroAuthManager:
         }
         
         async with httpx.AsyncClient(timeout=30, proxy=resolve_proxy()) as client:
-            response = await client.post(self._refresh_url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+            response = await post_refresh_request(
+                client, self._refresh_url, json_body=payload, headers=headers
+            )
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                self._note_desktop_refresh_status(error)
+                raise
+            self._refresh_5xx_since = None
+            data = parse_refresh_json(response, self._refresh_url)
         
         new_access_token = data.get("accessToken")
         new_refresh_token = data.get("refreshToken")
@@ -806,6 +938,46 @@ class KiroAuthManager:
         else:
             self._save_credentials_to_file()
     
+    def _note_desktop_refresh_status(self, error: httpx.HTTPStatusError) -> None:
+        """Track the Kiro Desktop /refreshToken 5xx streak and escalate when stale.
+
+        Non-5xx statuses end the streak (4xx is already a credential failure).
+        A 5xx starts or continues it; once it has lasted at least
+        ``KIRO_DESKTOP_REFRESH_5XX_SUSPECT_AFTER_S`` the failure is re-raised as
+        :class:`RefreshCredentialsSuspectError` so callers prompt for re-login
+        instead of reporting an endless "outage" (Sentry KIRO-GATEWAY-TRAY-2B).
+
+        Args:
+            error: Status error raised by ``raise_for_status``.
+
+        Raises:
+            RefreshCredentialsSuspectError: When the 5xx streak is old enough.
+        """
+        status = error.response.status_code
+        if not 500 <= status < 600:
+            self._refresh_5xx_since = None
+            return
+        now = time.time()
+        if self._refresh_5xx_since is None or self._refresh_5xx_since > now:
+            # Start (or restart after a backwards clock jump) the streak.
+            self._refresh_5xx_since = now
+            return
+        failing_for = now - self._refresh_5xx_since
+        if failing_for < KIRO_DESKTOP_REFRESH_5XX_SUSPECT_AFTER_S:
+            logger.debug(
+                "Kiro Desktop refresh 5xx streak at {:.0f}s (suspect after {:.0f}s)",
+                failing_for,
+                KIRO_DESKTOP_REFRESH_5XX_SUSPECT_AFTER_S,
+            )
+            return
+        logger.warning(
+            "Kiro Desktop refresh returned HTTP {} for {:.0f}s; treating saved "
+            "credentials as invalid and asking the user to sign in again",
+            status,
+            failing_for,
+        )
+        raise RefreshCredentialsSuspectError(status, failing_for) from error
+
     async def _refresh_token_aws_sso_oidc(self) -> None:
         """
         Refreshes token using AWS SSO OIDC endpoint.
@@ -889,7 +1061,9 @@ class KiroAuthManager:
                      f"api_region={self._region}, client_id={self._client_id[:8]}...")
         
         async with httpx.AsyncClient(timeout=30, proxy=resolve_proxy()) as client:
-            response = await client.post(url, json=payload, headers=headers)
+            response = await post_refresh_request(
+                client, url, json_body=payload, headers=headers
+            )
             
             # Log response details for debugging (especially on errors)
             if response.status_code != 200:
@@ -907,7 +1081,7 @@ class KiroAuthManager:
                     pass  # Body wasn't JSON, already logged as text
                 response.raise_for_status()
             
-            result = response.json()
+            result = parse_refresh_json(response, url)
         
         # AWS SSO OIDC CreateToken API returns camelCase fields
         new_access_token = result.get("accessToken")

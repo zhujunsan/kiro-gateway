@@ -20,11 +20,17 @@ import asyncio
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 from fastapi.responses import JSONResponse
 from loguru import logger
+
+from kiro.network_errors import (
+    TLS_HANDSHAKE_HINT,
+    is_tls_handshake_failure,
+    normalize_os_error,
+)
 
 from kiro.auth_state import (
     USAGE_AUTH_REQUIRED_CODE,
@@ -39,7 +45,7 @@ USAGE_UPSTREAM_MAX_ATTEMPTS = 3
 USAGE_UPSTREAM_BASE_DELAY_S = 0.4
 USAGE_UPSTREAM_MAX_DELAY_S = 2.5
 
-# Escalate to Sentry only after a sustained failure streak, then cooldown.
+# A failure streak becomes an outage episode only once it is sustained.
 #
 # Both gates below must hold at once (AND) — see
 # :meth:`UsageUpstreamMonitor.note_failure` for why. The tray polls ``/usage``
@@ -58,8 +64,22 @@ USAGE_UPSTREAM_MAX_DELAY_S = 2.5
 # the duration gate instead, so escalation stays time-based for everyone.
 USAGE_OUTAGE_CONSECUTIVE_THRESHOLD = 5
 USAGE_OUTAGE_DURATION_S = 300.0
-# While an outage persists, report at most once per 15 minutes per process.
-USAGE_OUTAGE_REPORT_COOLDOWN_S = 900.0
+
+# Reporting is state-change based, not periodic. A sustained streak opens one
+# "outage episode"; the episode closes on the next success. The previous model
+# re-reported every 15 minutes while an outage persisted, so a single offline
+# user produced 42 events with ``consecutive=644`` (Sentry KIRO-GATEWAY-TRAY-2B)
+# and 43 with ``consecutive=643`` (KIRO-GATEWAY-TRAY-22) without new information.
+#
+# Causes the gateway cannot fix — the user's link to AWS is broken (TLS
+# interception or regional blocking, DNS, timeouts, refused connections) — never
+# open a Sentry Issue: they are recorded as breadcrumbs so they still give
+# context to any later real error. Only causes that may indicate a gateway or
+# upstream problem open an Issue, once per episode.
+USAGE_OUTAGE_EXTERNAL_CAUSES = frozenset({"tls", "dns", "timeout", "connect"})
+
+# ``reason`` attached to soft-503 bodies when the TLS handshake was rejected.
+USAGE_TLS_HANDSHAKE_REASON = "tls_handshake"
 
 # Upstream HTTP statuses worth retrying (capacity / gateway blips).
 _RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
@@ -67,6 +87,35 @@ _RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
 # Upstream statuses meaning "this bearer token is not accepted" — a credential
 # problem the user must fix by signing in again, never a transient blip.
 _AUTH_REJECT_STATUS = frozenset({401, 403})
+
+
+def is_external_outage_cause(cause: str) -> bool:
+    """Return whether an outage cause is outside the gateway's control.
+
+    Args:
+        cause: Tag from :func:`kiro.auth_state.transport_failure_reason`.
+
+    Returns:
+        True for ``tls``, ``dns``, ``timeout``, and ``connect``.
+    """
+    return cause in USAGE_OUTAGE_EXTERNAL_CAUSES
+
+
+@dataclass(frozen=True)
+class UsageOutageRecovery:
+    """Snapshot of an outage episode that just ended with a success.
+
+    Attributes:
+        cause: Cause tag recorded when the episode opened.
+        issue_reported: Whether this episode opened a Sentry Issue.
+        consecutive_failures: Failures in the streak that just ended.
+        duration_s: Seconds from the first failure to the recovering success.
+    """
+
+    cause: str
+    issue_reported: bool
+    consecutive_failures: int
+    duration_s: float
 
 
 @dataclass
@@ -105,8 +154,11 @@ class UsageUpstreamMonitor:
         self._clock = clock
         self._consecutive_failures = 0
         self._first_failure_at: Optional[float] = None
-        self._last_report_at: Optional[float] = None
         self._auth_reported = False
+        # Outage episode state (see USAGE_OUTAGE_EXTERNAL_CAUSES).
+        self._outage_open = False
+        self._outage_cause: Optional[str] = None
+        self._outage_issue_reported = False
         self._lock = asyncio.Lock()
 
     @property
@@ -114,12 +166,55 @@ class UsageUpstreamMonitor:
         """Return the current consecutive soft-failure count."""
         return self._consecutive_failures
 
-    async def note_success(self) -> None:
-        """Reset the failure streak after a successful upstream read."""
+    @property
+    def outage_open(self) -> bool:
+        """Return whether a sustained outage episode is currently open."""
+        return self._outage_open
+
+    @property
+    def outage_issue_reported(self) -> bool:
+        """Return whether the open episode opened a Sentry Issue.
+
+        Decided once, from the cause that opened the episode: external causes
+        (see :data:`USAGE_OUTAGE_EXTERNAL_CAUSES`) never open one.
+        """
+        return self._outage_issue_reported
+
+    @property
+    def outage_cause(self) -> Optional[str]:
+        """Return the cause recorded when the open episode started, if any."""
+        return self._outage_cause
+
+    async def note_success(
+        self, *, now: Optional[float] = None
+    ) -> Optional[UsageOutageRecovery]:
+        """Reset the failure streak after a successful upstream read.
+
+        Args:
+            now: Optional wall-clock timestamp; injectable for tests.
+
+        Returns:
+            A :class:`UsageOutageRecovery` when this success closes an open
+            outage episode, otherwise ``None``.
+        """
+        ts = self._clock() if now is None else now
         async with self._lock:
+            recovery: Optional[UsageOutageRecovery] = None
+            if self._outage_open:
+                started = self._first_failure_at if self._first_failure_at is not None else ts
+                recovery = UsageOutageRecovery(
+                    cause=self._outage_cause or "other",
+                    issue_reported=self._outage_issue_reported,
+                    consecutive_failures=self._consecutive_failures,
+                    duration_s=max(0.0, ts - started),
+                )
             self._consecutive_failures = 0
             self._first_failure_at = None
             self._auth_reported = False
+            self._outage_open = False
+            self._outage_cause = None
+            self._outage_issue_reported = False
+            return recovery
 
     async def note_auth_failure(self) -> bool:
         """Record a credential failure and decide whether to report it once.
@@ -138,8 +233,13 @@ class UsageUpstreamMonitor:
             self._auth_reported = True
             return True
 
-    async def note_failure(self, *, now: Optional[float] = None) -> bool:
-        """Record a soft failure and decide whether to report an outage.
+    async def note_failure(
+        self,
+        *,
+        now: Optional[float] = None,
+        cause: str = "other",
+    ) -> bool:
+        """Record a soft failure and report whether it opens an outage episode.
 
         A failure counts as sustained only when the streak clears **both** the
         count gate and the duration gate. The two conditions are ANDed, not ORed.
@@ -165,11 +265,16 @@ class UsageUpstreamMonitor:
                 injectable for tests. Non-monotonic values are tolerated: a
                 backwards jump clamps the measured duration to zero instead of
                 producing a negative window.
+            cause: Cause tag of this failure. When this call opens an episode,
+                the cause is recorded atomically and decides
+                :attr:`outage_issue_reported` for the whole episode; a later
+                cause change does not reopen or reclassify it.
 
         Returns:
-            ``True`` when this failure should trigger a Sentry/outage report,
-            i.e. both thresholds are met (``>=``, inclusive) and the previous
-            report is older than ``USAGE_OUTAGE_REPORT_COOLDOWN_S``.
+            ``True`` exactly once per episode: for the failure at which both
+            thresholds are first met (``>=``, inclusive). Later failures in the
+            same episode return ``False`` until :meth:`note_success` closes it;
+            there is no periodic re-report.
         """
         ts = self._clock() if now is None else now
         async with self._lock:
@@ -198,12 +303,12 @@ class UsageUpstreamMonitor:
                     USAGE_OUTAGE_DURATION_S,
                 )
                 return False
-            if (
-                self._last_report_at is not None
-                and ts - self._last_report_at < USAGE_OUTAGE_REPORT_COOLDOWN_S
-            ):
+            if self._outage_open:
+                # Ongoing episode: no new state change.
                 return False
-            self._last_report_at = ts
+            self._outage_open = True
+            self._outage_cause = cause
+            self._outage_issue_reported = not is_external_outage_cause(cause)
             return True
 
 
@@ -224,21 +329,26 @@ def build_usage_network_error_response(exc: BaseException) -> JSONResponse:
         "Unable to reach Amazon Q usage API (network/proxy). "
         "Quota display will refresh when connectivity recovers."
     )
+    error: dict[str, Any] = {
+        "message": message,
+        "type": "usage_upstream_unreachable",
+        "code": "usage_upstream_unreachable",
+    }
+    if is_tls_handshake_failure(exc):
+        # Deterministic block (proxy/firewall/regional filtering): waiting will
+        # not help, so tell the user what to check. Code stays the same so
+        # existing clients keep treating it as a soft miss.
+        error["message"] = (
+            "Unable to reach Amazon Q usage API: the secure (TLS) connection was "
+            f"rejected. {TLS_HANDSHAKE_HINT}."
+        )
+        error["reason"] = USAGE_TLS_HANDSHAKE_REASON
     logger.debug(
         "GET /usage returning soft 503 after retries: {}: {}",
         type(exc).__name__,
         exc,
     )
-    return JSONResponse(
-        status_code=503,
-        content={
-            "error": {
-                "message": message,
-                "type": "usage_upstream_unreachable",
-                "code": "usage_upstream_unreachable",
-            }
-        },
-    )
+    return JSONResponse(status_code=503, content={"error": error})
 
 
 def build_usage_account_unavailable_response() -> JSONResponse:
@@ -338,13 +448,7 @@ async def finalize_usage_transport_failure(
             report_usage_auth_required(exc)
         return build_usage_auth_required_response(exc)
 
-    should_report = await mon.note_failure()
-    if should_report:
-        report_usage_outage(
-            exc,
-            consecutive=mon.consecutive_failures,
-            attempts=attempts,
-        )
+    await note_usage_failure(exc, attempts=attempts, monitor=mon)
     return build_usage_network_error_response(exc)
 
 
@@ -352,6 +456,7 @@ async def obtain_usage_access_token(
     auth: Any,
     *,
     monitor: Optional[UsageUpstreamMonitor] = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> tuple[Optional[str], Optional[JSONResponse]]:
     """Resolve a bearer token for GET /usage without raising.
 
@@ -365,30 +470,77 @@ async def obtain_usage_access_token(
       the user signs in again, so they return 401 ``usage_auth_required``.
 
     ``ValueError`` used to propagate and surface as HTTP 500; it is a signed-out
-    user, not a gateway bug.
+    user, not a gateway bug. Raw ``OSError`` / ``ssl.SSLError`` are normalized
+    to httpx transport errors for the same reason.
+
+    Transport errors and upstream 5xx are retried with the same bounded backoff
+    as getUsageLimits (``USAGE_UPSTREAM_MAX_ATTEMPTS`` attempts in total);
+    credential failures are never retried. Only the final outcome counts toward
+    the outage streak.
 
     Args:
         auth: Initialized ``KiroAuthManager`` (duck-typed: ``get_access_token``).
         monitor: Optional outage monitor override for tests.
+        sleep: Awaitable sleep between retries (injectable for tests).
 
     Returns:
         ``(token, None)`` on success, or ``(None, error_response)`` where the
         response is 401 for credential failures and 503 for transport failures.
     """
-    try:
-        token = await auth.get_access_token()
-    except (httpx.HTTPError, ValueError) as exc:
+    last_error: Optional[BaseException] = None
+    attempts = 0
+    for attempt in range(USAGE_UPSTREAM_MAX_ATTEMPTS):
+        attempts = attempt + 1
+        try:
+            return await auth.get_access_token(), None
+        except OSError as raw:
+            # Second line of defense: kiro.auth normalizes raw socket/TLS errors,
+            # but a duck-typed or future auth path might not (Sentry
+            # KIRO-GATEWAY-TRAY-2D surfaced a raw SSLError as HTTP 500).
+            exc: BaseException = normalize_os_error(raw)
+            exc.__cause__ = raw
+        except (httpx.HTTPError, ValueError) as caught:
+            exc = caught
+        last_error = exc
         logger.debug(
-            "GET /usage token refresh failed: {}: {}",
+            "GET /usage token refresh attempt {}/{} failed: {}: {}",
+            attempts,
+            USAGE_UPSTREAM_MAX_ATTEMPTS,
             type(exc).__name__,
             exc,
         )
-        return None, await finalize_usage_transport_failure(
-            exc,
-            attempts=1,
-            monitor=monitor,
-        )
-    return token, None
+        if not _is_retryable_token_error(exc):
+            break
+        if attempt + 1 >= USAGE_UPSTREAM_MAX_ATTEMPTS:
+            break
+        await sleep(_retry_delay_seconds(attempt))
+
+    assert last_error is not None
+    return None, await finalize_usage_transport_failure(
+        last_error,
+        attempts=attempts,
+        monitor=monitor,
+    )
+
+
+def _is_retryable_token_error(exc: BaseException) -> bool:
+    """Return whether a token refresh failure is worth retrying within one poll.
+
+    Only transport failures and upstream 5xx are transient. Credential failures
+    (4xx, ``ValueError`` after refresh is unrecoverable) repeat identically, and
+    malformed bodies (``httpx.DecodingError``) are not fixed by resending.
+
+    Args:
+        exc: Error raised by ``auth.get_access_token()``.
+
+    Returns:
+        True for ``httpx.TransportError`` and ``HTTPStatusError`` with 5xx.
+    """
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return 500 <= exc.response.status_code < 600
+    return False
 
 
 def _retry_delay_seconds(attempt_index: int) -> float:
@@ -440,25 +592,54 @@ def report_usage_auth_required(exc: BaseException) -> None:
         logger.debug("GET /usage auth breadcrumb skipped: {}", report_exc)
 
 
+def _add_usage_breadcrumb(*, level: str, message: str, data: dict[str, Any]) -> None:
+    """Attach a ``usage`` breadcrumb to the current Sentry scope, if available.
+
+    Breadcrumbs are never sent on their own; they only give context to a later
+    event. Never raises.
+
+    Args:
+        level: Sentry level name (``"info"``, ``"warning"``, ...).
+        message: Human-readable summary.
+        data: Structured details (no secrets).
+    """
+    try:
+        import sentry_sdk
+    except ImportError:
+        return
+    try:
+        sentry_sdk.add_breadcrumb(
+            category="usage", level=level, message=message, data=data
+        )
+    except Exception as report_exc:  # noqa: BLE001 — never break /usage on reporter failure
+        logger.debug("GET /usage breadcrumb skipped: {}", report_exc)
+
+
 def report_usage_outage(
     exc: BaseException,
     *,
     consecutive: int,
     attempts: int,
 ) -> None:
-    """Best-effort Sentry/log escalation for sustained /usage outages.
+    """Open one Sentry Issue for the start of a sustained /usage outage.
 
-    Occasional failures stay at DEBUG/soft-503 only. When the monitor says the
-    streak looks like an outage, emit one warning log and one Sentry event
-    (if the SDK is initialized). Never raises.
+    Called once per outage episode, only for causes the gateway may be able to
+    fix (``upstream_status``, ``other``; see
+    :data:`USAGE_OUTAGE_EXTERNAL_CAUSES`). External causes go through
+    :func:`record_usage_outage_breadcrumb` instead. Never raises.
 
-    The fingerprint includes the failure cause so DNS, TLS, timeout, and proxy
-    failures form separate Issues; a single shared fingerprint previously made
-    them impossible to triage apart.
+    The fingerprint includes the failure cause so different causes form separate
+    Issues; a single shared fingerprint previously made them impossible to
+    triage apart.
+
+    Args:
+        exc: Error that completed the sustained streak.
+        consecutive: Failures in the streak so far.
+        attempts: Attempts made by the request that opened the episode.
     """
     cause = transport_failure_reason(exc)
     logger.warning(
-        "GET /usage upstream outage after {} consecutive soft failures "
+        "GET /usage upstream outage started after {} consecutive soft failures "
         "(cause={}, last request attempts={}): {}: {}",
         consecutive,
         cause,
@@ -485,6 +666,135 @@ def report_usage_outage(
             )
     except Exception as report_exc:  # noqa: BLE001 — never break /usage on reporter failure
         logger.debug("GET /usage outage report skipped: {}", report_exc)
+
+
+def record_usage_outage_breadcrumb(
+    exc: BaseException,
+    *,
+    consecutive: int,
+    attempts: int,
+    phase: str,
+) -> None:
+    """Record an outage state as a breadcrumb only (no Sentry event).
+
+    Used for every failure of an episode opened by an external cause, and for
+    every failure after the opening one in any episode.
+
+    The local log is INFO, deliberately not WARNING: the tray ships WARNING+
+    loguru records to Sentry Logs, and an external outage must stay out of
+    Sentry entirely apart from this breadcrumb.
+
+    Args:
+        exc: Latest failure.
+        consecutive: Failures in the streak so far.
+        attempts: Attempts made by the latest request.
+        phase: ``"started"`` for the opening failure, ``"ongoing"`` afterwards.
+    """
+    cause = transport_failure_reason(exc)
+    logger.info(
+        "GET /usage upstream outage {} (cause={}, consecutive={}, attempts={}): {}: {}",
+        phase,
+        cause,
+        consecutive,
+        attempts,
+        type(exc).__name__,
+        exc,
+    )
+    _add_usage_breadcrumb(
+        level="warning",
+        message=f"GET /usage upstream outage {phase}",
+        data={
+            "cause": cause,
+            "external": is_external_outage_cause(cause),
+            "consecutive_failures": consecutive,
+            "request_attempts": attempts,
+            "error": type(exc).__name__,
+        },
+    )
+
+
+def report_usage_outage_recovered(recovery: UsageOutageRecovery) -> None:
+    """Record that an outage episode ended (log + info breadcrumb, no event).
+
+    Recovery is logged for every episode, including external ones, so the
+    breadcrumb trail shows both ends of the outage. It is never sent as a Sentry
+    event: ``capture_message(level="info")`` would create or update an Issue,
+    which contradicts "external causes never open an Issue".
+
+    Args:
+        recovery: Snapshot of the episode that just closed.
+    """
+    logger.info(
+        "GET /usage upstream recovered after {} consecutive failures over {:.0f}s "
+        "(cause={}, issue_reported={})",
+        recovery.consecutive_failures,
+        recovery.duration_s,
+        recovery.cause,
+        recovery.issue_reported,
+    )
+    _add_usage_breadcrumb(
+        level="info",
+        message="GET /usage upstream recovered",
+        data={
+            "cause": recovery.cause,
+            "external": is_external_outage_cause(recovery.cause),
+            "issue_reported": recovery.issue_reported,
+            "consecutive_failures": recovery.consecutive_failures,
+            "duration_s": round(recovery.duration_s, 1),
+        },
+    )
+
+
+async def note_usage_failure(
+    exc: BaseException,
+    *,
+    attempts: int,
+    monitor: UsageUpstreamMonitor,
+) -> bool:
+    """Feed one soft failure to the monitor and emit the matching signal.
+
+    Single entry point for the token-refresh path and both getUsageLimits
+    exhaustion paths, so every caller follows the same state-change policy:
+
+    * not yet sustained -> DEBUG only (inside the monitor);
+    * episode opens with a non-external cause -> one Sentry Issue;
+    * episode opens with an external cause -> breadcrumb only;
+    * episode ongoing -> breadcrumb only.
+
+    Args:
+        exc: Transport or upstream-status error that ended the request.
+        attempts: Attempts made by this request.
+        monitor: Failure-streak monitor.
+
+    Returns:
+        True only when this failure opened a Sentry Issue.
+    """
+    cause = transport_failure_reason(exc)
+    opened = await monitor.note_failure(cause=cause)
+    if not monitor.outage_open:
+        return False
+    consecutive = monitor.consecutive_failures
+    if opened and monitor.outage_issue_reported:
+        report_usage_outage(exc, consecutive=consecutive, attempts=attempts)
+        return True
+    record_usage_outage_breadcrumb(
+        exc,
+        consecutive=consecutive,
+        attempts=attempts,
+        phase="started" if opened else "ongoing",
+    )
+    return False
+
+
+async def note_usage_success(monitor: UsageUpstreamMonitor) -> None:
+    """Reset the monitor after a success and report a recovery if one occurred.
+
+    Args:
+        monitor: Failure-streak monitor.
+    """
+    recovery = await monitor.note_success()
+    if recovery is not None:
+        report_usage_outage_recovered(recovery)
 
 
 async def fetch_usage_limits(
@@ -524,7 +834,13 @@ async def fetch_usage_limits(
             else:
                 async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
                     resp = await client.get(url, headers=headers)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, OSError) as caught:
+            if isinstance(caught, OSError):
+                # Raw socket/TLS error escaped httpx (read-path SSLError).
+                exc = normalize_os_error(caught)
+                exc.__cause__ = caught
+            else:
+                exc = caught
             last_error = exc
             logger.debug(
                 "GET /usage attempt {}/{} transport error: {}: {}",
@@ -539,7 +855,7 @@ async def fetch_usage_limits(
             continue
 
         if resp.status_code == 200:
-            await mon.note_success()
+            await note_usage_success(mon)
             return UsageFetchResult(
                 response=resp,
                 error=None,
@@ -567,7 +883,7 @@ async def fetch_usage_limits(
                 )
             # Other non-retryable statuses (e.g. 400 validation) are forwarded
             # as-is; they are upstream feedback, not connectivity failures.
-            await mon.note_success()
+            await note_usage_success(mon)
             return UsageFetchResult(
                 response=resp,
                 error=None,
@@ -588,13 +904,9 @@ async def fetch_usage_limits(
         )
         if attempt + 1 >= USAGE_UPSTREAM_MAX_ATTEMPTS:
             # Return the last response so callers can forward status/body.
-            should_report = await mon.note_failure()
-            if should_report:
-                report_usage_outage(
-                    last_error,
-                    consecutive=mon.consecutive_failures,
-                    attempts=attempts,
-                )
+            should_report = await note_usage_failure(
+                last_error, attempts=attempts, monitor=mon
+            )
             return UsageFetchResult(
                 response=resp,
                 error=last_error,
@@ -604,13 +916,7 @@ async def fetch_usage_limits(
         await sleep(_retry_delay_seconds(attempt))
 
     assert last_error is not None
-    should_report = await mon.note_failure()
-    if should_report:
-        report_usage_outage(
-            last_error,
-            consecutive=mon.consecutive_failures,
-            attempts=attempts,
-        )
+    should_report = await note_usage_failure(last_error, attempts=attempts, monitor=mon)
     return UsageFetchResult(
         response=None,
         error=last_error,

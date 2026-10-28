@@ -3031,3 +3031,58 @@ class TestAnthropicNetworkErrors:
         assert response.status_code == 503
         assert response.json()["type"] == "error"
         assert "pool" in response.json()["error"]["message"].lower()
+
+
+
+# =============================================================================
+# Raw ssl.SSLError from the transport (Sentry KIRO-GATEWAY-TRAY-2D)
+# =============================================================================
+
+import ssl as _ssl
+
+_BAD_MAC_SSL_ERROR = "[SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac"
+
+
+class TestAnthropicMessagesRawSslError:
+    """Anthropic messages must not 500 on a raw read-path SSLError.
+
+    Uses the real ``KiroHttpClient`` with only the httpx client mocked, so the
+    normalization in ``request_with_retry`` is exercised end to end.
+    """
+
+    @pytest.mark.parametrize("account_system", [False, True])
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_raw_ssl_error_returns_502_not_500(
+        self, test_client, valid_proxy_api_key, stream, account_system
+    ):
+        """Raw SSLError from request()/send() must become a protocol-shaped 502."""
+        import httpx
+
+        transport = Mock()
+        transport.is_closed = False
+        transport.request = AsyncMock(side_effect=_ssl.SSLError(1, _BAD_MAC_SSL_ERROR))
+        transport.send = AsyncMock(side_effect=_ssl.SSLError(1, _BAD_MAC_SSL_ERROR))
+        transport.build_request = Mock(return_value=httpx.Request("POST", "https://kiro.test"))
+        transport.aclose = AsyncMock()
+        original_mode = test_client.app.state.account_system
+        test_client.app.state.account_system = account_system
+        try:
+            with patch("kiro.http_client.KiroHttpClient._get_client", new=AsyncMock(return_value=transport)), \
+                 patch("kiro.auth.KiroAuthManager.get_access_token", new=AsyncMock(return_value="tok")), \
+                 patch("kiro.http_client.get_kiro_headers", return_value={}), \
+                 patch("kiro.http_client.asyncio.sleep", new=AsyncMock()):
+                response = test_client.post(
+                    "/v1/messages",
+                    headers={"x-api-key": valid_proxy_api_key},
+                    json={**{"model": "claude-sonnet-4-5", "max_tokens": 32, "messages": [{"role": "user", "content": "hello"}]}, "stream": stream},
+                )
+        finally:
+            test_client.app.state.account_system = original_mode
+
+        assert response.status_code == 502
+        assert "Internal Server Error" not in response.text
+        assert "_ssl.c" not in response.text
+        payload = response.json()
+        assert payload["type"] == "error"
+        assert payload["error"]["type"] == "api_error"
+        assert "proxy" in payload["error"]["message"]

@@ -12,7 +12,7 @@ Tests for shared conversion logic used by both OpenAI and Anthropic adapters:
 """
 
 from copy import deepcopy
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import os
 import re
 import pytest
@@ -2824,6 +2824,72 @@ class TestToolSchemaCompatibility:
         with pytest.raises(ValueError, match="only property name strings"):
             sanitize_json_schema({"required": required})
 
+    @pytest.mark.parametrize("dialect", [
+        "http://json-schema.org/draft-07/schema#",
+        "https://json-schema.org/draft/2019-09/schema",
+        "https://json-schema.org/draft/2020-12/schema",
+    ])
+    @pytest.mark.parametrize("keyword", ["allOf", "anyOf", "oneOf"])
+    def test_root_dialect_survives_lossless_composition(self, dialect: str, keyword: str) -> None:
+        """Keep the document dialect while flattening constraints without input mutation."""
+        schema = {
+            "$schema": dialect,
+            "type": "object",
+            "properties": {"agent_id": {"type": "string"}},
+            "required": ["agent_id"],
+            keyword: [{
+                "allOf": [{
+                    "properties": {"root": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+                    "required": ["root"],
+                }],
+            }],
+        }
+        before = deepcopy(schema)
+
+        result = sanitize_json_schema(schema)
+
+        assert result == {
+            "$schema": dialect,
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string"},
+                "root": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            },
+            "required": ["agent_id", "root"],
+        }
+        assert schema == before
+        result["properties"]["agent_id"]["type"] = "integer"
+        assert schema == before
+
+    @pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
+    def test_root_dialect_does_not_bypass_alternative_guard(self, keyword: str) -> None:
+        """A dialect declaration never authorizes discarding alternative branches."""
+        schema = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            keyword: [{"required": ["agent_id"]}, {"required": ["root"]}],
+        }
+        before = deepcopy(schema)
+        with pytest.raises(ValueError, match="multiple alternatives"):
+            sanitize_json_schema(schema)
+        assert schema == before
+
+    @pytest.mark.parametrize("root_dialect", [None, "http://json-schema.org/draft-07/schema#"])
+    @pytest.mark.parametrize("branch_dialect", [
+        "http://json-schema.org/draft-07/schema#",
+        "https://json-schema.org/draft/2020-12/schema",
+    ])
+    def test_rejects_relocating_branch_dialect(
+        self, root_dialect: Optional[str], branch_dialect: str
+    ) -> None:
+        """Do not promote branch-local dialect declarations into document-wide settings."""
+        schema = {"allOf": [{"$schema": branch_dialect, "type": "object"}]}
+        if root_dialect is not None:
+            schema["$schema"] = root_dialect
+        before = deepcopy(schema)
+        with pytest.raises(ValueError, match=r"Cannot safely flatten.*\$schema"):
+            sanitize_json_schema(schema)
+        assert schema == before
+
     def test_required_union_preserves_names_and_order(self) -> None:
         """Union root and branch requirements, including duplicate/undeclared names."""
         schema = {"required": ["root", "root"], "allOf": [
@@ -2937,8 +3003,8 @@ class TestToolSchemaCompatibility:
 
     def test_keyword_property_names_and_instance_data_are_preserved(self) -> None:
         """Never treat property/definition names or example/default values as keywords."""
-        names = ["required", "additionalProperties", "allOf", "anyOf", "oneOf", "$ref"]
-        data = {"required": None, "additionalProperties": False, "allOf": []}
+        names = ["required", "additionalProperties", "allOf", "anyOf", "oneOf", "$ref", "$schema"]
+        data = {"required": None, "additionalProperties": False, "allOf": [], "$schema": "user data"}
         schema = {
             "allOf": [{"properties": {name: {"type": "string"} for name in names}}],
             "default": data, "examples": [data], "enum": [data],
@@ -3026,6 +3092,37 @@ class TestToolSchemaCompatibility:
                 "x": {"anyOf": [{"type": "string"}, {"type": "number"}]},
                 "y": {"type": "string"},
             },
+        }
+        assert schema == before
+
+    @pytest.mark.parametrize("api", ["openai", "anthropic", "responses"])
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("keyword", ["allOf", "anyOf", "oneOf"])
+    def test_api_payloads_preserve_root_dialect(
+        self, api: str, stream: bool, keyword: str
+    ) -> None:
+        """Accept document dialects in every API/mode while retaining tool constraints."""
+        schema = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {"agent_id": {"type": "string"}},
+            "required": ["agent_id"],
+            keyword: [{
+                "properties": {"root": {"type": "string"}},
+                "required": ["root"],
+            }],
+        }
+        before = deepcopy(schema)
+
+        payload = self._build_payload(api, stream, schema)
+
+        context = payload["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]
+        converted = context["tools"][0]["toolSpecification"]["inputSchema"]["json"]
+        assert converted == {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {"agent_id": {"type": "string"}, "root": {"type": "string"}},
+            "required": ["agent_id", "root"],
         }
         assert schema == before
 
