@@ -753,9 +753,12 @@ class TestAccountManagerInitializeAccount:
         assert account.model_resolver is not None
         assert account.model_discovery_attempted_at == 0.0
         assert account.model_discovery_succeeded is False
-        assert "gpt-5.6-sol" in account.model_cache.get_all_model_ids()
+        assert "gpt-5.6-terra" in account.model_cache.get_all_model_ids()
         assert "kiro-s-5" in account.model_resolver.get_available_models()
+        assert "kiro-s-5.5" in account.model_resolver.get_available_models()
         assert "kiro-o-5" in account.model_resolver.get_available_models()
+        assert "kiro-o-5.5" in account.model_resolver.get_available_models()
+        assert "kiro-kimi-k3" in account.model_resolver.get_available_models()
         assert "auto-kiro" not in account.model_resolver.get_available_models()
         # A successful init must leave no stale failure reason behind.
         assert account.last_init_error is None
@@ -1674,7 +1677,7 @@ class TestAccountManagerOnDemandModelDiscovery:
     @pytest.mark.asyncio
     async def test_first_list_request_discovers_then_cache_skips_four_hours(self, tmp_path):
         manager, account_id = await self._manager(tmp_path)
-        dynamic_ids = ["auto", "gpt-5.6-sol", "claude-sonnet-5", "claude-sonnet-4.5"]
+        dynamic_ids = ["auto", "gpt-5.6-terra", "claude-sonnet-5", "claude-sonnet-4.5"]
         with patch.object(
             manager, "_fetch_available_models",
             new=AsyncMock(return_value=[{"modelId": item} for item in dynamic_ids]),
@@ -1685,10 +1688,10 @@ class TestAccountManagerOnDemandModelDiscovery:
         assert fetch.await_count == 1
         assert first == second
         assert "auto" in first
-        assert "gpt-5.6-sol" in first
+        assert "gpt-5.6-terra" in first
         assert "kiro-s-5" in first
         assert "auto-kiro" not in first
-        assert "kiro-5.6-sol" not in first
+        assert "kiro-5.6-terra" not in first
         assert "claude-sonnet-4.5" not in first
         cache_ids = manager._accounts[account_id].model_cache.get_all_model_ids()
         assert set(cache_ids) == set(dynamic_ids)
@@ -1723,10 +1726,13 @@ class TestAccountManagerOnDemandModelDiscovery:
 
         assert fetch.await_count == 1
         assert first == second
-        assert "gpt-5.6-sol" in first
+        assert "gpt-5.6-terra" in first
         assert "auto" in first
         assert "kiro-s-5" in first
+        assert "kiro-s-5.5" in first
         assert "kiro-o-5" in first
+        assert "kiro-o-5.5" in first
+        assert "kiro-kimi-k3" in first
         assert "auto-kiro" not in first
         assert manager._accounts[account_id].model_discovery_succeeded is False
 
@@ -1734,7 +1740,7 @@ class TestAccountManagerOnDemandModelDiscovery:
     async def test_failed_expired_refresh_keeps_stale_and_throttles(self, tmp_path):
         manager, account_id = await self._manager(tmp_path)
         fetch = AsyncMock(side_effect=[
-            [{"modelId": "claude-sonnet-5"}, {"modelId": "gpt-5.6-sol"}],
+            [{"modelId": "claude-sonnet-5"}, {"modelId": "gpt-5.6-terra"}],
             ModelDiscoveryError("offline"),
         ])
         with patch.object(manager, "_fetch_available_models", new=fetch):

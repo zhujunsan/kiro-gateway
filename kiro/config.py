@@ -248,17 +248,19 @@ HIDDEN_MODELS: Dict[str, str] = {
 # Defined before MODEL_ALIASES so the static alias table can be derived from it.
 FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
-    {"modelId": "claude-sonnet-5"},
     {"modelId": "claude-haiku-4.5"},
     {"modelId": "claude-opus-4.6"},
     {"modelId": "claude-opus-5"},
-    {"modelId": "gpt-5.6-sol"},
-    {"modelId": "gpt-5.6-terra"},
-    {"modelId": "gpt-5.6-luna"},
+    {"modelId": "claude-opus-5.5"},
+    {"modelId": "claude-sonnet-5"},
+    {"modelId": "claude-sonnet-5.5"},
     {"modelId": "deepseek-3.2"},
     {"modelId": "glm-5"},
+    {"modelId": "kimi-k3"},
     {"modelId": "minimax-m2.5"},
     {"modelId": "qwen3-coder-next"},
+    {"modelId": "gpt-5.6-luna"},
+    {"modelId": "gpt-5.6-terra"},
 ]
 
 # ==================================================================================================
@@ -299,6 +301,7 @@ HIDDEN_FROM_LIST: List[str] = [
     "claude-sonnet-4",
     "claude-sonnet-4.5",
     "claude-sonnet-4.6",
+    "gpt-5.6-sol",
     "minimax-m2.1",
 ]
 

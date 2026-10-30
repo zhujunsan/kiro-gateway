@@ -30,6 +30,14 @@ def _efforts(info: dict) -> list[str]:
     [
         ("auto", ["text"], False, [], None, None),
         (
+            "claude-opus-5.5",
+            ["text", "image"],
+            True,
+            ["low", "medium", "high", "xhigh", "max"],
+            "medium",
+            1_000_000,
+        ),
+        (
             "claude-opus-5",
             ["text", "image"],
             True,
@@ -58,6 +66,14 @@ def _efforts(info: dict) -> list[str]:
             ["text", "image"],
             False,
             ["low", "medium", "high", "max"],
+            "medium",
+            1_000_000,
+        ),
+        (
+            "claude-sonnet-5.5",
+            ["text", "image"],
+            True,
+            ["low", "medium", "high", "xhigh", "max"],
             "medium",
             1_000_000,
         ),
@@ -111,6 +127,7 @@ def _efforts(info: dict) -> list[str]:
         ),
         ("deepseek-3.2", ["text"], False, [], None, 128_000),
         ("glm-5", ["text"], False, [], None, 200_000),
+        ("kimi-k3", ["text"], False, ["low", "high", "max"], "max", 256_000),
         ("minimax-m2.5", ["text"], False, [], None, 200_000),
         ("qwen3-coder-next", ["text"], False, [], None, 256_000),
     ],
@@ -154,12 +171,15 @@ def test_canonical_model_capabilities(
 @pytest.mark.parametrize(
     "alias,canonical",
     [
+        ("kiro-o-5.5", "claude-opus-5.5"),
         ("kiro-o-5", "claude-opus-5"),
         ("kiro-o-4.6", "claude-opus-4.6"),
+        ("kiro-s-5.5", "claude-sonnet-5.5"),
         ("kiro-s-5", "claude-sonnet-5"),
         ("kiro-h-4.5", "claude-haiku-4.5"),
         ("kiro-deepseek-3.2", "deepseek-3.2"),
         ("kiro-glm-5", "glm-5"),
+        ("kiro-kimi-k3", "kimi-k3"),
         ("kiro-minimax-m2.5", "minimax-m2.5"),
         ("kiro-qwen3-coder-next", "qwen3-coder-next"),
     ],

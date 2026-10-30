@@ -65,6 +65,7 @@ _LEVELS_OPUS_NEW = _reasoning_levels("low", "medium", "high", "xhigh", "max")
 _LEVELS_OPUS_46 = _reasoning_levels("low", "medium", "high", "max")
 _LEVELS_SONNET_46 = _reasoning_levels("low", "medium", "high", "max")
 _LEVELS_GPT_56 = _reasoning_levels("low", "medium", "high", "xhigh", "max")
+_LEVELS_KIMI_K3 = _reasoning_levels("low", "high", "max")
 
 # Per canonical modelId (after alias resolve). Values override stub defaults.
 # Keys: input_modalities, supports_image_detail_original,
@@ -78,6 +79,14 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "default_reasoning_level": None,
         "context_window": None,
         "max_context_window": None,
+    },
+    "claude-opus-5.5": {
+        "input_modalities": list(_TEXT_IMAGE),
+        "supports_image_detail_original": True,
+        "supported_reasoning_levels": list(_LEVELS_OPUS_NEW),
+        "default_reasoning_level": "medium",
+        "context_window": 1_000_000,
+        "max_context_window": 1_000_000,
     },
     "claude-opus-5": {
         "input_modalities": list(_TEXT_IMAGE),
@@ -107,6 +116,14 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "input_modalities": list(_TEXT_IMAGE),
         "supports_image_detail_original": False,
         "supported_reasoning_levels": list(_LEVELS_OPUS_46),
+        "default_reasoning_level": "medium",
+        "context_window": 1_000_000,
+        "max_context_window": 1_000_000,
+    },
+    "claude-sonnet-5.5": {
+        "input_modalities": list(_TEXT_IMAGE),
+        "supports_image_detail_original": True,
+        "supported_reasoning_levels": list(_LEVELS_OPUS_NEW),
         "default_reasoning_level": "medium",
         "context_window": 1_000_000,
         "max_context_window": 1_000_000,
@@ -174,6 +191,14 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "default_reasoning_level": None,
         "context_window": 200_000,
         "max_context_window": 200_000,
+    },
+    "kimi-k3": {
+        "input_modalities": list(_TEXT),
+        "supports_image_detail_original": False,
+        "supported_reasoning_levels": list(_LEVELS_KIMI_K3),
+        "default_reasoning_level": "max",
+        "context_window": 256_000,
+        "max_context_window": 256_000,
     },
     "minimax-m2.5": {
         "input_modalities": list(_TEXT),

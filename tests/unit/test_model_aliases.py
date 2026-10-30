@@ -18,13 +18,16 @@ class TestGenerateModelAlias:
     @pytest.mark.parametrize(
         "model_id,expected",
         [
+            ("claude-opus-5.5", "kiro-o-5.5"),
             ("claude-opus-5", "kiro-o-5"),
             ("claude-opus-4.6", "kiro-o-4.6"),
+            ("claude-sonnet-5.5", "kiro-s-5.5"),
             ("claude-sonnet-5", "kiro-s-5"),
             ("claude-haiku-4.5", "kiro-h-4.5"),
             ("claude-fable-5.1", "kiro-f-5.1"),
             ("deepseek-3.2", "kiro-deepseek-3.2"),
             ("glm-5", "kiro-glm-5"),
+            ("kimi-k3", "kiro-kimi-k3"),
             ("minimax-m2.5", "kiro-minimax-m2.5"),
             ("qwen3-coder-next", "kiro-qwen3-coder-next"),
         ],
@@ -56,13 +59,16 @@ class TestResolveModelAlias:
     @pytest.mark.parametrize(
         "alias,canonical",
         [
+            ("kiro-o-5.5", "claude-opus-5.5"),
             ("kiro-o-5", "claude-opus-5"),
             ("kiro-o-4.6", "claude-opus-4.6"),
+            ("kiro-s-5.5", "claude-sonnet-5.5"),
             ("kiro-s-5", "claude-sonnet-5"),
             ("kiro-h-4.5", "claude-haiku-4.5"),
             ("kiro-f-5.1", "claude-fable-5.1"),
             ("kiro-deepseek-3.2", "deepseek-3.2"),
             ("kiro-glm-5", "glm-5"),
+            ("kiro-kimi-k3", "kimi-k3"),
         ],
     )
     def test_syntactic_reverse(self, alias: str, canonical: str) -> None:
@@ -87,10 +93,18 @@ class TestModelAliasesConfigAlignment:
 
     def test_fallback_includes_opus_5_excludes_retired(self) -> None:
         fallback_ids = {entry["modelId"] for entry in FALLBACK_MODELS}
-        assert "claude-opus-5" in fallback_ids
-        assert "kiro-o-5" in MODEL_ALIASES
+        assert {
+            "claude-opus-5",
+            "claude-opus-5.5",
+            "claude-sonnet-5",
+            "claude-sonnet-5.5",
+            "kimi-k3",
+        }.issubset(fallback_ids)
         assert MODEL_ALIASES["kiro-o-5"] == "claude-opus-5"
-        retired = {"claude-opus-4.7", "claude-opus-4.8", "claude-sonnet-4.6"}
+        assert MODEL_ALIASES["kiro-o-5.5"] == "claude-opus-5.5"
+        assert MODEL_ALIASES["kiro-s-5.5"] == "claude-sonnet-5.5"
+        assert MODEL_ALIASES["kiro-kimi-k3"] == "kimi-k3"
+        retired = {"claude-opus-4.7", "claude-opus-4.8", "claude-sonnet-4.6", "gpt-5.6-sol"}
         assert retired.isdisjoint(fallback_ids)
         assert retired.issubset(set(HIDDEN_FROM_LIST))
         assert "kiro-o-4.7" not in MODEL_ALIASES

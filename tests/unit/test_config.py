@@ -532,6 +532,7 @@ class TestFallbackModelsConfig:
             "claude-sonnet-4",
             "claude-sonnet-4.5",
             "claude-sonnet-4.6",
+            "gpt-5.6-sol",
             "minimax-m2.1",
         }
         retired_aliases = {
@@ -549,8 +550,18 @@ class TestFallbackModelsConfig:
         assert retired_aliases.isdisjoint(MODEL_ALIASES.keys())
         assert retired.issubset(set(HIDDEN_FROM_LIST))
         assert not any(target in retired for target in MODEL_ALIASES.values())
-        assert "claude-opus-5" in fallback_ids
+        assert {
+            "claude-opus-5",
+            "claude-opus-5.5",
+            "claude-sonnet-5",
+            "claude-sonnet-5.5",
+            "kimi-k3",
+        }.issubset(fallback_ids)
         assert MODEL_ALIASES.get("kiro-o-5") == "claude-opus-5"
+        assert MODEL_ALIASES.get("kiro-o-5.5") == "claude-opus-5.5"
+        assert MODEL_ALIASES.get("kiro-s-5") == "claude-sonnet-5"
+        assert MODEL_ALIASES.get("kiro-s-5.5") == "claude-sonnet-5.5"
+        assert MODEL_ALIASES.get("kiro-kimi-k3") == "kimi-k3"
 
     def test_native_auto_and_gpt_models_have_no_aliases(self):
         """Verify native auto/GPT IDs are exposed without synthetic aliases."""
@@ -558,7 +569,6 @@ class TestFallbackModelsConfig:
 
         fallback_ids = {model["modelId"] for model in FALLBACK_MODELS}
         expected_gpt_ids = {
-            "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
         }
@@ -567,6 +577,8 @@ class TestFallbackModelsConfig:
         assert "auto" not in HIDDEN_FROM_LIST
         assert not any(target.startswith("gpt-") for target in MODEL_ALIASES.values())
         assert expected_gpt_ids.issubset(fallback_ids)
+        assert "gpt-5.6-sol" not in fallback_ids
+        assert "gpt-5.6-sol" in HIDDEN_FROM_LIST
     
 
 
@@ -600,7 +612,9 @@ class TestFallbackModelsIntegration:
         test_cases = [
             ("claude-opus-4-6", "claude-opus-4.6"),  # Dash → Dot
             ("claude-opus-5", "claude-opus-5"),
+            ("claude-opus-5-5", "claude-opus-5.5"),  # Dash → Dot
             ("claude-sonnet-5", "claude-sonnet-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5.5"),  # Dash → Dot
             ("claude-haiku-4-5", "claude-haiku-4.5"),  # Dash → Dot
         ]
         
