@@ -83,6 +83,10 @@ def classify_streaming_exception(exc: BaseException) -> tuple[str, str, str, int
 
     from kiro.auth_state import is_auth_failure
 
+    from kiro.kiro_errors import KiroContentFilterError
+
+    if isinstance(exc, KiroContentFilterError):
+        return "expected_upstream", "content_filter", "response_parse", 400
     if is_auth_failure(exc):
         return "auth", "login_required", "auth", 401
     if isinstance(exc, httpx.PoolTimeout):

@@ -414,6 +414,10 @@ def build_stream_error_body(
         is_auth_failure,
     )
 
+    from kiro.kiro_errors import KiroContentFilterError, build_content_filter_error_body
+
+    if isinstance(error, KiroContentFilterError):
+        return build_content_filter_error_body(str(error), format_type)
     if is_auth_failure(error):
         payload = build_auth_required_payload(
             code=LOGIN_REQUIRED_CODE,

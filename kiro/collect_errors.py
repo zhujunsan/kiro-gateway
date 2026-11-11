@@ -116,6 +116,17 @@ def classify_collect_exception(exc: BaseException) -> CollectFailure:
     # module scope would create a cycle for callers that import this first.
     from kiro.streaming_core import FirstTokenTimeoutError
 
+    from kiro.kiro_errors import KiroContentFilterError
+
+    if isinstance(exc, KiroContentFilterError):
+        return CollectFailure(
+            status_code=400,
+            source="expected_upstream",
+            code="content_filter",
+            phase="response_parse",
+            message=str(exc),
+            is_upstream=True,
+        )
     if is_auth_failure(exc):
         return CollectFailure(
             status_code=401,
@@ -269,6 +280,13 @@ def immediate_collect_response(
     Returns:
         A JSON response to return immediately, or ``None``.
     """
+    if failure.code == "content_filter":
+        from kiro.kiro_errors import build_content_filter_error_body
+
+        return JSONResponse(
+            status_code=400,
+            content=build_content_filter_error_body(failure.message, format_type),
+        )
     if failure.login_required:
         return login_required_json_response(format_type, reason=failure.reason)
     if failure.code == "pool_exhausted":

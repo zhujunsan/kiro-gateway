@@ -55,6 +55,46 @@ OPENAI_MODEL_NOT_AVAILABLE_CODE = "model_not_available"
 OPENAI_CAPACITY_CODE = "insufficient_model_capacity"
 
 
+class KiroContentFilterError(Exception):
+    """An explicit refusal returned inside a successful Kiro event stream.
+
+    Args:
+        metadata: Upstream metadata containing stopDetails and stopReason.
+    """
+
+    def __init__(self, metadata: Dict[str, Any]) -> None:
+        details = metadata.get("stopDetails")
+        refusal = details.get("refusal") if isinstance(details, dict) else None
+        refusal = refusal if isinstance(refusal, dict) else {}
+        category = refusal.get("category")
+        explanation = refusal.get("explanation")
+        label = f" ({category})" if isinstance(category, str) and category else ""
+        explanation = explanation if isinstance(explanation, str) and explanation.strip() else (
+            "The selected model declined this conversation. "
+            "Review the request or select a different model."
+        )
+        super().__init__(f"Kiro CONTENT_FILTERED{label}: {explanation}")
+
+
+def build_content_filter_error_body(message: str, format_type: str) -> Dict[str, Any]:
+    """Preserve a refusal in either supported client error envelope.
+
+    Args:
+        message: Upstream refusal description.
+        format_type: OpenAI-compatible or Anthropic API format.
+
+    Returns:
+        A non-retryable request error, including its status for SSE clients.
+    """
+    error = {
+        "type": "invalid_request_error",
+        "code": "content_filter",
+        "status": 400,
+        "message": message,
+    }
+    return {"type": "error", "error": error} if format_type == "anthropic" else {"error": error}
+
+
 @dataclass
 class KiroErrorInfo:
     """

@@ -2434,3 +2434,51 @@ class TestCollectWithFirstTokenRetry:
         print(f"Attempts: {attempts}")
         assert attempts == 1
         print("✓ max_retries=1 performs a single attempt")
+
+class TestContentFilterConsumers:
+    """Refusals must fail every public API before a successful terminal event."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("api", ["openai", "anthropic", "responses"])
+    @pytest.mark.parametrize("streaming", [True, False])
+    @pytest.mark.parametrize("metadata", [
+        {"stopDetails": {"refusal": {"category": "CYBER", "explanation": "Model declined this conversation."}}, "stopReason": "CONTENT_FILTERED"},
+        {"stopReason": "CONTENT_FILTERED"},
+    ])
+    @pytest.mark.parametrize("prefix", [b"", b'{"content":"partial answer"}'])
+    async def test_refusal_is_not_a_successful_empty_response(
+        self, api: str, streaming: bool, metadata: Dict[str, Any], prefix: bytes
+    ) -> None:
+        """Propagate fragmented refusals through all API/mode combinations."""
+        from kiro.kiro_errors import KiroContentFilterError
+        from kiro.collect_errors import classify_collect_exception, immediate_collect_response
+        from kiro.network_errors import build_stream_error_body
+        from kiro.debug_logger import classify_streaming_exception
+
+        wire = prefix + json.dumps(metadata).encode() + b'{"contextUsagePercentage":29.17}'
+        with pytest.raises(KiroContentFilterError) as caught:
+            await TestMeteringConsumers()._render_wire(api, streaming, wire)
+        error = caught.value
+        assert "CONTENT_FILTERED" in str(error)
+        if "stopDetails" in metadata:
+            assert "CYBER" in str(error)
+            assert "Model declined this conversation." in str(error)
+        body = build_stream_error_body(error, api)
+        assert body["error"]["code"] == "content_filter"
+        assert body["error"]["status"] == 400
+        assert body["error"]["message"] == str(error)
+        failure = classify_collect_exception(error)
+        response = immediate_collect_response(failure, api)
+        assert response.status_code == 400
+        assert json.loads(response.body) == body
+        assert classify_streaming_exception(error) == (
+            "expected_upstream", "content_filter", "response_parse", 400
+        )
+
+    def test_normal_metadata_is_ignored(self) -> None:
+        """Successful stop metadata must preserve the existing text parser."""
+        from kiro.parsers import AwsEventStreamParser
+
+        assert AwsEventStreamParser().feed(
+            b'{"stopReason":"end_turn"}{"content":"answer"}'
+        ) == [{"type": "content", "data": "answer"}]

@@ -328,6 +328,8 @@ class AwsEventStreamParser:
     # usage object cannot be mistaken for a standalone completion signal.
     EVENT_START_PATTERN = re.compile(r'\{\s*"(?P<key>(?:[^"\\]|\\.)*)"\s*:')
     EVENT_TYPES = {
+        'stopReason': 'metadata',
+        'stopDetails': 'metadata',
         'content': 'content',
         'name': 'tool_start',
         'input': 'tool_input',
@@ -402,6 +404,15 @@ class AwsEventStreamParser:
             Processed events. A single upstream tool event can produce multiple
             lifecycle events (for example start + input delta + stop).
         """
+        if event_type == 'metadata':
+            from kiro.kiro_errors import KiroContentFilterError
+
+            details = data.get("stopDetails")
+            if data.get("stopReason") == "CONTENT_FILTERED" or (
+                isinstance(details, dict) and "refusal" in details
+            ):
+                raise KiroContentFilterError(data)
+            return []
         if event_type == 'content':
             event = self._process_content_event(data)
             return [event] if event else []
